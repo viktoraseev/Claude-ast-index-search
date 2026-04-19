@@ -28,10 +28,24 @@
 (constructor_declaration
   name: (identifier) @constructor_name) @constructor_node
 
-; Fields
+; Fields (class/enum/record)
 (field_declaration
   declarator: (variable_declarator
     name: (identifier) @field_name)) @field_node
+
+; Interface constants (implicitly public static final even without modifiers)
+(constant_declaration
+  declarator: (variable_declarator
+    name: (identifier) @field_name)) @field_node
+
+; Enum constants (e.g. ACTIVE, INACTIVE inside enum body)
+(enum_body
+  (enum_constant
+    name: (identifier) @enum_constant_name) @enum_constant_node)
+
+; Annotation type declarations (@interface MyAnnotation { ... })
+(annotation_type_declaration
+  name: (identifier) @annotation_type_name) @annotation_type_node
 
 ; Annotations (marker - no arguments, like @Override)
 (marker_annotation
