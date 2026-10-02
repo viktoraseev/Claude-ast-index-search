@@ -37,6 +37,73 @@ class Oracle:
 
 
 class NavigationContractTests(unittest.TestCase):
+    def test_enum_reference_position_uses_the_declaration_anchor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'Mode.java').write_text('package example;\nenum Mode { ON(1), OFF(2); Mode(int n) {} }\n')
+            (root / 'Client.java').write_text('package example;\nclass Client { Mode mode = Mode.ON; }\n')
+            class EnumOracle:
+                def call(self, tool, arguments):
+                    if tool == 'ide_find_symbol':
+                        return {'symbols': [{'name': 'ON', 'kind': 'CLASS', 'file': 'Mode.java',
+                            'line': 2, 'column': 30, 'qualifiedName': 'example.Mode.ON'}]}
+                    if tool == 'ide_find_references':
+                        if 'symbol' not in arguments:
+                            if arguments['column'] != 13:
+                                raise AssertionError('wrong declaration anchor')
+                            return {'resolvedSymbol': {'name': 'Mode', 'kind': 'constructor'}, 'usages': []}
+                        if arguments['symbol'] != 'example.Mode#ON':
+                            raise AssertionError('wrong qualified member')
+                        return {'resolvedSymbol': {'name': 'ON', 'kind': 'constant field'},
+                                'usages': [{'file': 'Client.java', 'line': 2, 'type': 'REFERENCE'}]}
+                    raise AssertionError(tool)
+            binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+            database = directory / 'index.sqlite'
+            build_ast_index(str(binary), root, database, 'enum-anchor')
+            state = connect(directory / 'checks.sqlite')
+            try:
+                state.executescript(SCHEMA)
+                state.execute("INSERT INTO checks(id,feature,subject) VALUES ('enum','refs','ON')")
+                state.commit()
+                fixture = Fixture(root, binary, database, state, EnumOracle())
+                fixture.evaluate(state.execute('SELECT * FROM checks').fetchone())
+                result = state.execute('SELECT verdict,error,diff_json FROM checks').fetchone()
+                self.assertEqual(result[0], 'pass', tuple(result))
+            finally:
+                state.close()
+
+    def test_implicit_enum_constructor_sites_do_not_become_lexical_type_mentions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'Mode.java').write_text('package example;\nenum Mode {\n    ON(1);\n    Mode(int n) {}\n}\n')
+            class ImplicitOracle:
+                def call(self, tool, arguments):
+                    if tool == 'ide_find_symbol':
+                        return {'symbols': [{'name': 'Mode', 'kind': 'CLASS', 'file': 'Mode.java',
+                            'line': 2, 'column': 6, 'qualifiedName': 'example.Mode'}]}
+                    if tool == 'ide_find_references':
+                        return {'resolvedSymbol': {'name': 'Mode', 'kind': 'enum'},
+                                'usages': [{'file': 'Mode.java', 'line': 3, 'type': 'REFERENCE'}]}
+                    raise AssertionError(tool)
+            binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+            database = directory / 'index.sqlite'
+            build_ast_index(str(binary), root, database, 'implicit-enum')
+            state = connect(directory / 'checks.sqlite')
+            try:
+                state.executescript(SCHEMA)
+                state.execute("INSERT INTO checks(id,feature,subject) VALUES ('enum','refs','Mode')")
+                state.commit()
+                fixture = Fixture(root, binary, database, state, ImplicitOracle())
+                fixture.evaluate(state.execute('SELECT * FROM checks').fetchone())
+                result = state.execute('SELECT verdict,error,diff_json FROM checks').fetchone()
+                self.assertEqual(result[0], 'pass', tuple(result))
+            finally:
+                state.close()
+
     def test_same_line_overloads_detect_one_removed_production_index_row(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

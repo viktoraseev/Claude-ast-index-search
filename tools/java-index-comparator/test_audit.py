@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from pathlib import Path
 import tempfile
 import unittest
@@ -51,6 +52,22 @@ class LiveFixtureTests(unittest.TestCase):
         self.client.call.return_value = {"classes": [], "nextCursor": "next"}
         with self.assertRaisesRegex(Unsupported, "repeated cursor"):
             self.fixture.paginated(check["id"], "ide_find_class", {}, "classes")
+
+    def test_text_collection_cap_is_not_complete_evidence(self):
+        check = self.state.execute("SELECT * FROM checks LIMIT 1").fetchone()
+        self.client.call.return_value = {"matches": [{"file": "A.java", "line": 1}] * 5000,
+                                         "hasMore": False, "totalCollected": 5000}
+        with self.assertRaisesRegex(Unsupported, "collection cap"):
+            self.fixture.paginated(check["id"], "ide_search_text", {"query": "e"}, "matches")
+
+    def test_reference_usages_response_is_paginated_without_losing_imports(self):
+        check = self.state.execute("SELECT * FROM checks LIMIT 1").fetchone()
+        self.client.call.side_effect = [
+            {"usages": [{"file": "A.java", "line": 1, "type": "IMPORT"}], "nextCursor": "next"},
+            {"usages": [{"file": "A.java", "line": 2, "type": "REFERENCE"}], "totalIsExact": True},
+        ]
+        items = self.fixture.paginated(check["id"], "ide_find_references", {}, "references")
+        self.assertEqual([item["type"] for item in items], ["IMPORT", "REFERENCE"])
 
     def test_external_paths_are_not_silently_compared_as_local(self):
         with self.assertRaises(Unsupported):
@@ -126,6 +143,13 @@ class LiveFixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(Unsupported, "stale"):
             self.fixture.oracle_symbols(check, "run")
         self.client.call.assert_called_once()
+
+    def test_navigation_mismatch_is_confirmed_with_the_full_name_query(self):
+        check = self.state.execute("SELECT * FROM checks WHERE feature='class'").fetchone()
+        broad = [{"name": "run", "kind": "METHOD", "file": "A.java", "line": 1}]
+        self.client.call.return_value = {"symbols": []}
+        self.assertEqual(self.fixture.validate_navigation(check, "run", broad, Counter()), [])
+        self.assertEqual(self.client.call.call_args.args[1]['query'], 'run')
 
     def test_coarse_oracle_kinds_do_not_turn_enum_constants_into_types(self):
         identity = {"name": "OPEN", "file": "Status.java", "line": 2, "qualifiedName": "p.Status.OPEN"}

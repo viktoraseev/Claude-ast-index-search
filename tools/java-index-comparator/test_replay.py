@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from audit import SCHEMA
 from common import ToolError, canonical_json, connect, source_snapshot
-from replay import StoredOracle, problem_batch, replay
+from replay import ArchiveOracle, StoredOracle, problem_batch, replay
 
 
 class ReplayTests(unittest.TestCase):
@@ -37,6 +37,31 @@ class ReplayTests(unittest.TestCase):
             StoredOracle(self.source, "case").call("ide_find_symbol", self.arguments)
         with self.assertRaisesRegex(ToolError, "scope/query"):
             StoredOracle(self.source, "case").call("ide_find_class", {**self.arguments, "scope": "project_and_libraries"})
+
+    def test_supplemental_archive_never_reuses_a_different_query_or_scope(self):
+        from unittest.mock import Mock
+        live = Mock()
+        live.call.return_value = {'classes': []}
+        oracle = ArchiveOracle(self.source, 'case', live)
+        self.assertTrue(oracle.call('ide_find_class', self.arguments)['classes'])
+        live.call.assert_not_called()
+        query = {**self.arguments, 'query': 'Other'}
+        oracle.call('ide_find_class', query)
+        live.call.assert_called_once_with('ide_find_class', query)
+        with self.assertRaisesRegex(ToolError, 'operation is missing'):
+            ArchiveOracle(self.source, 'case').call('ide_find_class', {**self.arguments, 'scope': 'project_test_files'})
+
+    def test_supplemental_snapshot_is_validated_before_build(self):
+        archive = self.directory / 'archive.sqlite'
+        other = connect(archive)
+        other.executescript(SCHEMA)
+        with other:
+            other.execute("INSERT INTO metadata VALUES ('project_root','different')")
+        other.close()
+        with patch('replay.build_ast_index') as build:
+            with self.assertRaisesRegex(ToolError, 'supplemental oracle target'):
+                replay(self.evidence, self.root, self.binary, self.directory / 'replays', oracle_evidence=archive)
+            build.assert_not_called()
 
     def test_failure_limit_does_not_drop_unsupported_or_error_contracts(self):
         with self.source:

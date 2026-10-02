@@ -48,3 +48,6 @@
 ; Annotations (with arguments, like @GetMapping("/users"))
 (annotation
   name: [(identifier) (scoped_identifier)] @annotation_call_name) @definition
+
+; Imports are indexed separately from usages, under the imported simple name.
+(import_declaration) @import_node @definition

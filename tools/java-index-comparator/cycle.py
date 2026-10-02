@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
 import sys
 
-from common import ToolError, adapter_digest, canonical_json, connect, file_sha256, now_ms, source_snapshot
+from common import ToolError, adapter_digest, discover_mcp_url, canonical_json, connect, file_sha256, now_ms, source_snapshot
 
 
 SCHEMA = """
@@ -91,11 +92,23 @@ def scan(arguments: argparse.Namespace) -> dict:
     return command_summary(command, Path(arguments.output_dir) / "logs", "audit")
 
 
-def replay(evidence: Path, root: Path, binary: Path, output: Path) -> dict:
+def replay(evidence: Path, root: Path, binary: Path, output: Path, *, mcp_url: str | None = None, oracle_evidence: Path | None = None) -> dict:
     command = [sys.executable, str(Path(__file__).with_name("replay.py")),
                "--evidence", str(evidence), "--project-root", str(root),
                "--ast-index", str(binary), "--output-dir", str(output), "--limit", "100"]
+    if mcp_url:
+        command.extend(["--mcp-url", mcp_url])
+    if oracle_evidence:
+        command.extend(["--oracle-evidence", str(oracle_evidence)])
     return command_summary(command, output / "logs", "replay")
+
+
+def reload_driver(completed: int = 0) -> None:
+    """Reload repaired driver code only after a durable phase transition."""
+    script = Path(__file__).resolve()
+    if Path(sys.argv[0]).resolve() == script:
+        os.environ['AST_INDEX_CYCLE_COMPLETED_ROUNDS'] = str(completed)
+        os.execv(sys.executable, [sys.executable, str(script), *sys.argv[1:]])
 
 
 def agent_prompt(summary: dict, root: Path) -> str:
@@ -111,6 +124,11 @@ do not generate one test per row. Add compact, public-safe regression fixtures
 that exercise actual production behaviour. Demonstrate failure before the fix,
 then repair ast-index. If a verdict is a normalization/scope/pagination bug,
 repair the comparator and add a test; never mask a production defect.
+Distinguish MCP differential coverage from independent source and internal CLI/DB
+contract checks. A native DB agreeing with native output does not establish MCP
+equivalence. Label each evidence source accurately; do not claim MCP coverage
+for an oracle-less command. Language-inapplicable features need explicit,
+reproducible applicability evidence, not a blanket skip or a fake pass.
 Support missing audit contracts rather than marking them covered or skipping
 them. All applicable ast-index features remain in scope, not only class/symbol.
 Do not modify the target project. Do not commit target source, evidence databases,
@@ -231,7 +249,7 @@ def run(arguments: argparse.Namespace) -> int:
                     batch.close()
                 summary = seed_summary(resume_batch, root, repository / "target/release/ast-index")
                 set_phase(state, row["id"], "agent", summary_json=canonical_json(summary))
-            completed = 0
+            completed = int(os.environ.pop('AST_INDEX_CYCLE_COMPLETED_ROUNDS', '0'))
             while arguments.max_rounds is None or completed < arguments.max_rounds:
                 row = state.execute("SELECT * FROM rounds WHERE phase!='done' ORDER BY id DESC LIMIT 1").fetchone()
                 if row is None:
@@ -275,13 +293,15 @@ def run(arguments: argparse.Namespace) -> int:
                         if not changed_files(repository):
                             raise ToolError("agent made no code changes; the incomplete audit cannot count as success")
                         set_phase(state, round_id, "verify")
+                        reload_driver(completed)
                     elif phase == "verify":
                         summary = json.loads(row["summary_json"])
                         try:
                             logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
                             logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
                             if summary["counts"].get("fail") or summary["counts"].get("unsupported"):
-                                result = replay(Path(summary["evidence"]), root, repository / "target/release/ast-index", directory / "batch-verification")
+                                result = replay(Path(summary["evidence"]), root, repository / "target/release/ast-index", directory / "batch-verification", mcp_url=arguments.mcp_url or discover_mcp_url(arguments.mcp_name),
+                                                oracle_evidence=Path(summary['verification']['verification']) if summary.get('verification', {}).get('verification') else None)
                                 if not result["verified"]:
                                     summary["verification"] = result
                                     set_phase(state, round_id, "agent", summary_json=canonical_json(summary))

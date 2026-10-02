@@ -1198,7 +1198,7 @@ struct ParsedFile {
     mtime: i64,
     size: i64,
     symbols: Vec<ParsedSymbol>,
-    qualified_names: HashMap<(String, usize, String), String>,
+    qualified_names: HashMap<(String, usize, String), std::collections::VecDeque<Option<String>>>,
     refs: Vec<ParsedRef>,
     /// [`content_words`] of the text, when it was read.
     words: Option<String>,
@@ -1336,9 +1336,20 @@ fn parse_file_keyed(
     let mut qualified_names = HashMap::new();
 
     if file_type == parsers::FileType::Cpp {
-        qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+        let names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+        for symbol in &symbols {
+            let key = (
+                symbol.kind.as_str().to_string(),
+                symbol.line,
+                symbol.name.clone(),
+            );
+            qualified_names
+                .entry(key.clone())
+                .or_insert_with(std::collections::VecDeque::new)
+                .push_back(names.get(&key).cloned());
+        }
     } else if file_type == parsers::FileType::Java {
-        qualified_names = parsers::treesitter::java::collect_qualified_names(&content)?;
+        qualified_names = parsers::treesitter::java::collect_qualified_name_occurrences(&content)?;
     }
 
     if file_type == parsers::FileType::TypeScript {
@@ -2382,7 +2393,7 @@ fn write_batch_to_db(
                 mtime,
                 size,
                 symbols,
-                qualified_names,
+                mut qualified_names,
                 refs,
                 words,
             } = pf;
@@ -2397,11 +2408,10 @@ fn write_batch_to_db(
             // here only add extra work, especially during full rebuilds on a fresh DB.
 
             for sym in symbols {
-                let qualified_name = qualified_names.get(&(
-                    sym.kind.as_str().to_string(),
-                    sym.line,
-                    sym.name.clone(),
-                ));
+                let qualified_name = qualified_names
+                    .get_mut(&(sym.kind.as_str().to_string(), sym.line, sym.name.clone()))
+                    .and_then(|names| names.pop_front())
+                    .flatten();
                 sym_stmt.execute(rusqlite::params![
                     file_id,
                     sym.name,

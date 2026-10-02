@@ -271,12 +271,9 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
     for (category, items) in &todos {
         if !items.is_empty() {
             println!("\n{}", format!("{} ({}):", category, items.len()).cyan());
-            for (path, line_num, content) in items.iter().take(20) {
+            for (path, line_num, content) in items {
                 println!("  {}:{}", path, line_num);
                 println!("    {}", content);
-            }
-            if items.len() > 20 {
-                println!("  ... and {} more", items.len() - 20);
             }
         }
     }

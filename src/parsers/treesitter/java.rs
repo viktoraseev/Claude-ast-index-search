@@ -1,7 +1,7 @@
 //! Tree-sitter based Java parser
 
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
@@ -139,6 +139,7 @@ impl LanguageParser for JavaParser {
         let idx_annotation_name = idx("annotation_name");
         let idx_annotation_call_name = idx("annotation_call_name");
         let idx_definition = idx("definition");
+        let idx_import_node = idx("import_node");
 
         // Distinct declarations may share a line (including overloads and constructors).
         let mut emitted: std::collections::HashSet<(String, usize)> =
@@ -151,6 +152,30 @@ impl LanguageParser for JavaParser {
 
         while let Some(m) = matches.next() {
             let end_line = find_capture(m, idx_definition).map(|c| text_end_line(content, &c.node));
+
+            if let Some(import) = find_capture(m, idx_import_node) {
+                let text = node_text(content, &import.node);
+                if !text.trim_end_matches(';').trim_end().ends_with('*') {
+                    let mut identifiers = Vec::new();
+                    super::walk_tree_preorder(&import.node, |node| {
+                        if node.kind() == "identifier" {
+                            identifiers.push(node);
+                        }
+                        super::WalkControl::Continue
+                    });
+                    if let Some(name_node) = identifiers.last() {
+                        symbols.push(ParsedSymbol {
+                            name: node_text(content, name_node).to_string(),
+                            kind: SymbolKind::Import,
+                            line: node_line(name_node),
+                            signature: text.trim().to_string(),
+                            parents: vec![],
+                            end_line,
+                        });
+                    }
+                }
+                continue;
+            }
 
             // === Classes ===
             if let Some(name_cap) = find_capture(m, idx_class_name) {
@@ -400,38 +425,57 @@ impl LanguageParser for JavaParser {
     }
 }
 
-/// Include method-reference targets, which have no call parentheses.
+/// Extract Java reference positions from syntax, without skipping a whole declaration line.
 fn java_refs(
     content: &str,
     tree: &tree_sitter::Tree,
-    defined: &[ParsedSymbol],
-    file_type: FileType,
+    _defined: &[ParsedSymbol],
+    _file_type: FileType,
 ) -> Result<Vec<ParsedRef>> {
-    let masked = super::mask_non_code(content, tree.root_node(), &NON_CODE);
-    let mut refs = super::extract_refs_masked(content, &masked, defined, Some(file_type))?;
-    let mut seen: std::collections::HashSet<(String, usize)> =
-        refs.iter().map(|r| (r.name.clone(), r.line)).collect();
+    let mut refs = Vec::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
-        if node.kind() == "method_reference" {
-            // The final child is the target identifier after any type
-            // arguments, or the unnamed `new` token for constructor references.
-            let mut cursor = node.walk();
-            if let Some(target) = node
-                .children(&mut cursor)
-                .last()
-                .filter(|n| n.kind() == "identifier")
-            {
-                let name = node_text(content, &target);
-                let line = node_line(&target);
-                if seen.insert((name.to_string(), line)) {
-                    refs.push(ParsedRef {
-                        name: name.to_string(),
-                        line,
-                        context: crate::parsers::truncate_context(
-                            super::line_text(content, line).trim(),
-                        ),
-                    });
-                }
+        if matches!(
+            node.kind(),
+            "package_declaration"
+                | "import_declaration"
+                | "line_comment"
+                | "block_comment"
+                | "character_literal"
+        ) {
+            return super::WalkControl::SkipChildren;
+        }
+        if matches!(node.kind(), "identifier" | "type_identifier") {
+            let declaration = node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "class_declaration"
+                        | "interface_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                        | "annotation_type_declaration"
+                        | "method_declaration"
+                        | "constructor_declaration"
+                        | "compact_constructor_declaration"
+                        | "variable_declarator"
+                        | "formal_parameter"
+                        | "spread_parameter"
+                        | "catch_formal_parameter"
+                        | "type_parameter"
+                        | "enum_constant"
+                        | "annotation_type_element_declaration"
+                ) && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == node.id())
+            });
+            if !declaration {
+                let line = node_line(&node);
+                refs.push(ParsedRef {
+                    name: node_text(content, &node).to_string(),
+                    line,
+                    context: crate::parsers::truncate_context(
+                        super::line_text(content, line).trim(),
+                    ),
+                });
             }
         }
         super::WalkControl::Continue
@@ -439,7 +483,23 @@ fn java_refs(
     Ok(refs)
 }
 
+type QualifiedNameOccurrences = HashMap<(String, usize, String), VecDeque<Option<String>>>;
+
 pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, String), String>> {
+    Ok(collect_qualified_name_occurrences(content)?
+        .into_iter()
+        .filter_map(|(key, values)| {
+            values
+                .into_iter()
+                .flatten()
+                .next_back()
+                .map(|value| (key, value))
+        })
+        .collect())
+}
+
+/// Keep declaration occurrences in parser order, including local declarations without an FQN.
+pub fn collect_qualified_name_occurrences(content: &str) -> Result<QualifiedNameOccurrences> {
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let root = tree.root_node();
     let mut root_cursor = root.walk();
@@ -457,7 +517,9 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
     let query = &*JAVA_QUERY;
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, content.as_bytes());
-    let mut names = HashMap::new();
+    let mut names: QualifiedNameOccurrences = HashMap::new();
+    let mut accessors = Vec::new();
+    let mut explicit_accessors = std::collections::HashSet::new();
     while let Some(m) = matches.next() {
         for capture in m.captures {
             let kinds: &[SymbolKind] = match query.capture_names()[capture.index as usize] {
@@ -467,7 +529,7 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
                 "enum_constant_name" => &[SymbolKind::Constant],
                 "method_name" | "constructor_name" => &[SymbolKind::Function],
                 "field_name" => &[SymbolKind::Property],
-                "record_component_name" => &[SymbolKind::Property, SymbolKind::Function],
+                "record_component_name" => &[SymbolKind::Property],
                 _ => continue,
             };
             let name = node_text(content, &capture.node);
@@ -503,25 +565,41 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
                 }
                 node = parent.parent();
             }
-            if is_local {
-                continue;
-            }
             ancestors.reverse();
             if let Some(package) = &package {
                 ancestors.insert(0, package.clone());
             }
             ancestors.push(name.to_string());
-            let qualified = ancestors.join(".");
-            for kind in kinds {
-                names.insert(
-                    (
-                        kind.as_str().to_string(),
-                        node_line(&capture.node),
-                        name.to_string(),
-                    ),
-                    qualified.clone(),
-                );
+            let qualified = (!is_local).then(|| ancestors.join("."));
+            let key = (
+                kinds[0].as_str().to_string(),
+                node_line(&capture.node),
+                name.to_string(),
+            );
+            names.entry(key).or_default().push_back(qualified.clone());
+            if query.capture_names()[capture.index as usize] == "record_component_name" {
+                let owner = enclosing_type_name(content, &capture.node).unwrap_or_default();
+                accessors.push((owner, name.to_string(), node_line(&capture.node), qualified));
+            } else if query.capture_names()[capture.index as usize] == "method_name" {
+                if let Some(method) = capture.node.parent() {
+                    if method
+                        .child_by_field_name("parameters")
+                        .is_some_and(|parameters| parameters.named_child_count() == 0)
+                    {
+                        if let Some(owner) = enclosing_type_name(content, &method) {
+                            explicit_accessors.insert((owner, name.to_string()));
+                        }
+                    }
+                }
             }
+        }
+    }
+    for (owner, name, line, qualified) in accessors {
+        if !explicit_accessors.contains(&(owner, name.clone())) {
+            names
+                .entry(("function".to_string(), line, name))
+                .or_default()
+                .push_back(qualified);
         }
     }
     Ok(names)

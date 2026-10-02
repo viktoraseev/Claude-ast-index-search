@@ -42,6 +42,9 @@ public class JavaStructure {
                 int namePosition(Tree tree, String name, String suffix) {
                     int begin = start(tree), finish = end(tree);
                     if (begin < 0 || finish < begin) throw new IllegalStateException("Missing source range");
+                    if (tree instanceof VariableTree variable && variable.getInitializer() != null
+                        && start(variable.getInitializer()) > begin)
+                        finish = start(variable.getInitializer());
                     if (tree instanceof MethodTree method) {
                         if (method.getBody() != null) finish = start(method.getBody()) + 1;
                         if (!method.getParameters().isEmpty() && start(method.getParameters().get(0)) > begin)
@@ -55,21 +58,85 @@ public class JavaStructure {
                     return found;
                 }
                 void emit(String kind, String name, int position) {
+                    emit(kind, name, position, position);
+                }
+                void emit(String kind, String name, int position, int finish) {
                     entries.add("{\"kind\":" + quote(kind) + ",\"name\":" + quote(name)
-                        + ",\"line\":" + unit.getLineMap().getLineNumber(position) + "}");
+                        + ",\"line\":" + unit.getLineMap().getLineNumber(position)
+                        + ",\"column\":" + (position - source.lastIndexOf('\n', position - 1))
+                        + ",\"end_line\":" + unit.getLineMap().getLineNumber(Math.max(position, finish - 1)) + "}");
                 }
                 @Override public Void visitMethod(MethodTree tree, Void unused) {
                     if (tree.getName().contentEquals("<init>")) {
                         ClassTree owner = (ClassTree) getCurrentPath().getParentPath().getLeaf();
                         String name = owner.getSimpleName().toString();
-                        emit("constructor", name, namePosition(tree, name, "\\s*[({]"));
+                        emit("constructor", name, namePosition(tree, name, "\\s*[({]"), end(tree));
                     } else {
                         String name = tree.getName().toString();
-                        emit("method", name, namePosition(tree, name, "\\s*\\("));
+                        emit("method", name, namePosition(tree, name, "\\s*\\("), end(tree));
                     }
                     return super.visitMethod(tree, unused);
                 }
+                @Override public Void visitCompilationUnit(CompilationUnitTree tree, Void unused) {
+                    scan(tree.getPackageAnnotations(), unused);
+                    scan(tree.getImports(), unused);
+                    scan(tree.getTypeDecls(), unused);
+                    return null;
+                }
+                @Override public Void visitImport(ImportTree tree, Void unused) {
+                    String full = tree.getQualifiedIdentifier().toString();
+                    if (!full.endsWith(".*")) {
+                        String name = full.substring(full.lastIndexOf('.') + 1);
+                        emit("import", name, namePosition(tree, name, ""), end(tree));
+                    }
+                    return null;
+                }
+                @Override public Void visitIdentifier(IdentifierTree tree, Void unused) {
+                    String name = tree.getName().toString();
+                    int begin = start(tree), finish = end(tree);
+                    // javac synthesizes the enum type at constant constructor
+                    // sites. A lexical reference must have an actual source token.
+                    if (!name.equals("this") && !name.equals("super") && begin >= 0 && finish >= begin
+                        && source.substring(begin, finish).equals(name)) emit("usage", name, begin);
+                    return super.visitIdentifier(tree, unused);
+                }
+                @Override public Void visitMemberSelect(MemberSelectTree tree, Void unused) {
+                    String name = tree.getIdentifier().toString();
+                    if (!name.equals("class") && !name.equals("this") && !name.equals("super"))
+                        emit("usage", name, end(tree) - name.length());
+                    return super.visitMemberSelect(tree, unused);
+                }
+                @Override public Void visitMemberReference(MemberReferenceTree tree, Void unused) {
+                    if (tree.getMode() != MemberReferenceTree.ReferenceMode.NEW) {
+                        String name = tree.getName().toString();
+                        emit("usage", name, end(tree) - name.length());
+                    }
+                    return super.visitMemberReference(tree, unused);
+                }
+                @Override public Void visitVariable(VariableTree tree, Void unused) {
+                    if (getCurrentPath().getParentPath().getLeaf() instanceof ClassTree owner
+                        && (owner.getKind() != Tree.Kind.RECORD || tree.getModifiers().getFlags().contains(javax.lang.model.element.Modifier.STATIC))) {
+                        String name = tree.getName().toString();
+                        boolean constant = owner.getKind() == Tree.Kind.ENUM && tree.getInitializer() instanceof NewClassTree
+                            && source.substring(start(tree), end(tree)).stripLeading().startsWith(name);
+                        emit(constant ? "constant" : "property", name,
+                            constant ? start(tree) : namePosition(tree, name, ""), end(tree));
+                    }
+                    return super.visitVariable(tree, unused);
+                }
                 @Override public Void visitClass(ClassTree tree, Void unused) {
+                    String typeName = tree.getSimpleName().toString();
+                    if (!typeName.isEmpty()) {
+                        Matcher anchor = Pattern.compile("(?:class|interface|enum|record)\\s+(" + Pattern.quote(typeName) + ")(?![\\w$])")
+                            .matcher(source.substring(start(tree), end(tree)));
+                        if (!anchor.find()) throw new IllegalStateException("Missing type anchor");
+                        String kind = switch (tree.getKind()) {
+                            case INTERFACE, ANNOTATION_TYPE -> "interface";
+                            case ENUM -> "enum";
+                            default -> "class";
+                        };
+                        emit(kind, typeName, start(tree) + anchor.start(1), end(tree));
+                    }
                     List<Tree> parents = new ArrayList<>(tree.getImplementsClause());
                     if (tree.getExtendsClause() != null) parents.add(tree.getExtendsClause());
                     for (Tree parent : parents) {
