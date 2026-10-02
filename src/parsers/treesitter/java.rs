@@ -20,6 +20,101 @@ pub static JAVA_PARSER: JavaParser = JavaParser;
 
 pub struct JavaParser;
 
+/// Find type tokens in Java fields and parameters annotated for injection.
+pub(crate) fn injection_lines(content: &str, type_re: &regex::Regex) -> Result<Vec<usize>> {
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut lines = std::collections::BTreeSet::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() == "modifiers" {
+            let mut children = node.walk();
+            let injected = node.named_children(&mut children).any(|annotation| {
+                matches!(annotation.kind(), "annotation" | "marker_annotation")
+                    && annotation.child_by_field_name("name").is_some_and(|name| {
+                        matches!(
+                            node_text(content, &name).rsplit('.').next(),
+                            Some("Inject" | "Autowired")
+                        )
+                    })
+            });
+            if injected {
+                if let Some(owner) = node.parent() {
+                    let mut types = Vec::new();
+                    match owner.kind() {
+                        "method_declaration" | "constructor_declaration" => {
+                            if let Some(parameters) = owner.child_by_field_name("parameters") {
+                                let mut params = parameters.walk();
+                                for parameter in parameters.named_children(&mut params) {
+                                    if let Some(ty) = injection_parameter_type(parameter) {
+                                        types.push(ty);
+                                    }
+                                }
+                            }
+                        }
+                        "field_declaration"
+                        | "local_variable_declaration"
+                        | "formal_parameter"
+                        | "spread_parameter" => {
+                            if let Some(ty) = injection_parameter_type(owner) {
+                                types.push(ty);
+                            }
+                        }
+                        _ => {}
+                    }
+                    for ty in types {
+                        let mut pending = vec![ty];
+                        while let Some(part) = pending.pop() {
+                            match part.kind() {
+                                "annotation" | "marker_annotation" => continue,
+                                "type_identifier"
+                                | "identifier"
+                                | "integral_type"
+                                | "floating_point_type"
+                                | "boolean_type" => {
+                                    for token in type_re.find_iter(node_text(content, &part)) {
+                                        let offset = part.start_byte() + token.start();
+                                        lines.insert(
+                                            content[..offset]
+                                                .bytes()
+                                                .filter(|b| *b == b'\n')
+                                                .count(),
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    let mut fields = part.walk();
+                                    pending.extend(part.named_children(&mut fields));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return Ok(lines.into_iter().collect());
+            }
+        }
+    }
+}
+
+fn injection_parameter_type(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    node.child_by_field_name("type").or_else(|| {
+        if node.kind() != "spread_parameter" {
+            return None;
+        }
+        // Varargs types are unnamed fields in this grammar.
+        let mut fields = node.walk();
+        let mut children = node.named_children(&mut fields);
+        children.find(|field| field.kind() == "type_identifier" || field.kind().ends_with("_type"))
+    })
+}
+
 /// Significant Java/Spring annotations to track
 const SIGNIFICANT_ANNOTATIONS: &[&str] = &[
     "RestController",

@@ -54,6 +54,10 @@ CREATE INDEX IF NOT EXISTS checks_status ON checks(status, feature, subject);
 CREATE TABLE IF NOT EXISTS source_structures(
     path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL, entries_json TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS source_injection_targets(
+    name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
+    PRIMARY KEY(name,path,line)
+);
 """ + ORACLE_SCHEMA
 
 
@@ -151,7 +155,22 @@ INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 
 
 LIVE_FEATURES = INTERNAL_FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
-                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks"}
+                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
+
+SUPPRESSION_PATTERN = r'@(?:[\w$]+:)?(?:[\w$]+\.)*Suppress(?:Warnings)?\b'
+
+
+def grep_locations(output: str, root: Path, header_pattern: str, limit: int):
+    """Validate counts as well as locations; a JSON/text shape is not coverage."""
+    lines = output.splitlines()
+    header = re.fullmatch(header_pattern, lines[0]) if lines else None
+    if not header or any(re.search(r'\.\.\. and \d+ more', line) for line in lines):
+        raise Unsupported('unrecognized or incomplete grep output')
+    items = [{'path': match[1], 'line': int(match[2])} for line in lines[1:]
+             if (match := re.fullmatch(r'  (\S.*):(\d+)', line))]
+    if len(items) != int(header[1]) or len(items) > limit:
+        raise Unsupported('grep result count does not match rendered locations')
+    return location_keys(items, root)
 
 
 def coverage_sources(state: sqlite3.Connection) -> dict[str, int]:
@@ -356,6 +375,7 @@ class Fixture:
                 state.execute('DELETE FROM source_structures')
                 state.execute("INSERT OR REPLACE INTO metadata VALUES ('structure_sha256',?)", (structure_digest,))
         self.schedule_followups = schedule_followups
+        self._injection_ready = False
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
@@ -856,6 +876,47 @@ class Fixture:
                  if (match := re.fullmatch(r'  (\S.*):(\d+)', line))]
         return expected, actual, location_keys(expected, self.root), location_keys(items, self.root)
 
+    def suppression_check(self, check: sqlite3.Row):
+        query = json.loads(check['subject'])['query']
+        pattern = SUPPRESSION_PATTERN
+        if query:
+            literal = re.escape(query)
+            pattern = f'(?:{pattern}).*(?i:{literal})|(?i:{literal}).*(?:{pattern})'
+        expected = self.oracle_text(check, {
+            'project_path': str(self.root), 'query': pattern, 'regex': True,
+            'caseSensitive': True, 'context': 'all', 'filePattern': '*.java', 'pageSize': 500,
+        })
+        arguments = [] if query is None else [query]
+        actual = self.text_cli('suppress', *arguments, '--limit', '1000000')
+        locations = grep_locations(actual, self.root, r'@Suppress annotations \((\d+)\):', 1000000)
+        if len(locations) >= 1000000:
+            raise Unsupported('suppression result reached CLI collection limit')
+        return expected, actual, location_keys(expected, self.root), locations
+
+    def injection_check(self, check: sqlite3.Row):
+        name = check['subject']
+        if not self._injection_ready:
+            # Sources are frozen for an audit/replay invocation and validated
+            # again at its end. Rebuild derived truth for every new fixture;
+            # an interrupted build is never a reusable completeness marker.
+            with self.state:
+                self.state.execute('DELETE FROM source_injection_targets')
+            for path in java_files(self.root):
+                file = path.relative_to(self.root).as_posix()
+                entries = self.structure(file)
+                with self.state:
+                    self.state.executemany('INSERT OR IGNORE INTO source_injection_targets VALUES (?,?,?)',
+                        ((target['name'], file, target['line']) for entry in entries
+                         if entry['kind'] == 'annotation' for target in entry.get('injection_targets', [])))
+            self._injection_ready = True
+        expected = [{'file': row['path'], 'line': row['line']} for row in self.state.execute(
+            'SELECT path,line FROM source_injection_targets WHERE name=? ORDER BY path,line', (name,))]
+        actual = self.text_cli('inject', name, '--limit', '1000000')
+        locations = grep_locations(actual, self.root, r"Injection points for '.+' \((\d+)\):", 1000000)
+        if len(locations) >= 1000000:
+            raise Unsupported('injection result reached CLI collection limit')
+        return expected, actual, location_keys(expected, self.root), locations
+
     def option_check(self, check: sqlite3.Row):
         file = relative_path(check['subject'], self.root)
         command = check['feature'].split(':')[0]
@@ -1190,6 +1251,7 @@ class Fixture:
                        "symbol:options": self.option_check, "class:options": self.option_check,
                        "symbol:qualified-pattern": self.option_check, "class:qualified-pattern": self.option_check,
                        "todo": self.grep_check, "deprecated": self.grep_check, "deeplinks": self.grep_check,
+                       "suppress": self.suppression_check, "inject": self.injection_check,
                        "search:references": self.search_aggregation_check, "search:ranking": self.search_ranking_check,
                        "search:content": self.text_search_check, "annotations": self.text_search_check, **dict.fromkeys(("implementations", "hierarchy", "refs", "usages", "callers"), self.semantic_check)}.get(check["feature"])
             if check["feature"] in {"stats", "query", "schema", "db-path"}:
@@ -1254,14 +1316,23 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     pending_contracts = {
         "search:rank-presets": "history/graph ranking presets and test exclusion contracts not implemented yet",
         "deeplinks:non-java": "non-Java deeplink scopes require separate text/applicability contracts",
+        "suppress:non-java": "Kotlin suppression scope requires a separate text/applicability contract",
+        "inject:non-java": "Kotlin injection scope requires a separate syntax/applicability contract",
     }
     type_names = {Path(entry["path"]).stem for entry in source_files}
+    candidate_names = set(candidates)
     annotation_names = set()
+    suppression_queries = {None, '', '__audit_absent_suppression__'}
     if root is not None:
         for entry in source_files:
-            code = java_code_without_literals((root / entry["path"]).read_text(encoding="utf-8"))
+            content = (root / entry["path"]).read_text(encoding="utf-8")
+            code = java_code_without_literals(content)
             annotation_names.update(re.findall(r"@([\w$]+)", code))
             type_names.update(re.findall(r"\b(?:class|interface|enum|record)\s+([\w$]+)", code))
+            for line in content.splitlines():
+                if re.search(SUPPRESSION_PATTERN, line):
+                    for query in re.findall(r'"([^"\n]+)"', line):
+                        suppression_queries.update((query, query.upper()))
     with state:
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
@@ -1269,6 +1340,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 ("internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
                  "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
                  "live MCP text locations (Java scope only; other language scopes remain pending)" if feature == "deeplinks" else
+                 "live MCP text locations (Java suppression scope; Kotlin contract remains pending)" if feature == "suppress" else
+                 "independent JDK syntax: injection declaration type locations (Java scope; Kotlin contract remains pending)" if feature == "inject" else
                  "live MCP text locations" if feature in {"annotations", "search:content", "todo", "deprecated"} else
                  "independent JDK syntax: qualified patterns and combined fuzzy/kind filters" if feature in {"symbol:qualified-pattern", "class:qualified-pattern"} else
                  "independent JDK syntax: patterns, filters, fuzzy lookup and source bodies" if feature in {"symbol:options", "class:options"} else
@@ -1287,11 +1360,20 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": name}), feature, name,
                 ))
-        for name in sorted(candidates):
+        for name in sorted(candidate_names):
             for feature in ("symbol", "search", "search:content", "search:references", "search:ranking"):
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": name}), feature, name,
                 ))
+        for name in sorted(type_names | candidate_names):
+            state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)', (
+                stable_id({'feature': 'inject', 'subject': name}), 'inject', name,
+            ))
+        for query in sorted(suppression_queries, key=lambda value: (value is not None, value or '')):
+            subject = canonical_json({'query': query})
+            state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)', (
+                stable_id({'feature': 'suppress', 'subject': subject}), 'suppress', subject,
+            ))
         for name in sorted({Path(entry["path"]).name for entry in source_files}):
             for feature in ('file', 'search:files'):
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (

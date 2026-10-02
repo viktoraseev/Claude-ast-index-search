@@ -12,6 +12,24 @@ from common import ToolError, connect
 
 
 class CycleTests(unittest.TestCase):
+    def test_empty_problem_batch_prioritizes_a_coverage_family(self):
+        summary = {"evidence": "evidence.sqlite", "counts": {"pass": 100},
+                   "unimplemented_features": 53}
+        prompt = cycle.agent_prompt(summary, Path("project"))
+        self.assertIn("close one coherent family of pending contracts", prompt)
+        self.assertIn("not just one easy command", prompt)
+        self.assertIn("all relevant file types", prompt)
+        self.assertIn("Java-only inventory is not proof", prompt)
+
+    def test_recorded_problems_and_failed_verification_take_priority(self):
+        cases = [{"counts": {kind: 1}} for kind in ("fail", "unsupported", "error")]
+        cases.append({"counts": {"pass": 100}, "verification": {"verified": False}})
+        for case in cases:
+            with self.subTest(case=case):
+                prompt = cycle.agent_prompt({"evidence": "evidence.sqlite", **case}, Path("project"))
+                self.assertIn("repair the recorded problem batch or failed verification first", prompt)
+                self.assertNotIn("close one coherent family of pending contracts", prompt)
+
     def test_failed_command_keeps_payload_on_disk_not_in_exception(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

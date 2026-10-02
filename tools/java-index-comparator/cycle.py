@@ -112,8 +112,20 @@ def reload_driver(completed: int = 0) -> None:
 
 
 def agent_prompt(summary: dict, root: Path) -> str:
+    problems = any(summary.get('counts', {}).get(kind, 0)
+                   for kind in ('fail', 'unsupported', 'error'))
+    failed_verification = summary.get('verification', {}).get('verified') is False
+    if problems or failed_verification:
+        priority = "Round priority: repair the recorded problem batch or failed verification first."
+    else:
+        priority = """Round priority: close one coherent family of pending contracts,
+not just one easy command followed by another expensive full audit. Inspect the
+pending list first, group commands sharing an oracle or fixture, and implement
+the related contracts together. Do not trade correctness for a coverage count;
+leave genuinely unresolved contracts pending and explain the remaining gap."""
     return f"""Read AGENTS.md and repository contributor rules. This is one round of an
 automated differential repair, not permission to redefine the goal.
+{priority}
 Target is read-only: {root}. Evidence SQLite: {summary['evidence']}.
 Latest verification: {canonical_json(summary.get('verification', {}))}.
 Round logs: {summary.get('round_logs', 'not available')}.
@@ -129,6 +141,13 @@ contract checks. A native DB agreeing with native output does not establish MCP
 equivalence. Label each evidence source accurately; do not claim MCP coverage
 for an oracle-less command. Language-inapplicable features need explicit,
 reproducible applicability evidence, not a blanket skip or a fake pass.
+Determine applicability with a bounded inventory of all relevant file types
+inside the exact target root. A Java-only inventory is not proof that another
+language or framework is absent. Persist the inventory evidence privately and
+add synthetic negative tests proving that an applicable feature cannot be
+silently classified as inapplicable. Mutation commands may be exercised only
+on disposable fixtures inside this repository's artifact directory, never on
+the read-only target, real hooks, shared MCP configuration or another index.
 Support missing audit contracts rather than marking them covered or skipping
 them. All applicable ast-index features remain in scope, not only class/symbol.
 Do not modify the target project. Do not commit target source, evidence databases,

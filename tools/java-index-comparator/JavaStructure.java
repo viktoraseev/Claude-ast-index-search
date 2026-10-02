@@ -61,12 +61,15 @@ public class JavaStructure {
                     emit(kind, name, position, position);
                 }
                 void emit(String kind, String name, int position, int finish) {
+                    emit(kind, name, position, finish, "");
+                }
+                void emit(String kind, String name, int position, int finish, String extra) {
                     String qualified = qualifiedName(kind, name);
                     entries.add("{\"kind\":" + quote(kind) + ",\"name\":" + quote(name)
                         + ",\"line\":" + unit.getLineMap().getLineNumber(position)
                         + ",\"column\":" + (position - source.lastIndexOf('\n', position - 1))
                         + ",\"end_line\":" + unit.getLineMap().getLineNumber(Math.max(position, finish - 1))
-                        + (qualified == null ? "" : ",\"qualified_name\":" + quote(qualified)) + "}");
+                        + (qualified == null ? "" : ",\"qualified_name\":" + quote(qualified)) + extra + "}");
                 }
                 String qualifiedName(String kind, String name) {
                     if (List.of("import", "usage", "annotation").contains(kind)) return null;
@@ -187,7 +190,45 @@ public class JavaStructure {
                 }
                 @Override public Void visitAnnotation(AnnotationTree tree, Void unused) {
                     String name = tree.getAnnotationType().toString();
-                    emit("annotation", "@" + name.substring(name.lastIndexOf('.') + 1), start(tree));
+                    String simple = name.substring(name.lastIndexOf('.') + 1);
+                    String extra = "";
+                    TreePath parent = getCurrentPath().getParentPath();
+                    if (List.of("Inject", "Autowired").contains(simple)
+                        && parent != null && parent.getLeaf() instanceof ModifiersTree) {
+                        Tree owner = parent.getParentPath().getLeaf();
+                        List<Tree> types = new ArrayList<>();
+                        if (owner instanceof VariableTree variable) types.add(variable.getType());
+                        if (owner instanceof MethodTree method)
+                            for (VariableTree parameter : method.getParameters()) types.add(parameter.getType());
+                        List<String> targets = new ArrayList<>();
+                        for (Tree type : types) {
+                            if (type == null || start(type) < 0 || end(type) < start(type)) continue;
+                            new TreeScanner<Void, Void>() {
+                                void target(String name, int position) {
+                                    targets.add("{\"name\":" + quote(name) + ",\"line\":"
+                                        + unit.getLineMap().getLineNumber(position) + "}");
+                                }
+                                @Override public Void visitIdentifier(IdentifierTree identifier, Void unused) {
+                                    target(identifier.getName().toString(), start(identifier));
+                                    return null;
+                                }
+                                @Override public Void visitMemberSelect(MemberSelectTree member, Void unused) {
+                                    String name = member.getIdentifier().toString();
+                                    target(name, end(member) - name.length());
+                                    return super.visitMemberSelect(member, unused);
+                                }
+                                @Override public Void visitPrimitiveType(PrimitiveTypeTree primitive, Void unused) {
+                                    target(primitive.toString(), start(primitive));
+                                    return null;
+                                }
+                                @Override public Void visitAnnotation(AnnotationTree annotation, Void unused) {
+                                    return null; // Type-use annotation names/arguments are not injected types.
+                                }
+                            }.scan(type, null);
+                        }
+                        extra = ",\"injection_targets\":[" + String.join(",", targets) + "]";
+                    }
+                    emit("annotation", "@" + simple, start(tree), start(tree), extra);
                     return super.visitAnnotation(tree, unused);
                 }
             }.scan(unit, null);

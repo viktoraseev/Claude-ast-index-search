@@ -1060,21 +1060,28 @@ pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<
 
 /// Find @Suppress annotations
 pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let pattern = pattern_with_line_filter(r"@Suppress", query);
+    let pattern =
+        pattern_with_line_filter(r"@(?:[\w$]+:)?(?:[\w$]+\.)*Suppress(?:Warnings)?\b", query);
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files_limited(root, &pattern, &["kt"], limit, |path, line_num, line| {
-        if let Some(q) = query {
-            if !line.to_lowercase().contains(&q.to_lowercase()) {
-                return;
+    search_files_limited(
+        root,
+        &pattern,
+        &["kt", "java"],
+        limit,
+        |path, line_num, line| {
+            if let Some(q) = query {
+                if !line.to_lowercase().contains(&q.to_lowercase()) {
+                    return;
+                }
             }
-        }
 
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(80).collect();
-        items.push((rel_path, line_num, content));
-    })?;
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(80).collect();
+            items.push((rel_path, line_num, content));
+        },
+    )?;
 
     println!(
         "{}",
@@ -1115,12 +1122,20 @@ pub fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
         let Ok(content) = std::fs::read_to_string(path) else {
             continue;
         };
-        if !content.contains("@Inject") && !content.contains("Autowired") {
+        let java = path
+            .extension()
+            .is_some_and(|extension| extension == "java");
+        if !content.contains("Inject") && !content.contains("Autowired") {
             continue;
         }
         let lines: Vec<&str> = content.lines().collect();
         let rel_path = relative_path(root, path);
-        for line_idx in injection_lines(&content, &type_re) {
+        let injection_sites = if java {
+            crate::parsers::treesitter::java::injection_lines(&content, &type_re)?
+        } else {
+            injection_lines(&content, &type_re)
+        };
+        for line_idx in injection_sites {
             if items.len() >= limit {
                 break;
             }
