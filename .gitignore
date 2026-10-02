@@ -1,4 +1,6 @@
 /target
+/.artifacts/
+__pycache__/
 # Only the top-level .claude/ is scoped — the leading slash keeps paths
 # like `examples/.claude/...` untouched (those are templates for users).
 /.claude/*
