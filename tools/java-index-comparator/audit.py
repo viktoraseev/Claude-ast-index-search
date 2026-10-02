@@ -21,6 +21,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tomllib
 from typing import Any
 
 from common import (
@@ -92,7 +93,9 @@ class InvocationOracle:
         return response
 
 
-LIVE_FEATURES = {"class", "class-qualified", "symbol", "file", "outline", "imports",
+INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list'}
+
+LIVE_FEATURES = INTERNAL_FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated"}
 
@@ -974,6 +977,63 @@ class Fixture:
         finally:
             source.close()
 
+    def analysis_management_check(self, check: sqlite3.Row):
+        """Validate read-only internal contracts; these do not claim MCP equivalence."""
+        feature = check['feature']
+        if feature == 'version':
+            manifest = Path(__file__).resolve().parents[2] / 'Cargo.toml'
+            expected = 'ast-index v' + tomllib.loads(manifest.read_text())['package']['version']
+            actual = self.text_cli('version').strip()
+            return expected, actual, {expected}, {actual}
+        source = connect(self.database, read_only=True)
+        try:
+            if feature in {'list-roots', 'subtree:list'}:
+                expected = [dict(row) for row in source.execute(
+                    'SELECT name,canonical_path,original_path FROM subtrees ORDER BY name')]
+                actual = self.cli('list-roots') if feature == 'list-roots' else self.cli('subtree', 'list')
+                if not isinstance(actual, list):
+                    raise Unsupported('root listing has no array')
+                return expected, actual, {(canonical_json(expected),)}, {(canonical_json(actual),)}
+            # The command promises potentially unused *indexed* symbols. This
+            # checks its selection and limits, not correctness of the index.
+            rows = source.execute('''SELECT s.name,s.kind,s.line,f.path FROM symbols s
+                JOIN files f ON f.id=s.file_id
+                WHERE s.kind IN ('class','interface','function','object','enum','protocol','struct')
+                AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.name=s.name)
+                AND NOT EXISTS (SELECT 1 FROM xml_usages x WHERE x.class_name=s.name)
+                AND NOT EXISTS (SELECT 1 FROM storyboard_usages b WHERE b.class_name=s.name)
+                ORDER BY f.path,s.line''')
+            expected = [dict(row) for row in rows]
+            outputs, expected_keys, actual_keys = {}, set(), set()
+            modes = [('full', [], expected),
+                     ('exports', ['--export-only'], [item for item in expected if re.match('[A-Z]', item['name'])]),
+                     ('absent-module', ['--module', '__audit_absent_module__'], [])]
+            # Exercise a real path scope and every configured module name too.
+            if expected:
+                prefix = str(Path(expected[0]['path']).parent)
+                prefix = '' if prefix == '.' else prefix + '/'
+                modes.append(('path-module', ['--module', prefix],
+                              [item for item in expected if item['path'].startswith(prefix)]))
+            for row in source.execute('SELECT name,path FROM modules ORDER BY name'):
+                if not row['path']:
+                    continue
+                prefix = row['path'].rstrip('/') + '/'
+                modes.append(('named-module:' + row['name'], ['--module', row['name']],
+                              [item for item in expected if item['path'].startswith(prefix)]))
+            def identity(item):
+                return item['name'], item['kind'], relative_path(item['path'], self.root), item['line']
+            for mode, arguments, selected in modes:
+                for limit in (1, 3, 1000000):
+                    output = self.cli('unused-symbols', *arguments, '--limit', str(limit))
+                    if not isinstance(output, list):
+                        raise Unsupported('unused-symbols has no result array')
+                    outputs[mode + ':' + str(limit)] = output
+                    expected_keys.update((mode, limit, index, *identity(item)) for index, item in enumerate(selected[:limit]))
+                    actual_keys.update((mode, limit, index, *identity(item)) for index, item in enumerate(output))
+            return expected, outputs, expected_keys, actual_keys
+        finally:
+            source.close()
+
     def evaluate(self, check: sqlite3.Row) -> None:
         with self.state:
             self.state.execute("DELETE FROM pages WHERE check_id=?", (check["id"],))
@@ -989,6 +1049,8 @@ class Fixture:
                        "search:content": self.text_search_check, "annotations": self.text_search_check, **dict.fromkeys(("implementations", "hierarchy", "refs", "usages", "callers"), self.semantic_check)}.get(check["feature"])
             if check["feature"] in {"stats", "query", "schema", "db-path"}:
                 handler = self.introspection_check
+            if check['feature'] in INTERNAL_FEATURES:
+                handler = self.analysis_management_check
             if handler is None:
                 raise Unsupported(f"no live handler for {check['feature']}")
             expected, actual, expected_keys, actual_keys = handler(check)
@@ -1056,7 +1118,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                ("independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
+                ("internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
+                 "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
                  "live MCP text locations" if feature in {"annotations", "search:content", "todo", "deprecated"} else
                  "independent JDK syntax: qualified patterns and combined fuzzy/kind filters" if feature in {"symbol:qualified-pattern", "class:qualified-pattern"} else
                  "independent JDK syntax: patterns, filters, fuzzy lookup and source bodies" if feature in {"symbol:options", "class:options"} else
@@ -1094,7 +1157,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": entry["path"]}), feature, entry["path"],
                 ))
-        for feature in ("stats", "query", "schema", "db-path", "todo", "deprecated"):
+        for feature in ("stats", "query", "schema", "db-path", "todo", "deprecated", *sorted(INTERNAL_FEATURES)):
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))

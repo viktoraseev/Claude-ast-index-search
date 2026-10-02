@@ -1338,7 +1338,9 @@ pub fn cmd_usages(
 
         let (source, total) = ReferenceSource::resolve(&conn, symbol, scope)?;
 
-        if total > 0 {
+        // An indexed declaration with zero references is an authoritative empty
+        // result. Grep would turn its declaration and prose into false usages.
+        if total > 0 || db::count_symbols_by_name_scoped(&conn, symbol, None, scope, true)? > 0 {
             let mut refs = source.find(&conn, symbol, limit, scope)?;
             let resolver = PathResolver::try_from_conn(root, &conn)?;
             refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));

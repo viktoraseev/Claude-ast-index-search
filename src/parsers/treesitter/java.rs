@@ -463,11 +463,21 @@ fn java_refs(
                         | "type_parameter"
                         | "enum_constant"
                         | "annotation_type_element_declaration"
+                        | "enhanced_for_statement"
+                        | "instanceof_expression"
+                        | "type_pattern"
                 ) && parent
                     .child_by_field_name("name")
                     .is_some_and(|name| name.id() == node.id())
             });
-            if !declaration {
+            let lambda_binding = node.parent().is_some_and(|parent| {
+                parent.kind() == "inferred_parameters"
+                    || (parent.kind() == "lambda_expression"
+                        && parent
+                            .child_by_field_name("parameters")
+                            .is_some_and(|parameters| parameters.id() == node.id()))
+            });
+            if !declaration && !lambda_binding {
                 let line = node_line(&node);
                 refs.push(ParsedRef {
                     name: node_text(content, &node).to_string(),
@@ -481,6 +491,35 @@ fn java_refs(
         super::WalkControl::Continue
     });
     Ok(refs)
+}
+
+/// Find Java invocation identifier lines, excluding declarations and method references.
+pub fn invocation_lines(content: &str, name: &str) -> Result<std::collections::HashSet<usize>> {
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut lines = std::collections::HashSet::new();
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        let identifier = match node.kind() {
+            "method_invocation" => node.child_by_field_name("name"),
+            "object_creation_expression" => node.child_by_field_name("type").map(|mut ty| {
+                // Generic and qualified constructor names end in a type identifier.
+                if ty.kind() == "generic_type" {
+                    ty = ty.named_child(0).unwrap_or(ty);
+                }
+                if ty.kind() == "scoped_type_identifier" {
+                    ty = ty.child_by_field_name("name").unwrap_or(ty);
+                }
+                ty
+            }),
+            _ => None,
+        };
+        if let Some(identifier) = identifier {
+            if node_text(content, &identifier) == name {
+                lines.insert(node_line(&identifier));
+            }
+        }
+        super::WalkControl::Continue
+    });
+    Ok(lines)
 }
 
 type QualifiedNameOccurrences = HashMap<(String, usize, String), VecDeque<Option<String>>>;

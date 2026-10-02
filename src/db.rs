@@ -7724,21 +7724,30 @@ pub fn find_definitions_on_line(
     Ok(names)
 }
 
+/// Escape a literal identifier prefix for SQLite LIKE.
+fn literal_reference_prefix(query: &str) -> String {
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{escaped}%")
+}
+
 /// Search references by name (prefix match, grouped by unique name)
 pub fn search_refs(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(String, i64)>> {
-    let pattern = format!("{}%", query);
+    let pattern = literal_reference_prefix(query);
     let mut stmt = conn.prepare(
         r#"
         SELECT r.name, COUNT(*) as usage_count
         FROM refs r
-        WHERE r.name LIKE ?1
+        WHERE r.name LIKE ?1 ESCAPE '\'
         GROUP BY r.name
         ORDER BY
             CASE WHEN r.name = ?2 THEN 0
-                 WHEN r.name LIKE ?1 THEN 1
+                 WHEN r.name LIKE ?1 ESCAPE '\' THEN 1
                  ELSE 2
             END,
-            usage_count DESC
+            usage_count DESC, r.name
         LIMIT ?3
         "#,
     )?;
@@ -7752,8 +7761,8 @@ pub fn search_refs(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(
 
 pub fn count_search_refs(conn: &Connection, query: &str) -> Result<usize> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT name) FROM refs WHERE name LIKE ?1",
-        params![format!("{query}%")],
+        "SELECT COUNT(DISTINCT name) FROM refs WHERE name LIKE ?1 ESCAPE '\\'",
+        params![literal_reference_prefix(query)],
         |row| row.get(0),
     )?;
     Ok(count as usize)
@@ -7764,11 +7773,14 @@ pub fn count_search_ref_terms(conn: &Connection, terms: &[&str]) -> Result<usize
         return Ok(0);
     }
     let predicates = (0..terms.len())
-        .map(|_| "name LIKE ?")
+        .map(|_| "name LIKE ? ESCAPE '\\'")
         .collect::<Vec<_>>()
         .join(" OR ");
     let sql = format!("SELECT COUNT(DISTINCT name) FROM refs WHERE {predicates}");
-    let values: Vec<String> = terms.iter().map(|term| format!("{term}%")).collect();
+    let values: Vec<String> = terms
+        .iter()
+        .map(|term| literal_reference_prefix(term))
+        .collect();
     let params: Vec<&dyn rusqlite::types::ToSql> = values
         .iter()
         .map(|value| value as &dyn rusqlite::types::ToSql)
@@ -7786,14 +7798,17 @@ pub fn count_search_ref_terms_scoped(
         return Ok(0);
     }
     let predicates = (0..terms.len())
-        .map(|_| "r.name LIKE ?")
+        .map(|_| "r.name LIKE ? ESCAPE '\\'")
         .collect::<Vec<_>>()
         .join(" OR ");
     let (scope_clause, scope_params) = scope.path_condition();
     let sql = format!(
         "SELECT COUNT(DISTINCT r.name) FROM refs r JOIN files f ON r.file_id = f.id WHERE ({predicates}){scope_clause}"
     );
-    let mut values: Vec<String> = terms.iter().map(|term| format!("{term}%")).collect();
+    let mut values: Vec<String> = terms
+        .iter()
+        .map(|term| literal_reference_prefix(term))
+        .collect();
     values.extend(scope_params);
     let params: Vec<&dyn rusqlite::types::ToSql> = values
         .iter()
@@ -7813,14 +7828,17 @@ pub fn search_ref_terms_scoped(
         return Ok(Vec::new());
     }
     let predicates = (0..terms.len())
-        .map(|_| "r.name LIKE ?")
+        .map(|_| "r.name LIKE ? ESCAPE '\\'")
         .collect::<Vec<_>>()
         .join(" OR ");
     let (scope_clause, scope_params) = scope.path_condition();
     let sql = format!(
         "SELECT r.name, COUNT(*) AS usage_count FROM refs r JOIN files f ON r.file_id = f.id WHERE ({predicates}){scope_clause} GROUP BY r.name ORDER BY usage_count DESC, r.name LIMIT ?"
     );
-    let mut values: Vec<String> = terms.iter().map(|term| format!("{term}%")).collect();
+    let mut values: Vec<String> = terms
+        .iter()
+        .map(|term| literal_reference_prefix(term))
+        .collect();
     values.extend(scope_params);
     values.push(limit.to_string());
     let params: Vec<&dyn rusqlite::types::ToSql> = values
@@ -7851,13 +7869,13 @@ pub fn search_refs_scoped(
         SELECT r.name, COUNT(*) AS usage_count
         FROM refs r
         JOIN files f ON r.file_id = f.id
-        WHERE r.name LIKE ?{scope_clause}
+        WHERE r.name LIKE ? ESCAPE '\'{scope_clause}
         GROUP BY r.name
-        ORDER BY CASE WHEN r.name = ? THEN 0 ELSE 1 END, usage_count DESC
+        ORDER BY CASE WHEN r.name = ? THEN 0 ELSE 1 END, usage_count DESC, r.name
         LIMIT ?
         "#
     );
-    let mut values = vec![format!("{query}%")];
+    let mut values = vec![literal_reference_prefix(query)];
     values.extend(scope_params);
     values.push(query.to_string());
     values.push(limit.to_string());

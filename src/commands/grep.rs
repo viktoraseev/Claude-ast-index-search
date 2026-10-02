@@ -289,7 +289,11 @@ pub fn cmd_callers(
     format: &str,
     in_file: Option<&str>,
 ) -> Result<()> {
-    let pattern = build_caller_pattern(function_name);
+    let pattern = format!(
+        "{}|{}",
+        build_caller_pattern(function_name),
+        regex::escape(function_name)
+    );
     let def_pattern = build_def_skip_pattern(function_name);
     let conn = db::open_db_leased(root)?;
     let resolver = PathResolver::try_from_conn(root, &conn)?;
@@ -300,6 +304,10 @@ pub fn cmd_callers(
         .as_ref()
         .and_then(|words| words.prefilter(&[function_name]));
 
+    // Retain one parsed Java file, so project-sized caller scans stay bounded.
+    let mut java_calls = None;
+    let mut java_error = None;
+    let caller_regex = Regex::new(&build_caller_pattern(function_name))?;
     let page = super::search_files_page_in_kept(
         root,
         &roots,
@@ -307,8 +315,36 @@ pub fn cmd_callers(
         &ALL_SOURCE_EXTENSIONS,
         limit,
         prefilter.as_ref(),
-        &|_, line| !def_pattern.is_match(line),
+        &|path, line| {
+            path.extension().is_some_and(|ext| ext == "java") || !def_pattern.is_match(line)
+        },
         |path, line_num, line| {
+            if path.extension().is_some_and(|ext| ext == "java") {
+                if java_calls.as_ref().is_none_or(
+                    |(cached, _): &(PathBuf, std::collections::HashSet<usize>)| cached != path,
+                ) {
+                    let calls = match std::fs::read_to_string(path)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|content| {
+                            crate::parsers::treesitter::java::invocation_lines(
+                                &content,
+                                function_name,
+                            )
+                        }) {
+                        Ok(calls) => calls,
+                        Err(error) => {
+                            java_error = Some(error);
+                            return None;
+                        }
+                    };
+                    java_calls = Some((path.to_path_buf(), calls));
+                }
+                if !java_calls.as_ref().unwrap().1.contains(&line_num) {
+                    return None;
+                }
+            } else if !caller_regex.is_match(line) {
+                return None;
+            }
             let rel_path = super::display_path(&resolver, root, path);
             if let Some(filter) = in_file {
                 if !rel_path.contains(filter) {
@@ -319,6 +355,9 @@ pub fn cmd_callers(
             Some((rel_path, line_num, content))
         },
     )?;
+    if let Some(error) = java_error {
+        return Err(error);
+    }
 
     if format == "json" {
         let items: Vec<_> = page
