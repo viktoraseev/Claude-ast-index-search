@@ -1,6 +1,7 @@
 //! Tree-sitter based Java parser
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
@@ -340,6 +341,91 @@ impl LanguageParser for JavaParser {
 
         Ok(symbols)
     }
+}
+
+pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, String), String>> {
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let root = tree.root_node();
+    let mut root_cursor = root.walk();
+    let package = root
+        .named_children(&mut root_cursor)
+        .find(|node| node.kind() == "package_declaration")
+        .and_then(|node| {
+            let mut cursor = node.walk();
+            let name = node
+                .named_children(&mut cursor)
+                .find(|child| matches!(child.kind(), "identifier" | "scoped_identifier"));
+            name
+        })
+        .map(|node| node_text(content, &node).to_string());
+    let query = &*JAVA_QUERY;
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(query, root, content.as_bytes());
+    let mut names = HashMap::new();
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let kinds: &[SymbolKind] = match query.capture_names()[capture.index as usize] {
+                "class_name" => &[SymbolKind::Class],
+                "interface_name" => &[SymbolKind::Interface],
+                "enum_name" => &[SymbolKind::Enum],
+                "method_name" | "constructor_name" => &[SymbolKind::Function],
+                "field_name" => &[SymbolKind::Property],
+                "record_component_name" => &[SymbolKind::Property, SymbolKind::Function],
+                _ => continue,
+            };
+            let name = node_text(content, &capture.node);
+            let mut ancestors = Vec::new();
+            let mut node = capture.node.parent();
+            let mut is_local = false;
+            while let Some(parent) = node {
+                match parent.kind() {
+                    "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration" => {
+                        if let Some(owner) = parent.child_by_field_name("name") {
+                            // The captured type's own name is already the final segment.
+                            if owner.id() != capture.node.id() {
+                                ancestors.push(node_text(content, &owner).to_string());
+                            }
+                        }
+                    }
+                    "method_declaration" | "constructor_declaration" => {
+                        // Every callable other than this declaration encloses a
+                        // local or anonymous type, which has no Java FQN.
+                        if parent.child_by_field_name("name").map(|owner| owner.id())
+                            != Some(capture.node.id())
+                        {
+                            is_local = true;
+                        }
+                    }
+                    "object_creation_expression" => is_local = true,
+                    _ => {}
+                }
+                node = parent.parent();
+            }
+            if is_local {
+                continue;
+            }
+            ancestors.reverse();
+            if let Some(package) = &package {
+                ancestors.insert(0, package.clone());
+            }
+            ancestors.push(name.to_string());
+            let qualified = ancestors.join(".");
+            for kind in kinds {
+                names.insert(
+                    (
+                        kind.as_str().to_string(),
+                        node_line(&capture.node),
+                        name.to_string(),
+                    ),
+                    qualified.clone(),
+                );
+            }
+        }
+    }
+    Ok(names)
 }
 
 /// Check if a node is inside a class/interface/enum/record body

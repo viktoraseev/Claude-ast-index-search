@@ -1337,6 +1337,8 @@ fn parse_file_keyed(
 
     if file_type == parsers::FileType::Cpp {
         qualified_names = parsers::treesitter::cpp::collect_qualified_names(&content)?;
+    } else if file_type == parsers::FileType::Java {
+        qualified_names = parsers::treesitter::java::collect_qualified_names(&content)?;
     }
 
     if file_type == parsers::FileType::TypeScript {

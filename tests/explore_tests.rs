@@ -439,7 +439,7 @@ fn rwr_keeps_name_matched_callers_where_the_graph_resolves_none() {
     assert!(
         names.contains(&(
             "caller".to_string(),
-            "src/main/java/b/Billing.java:close".to_string()
+            "src/main/java/b/Billing.java:b.Billing.close".to_string()
         )),
         "{names:?}"
     );
