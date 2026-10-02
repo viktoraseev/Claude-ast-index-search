@@ -12,9 +12,7 @@ import sqlite3
 import subprocess
 import sys
 
-from audit import scan
 from common import ToolError, canonical_json, connect, now_ms, source_snapshot
-from replay import replay
 
 
 SCHEMA = """
@@ -50,19 +48,57 @@ def changed_files(repository: Path) -> list[str]:
 
 
 def logged(command: list[str], repository: Path, directory: Path, name: str,
-           *, prompt: str | None = None, timeout: float | None = None) -> None:
+           *, prompt: str | None = None, timeout: float | None = None,
+           acceptable_exit_codes: tuple[int, ...] = (0,)) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / f"{name}.stdout.log").open("ab") as stdout, (directory / f"{name}.stderr.log").open("ab") as stderr:
         result = subprocess.run(command, cwd=repository, input=prompt.encode() if prompt is not None else None,
                                 stdout=stdout, stderr=stderr, timeout=timeout)
-    if result.returncode:
+    if result.returncode not in acceptable_exit_codes:
         raise ToolError(f"{name} failed ({result.returncode}); see round logs, payloads were not printed")
+
+
+def command_summary(command: list[str], directory: Path, label: str) -> dict:
+    name = f"{label}-{now_ms()}"
+    repository = Path(__file__).resolve().parents[2]
+    logged(command, repository, directory, name, acceptable_exit_codes=(0, 1))
+    with (directory / f"{name}.stdout.log").open("rb") as output:
+        value = output.read(1024 * 1024 + 1)
+    if len(value) > 1024 * 1024:
+        raise ToolError("tool emitted an unbounded aggregate summary")
+    result = json.loads(value)
+    if not isinstance(result, dict):
+        raise ToolError("tool summary must be an object")
+    return result
+
+
+def scan(arguments: argparse.Namespace) -> dict:
+    # Each invocation imports the current adapter implementation. A long-lived
+    # driver must not keep using the pre-repair Python module after agent edits.
+    command = [sys.executable, str(Path(__file__).with_name("audit.py")),
+               "--project-root", arguments.project_root, "--output-dir", arguments.output_dir,
+               "--ast-index", arguments.ast_index, "--mcp-name", arguments.mcp_name,
+               "--timeout", str(arguments.timeout), "--problem-limit", str(arguments.problem_limit)]
+    if arguments.mcp_url:
+        command.extend(["--mcp-url", arguments.mcp_url])
+    if arguments.case_limit is not None:
+        command.extend(["--case-limit", str(arguments.case_limit)])
+    return command_summary(command, Path(arguments.output_dir) / "logs", "audit")
+
+
+def replay(evidence: Path, root: Path, binary: Path, output: Path) -> dict:
+    command = [sys.executable, str(Path(__file__).with_name("replay.py")),
+               "--evidence", str(evidence), "--project-root", str(root),
+               "--ast-index", str(binary), "--output-dir", str(output), "--limit", "100"]
+    return command_summary(command, output / "logs", "replay")
 
 
 def agent_prompt(summary: dict, root: Path) -> str:
     return f"""Read AGENTS.md and repository contributor rules. This is one round of an
 automated differential repair, not permission to redefine the goal.
 Target is read-only: {root}. Evidence SQLite: {summary['evidence']}.
+Latest verification: {canonical_json(summary.get('verification', {}))}.
+Round logs: {summary.get('round_logs', 'not available')}.
 Read the checks table using a streaming cursor: up to the first 100 verdict=fail
 rows, plus unsupported/error and pending coverage contracts. Group by cause;
 do not generate one test per row. Add compact, public-safe regression fixtures
@@ -205,7 +241,8 @@ def run(arguments: argparse.Namespace) -> int:
                             continue
                         set_phase(state, round_id, "agent", summary_json=canonical_json(summary))
                     elif phase == "agent":
-                        logged(agent_command, repository, directory, "agent", prompt=agent_prompt(json.loads(row["summary_json"]), root), timeout=arguments.agent_timeout)
+                        summary = {**json.loads(row["summary_json"]), "round_logs": str(directory)}
+                        logged(agent_command, repository, directory, "agent", prompt=agent_prompt(summary, root), timeout=arguments.agent_timeout)
                         if git(repository, "rev-parse", "HEAD") != row["base_head"]:
                             raise ToolError("HEAD changed during agent work; review before continuing")
                         if not changed_files(repository):
@@ -215,10 +252,12 @@ def run(arguments: argparse.Namespace) -> int:
                         logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
                         logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
                         summary = json.loads(row["summary_json"])
-                        if summary["counts"].get("fail"):
+                        if summary["counts"].get("fail") or summary["counts"].get("unsupported"):
                             result = replay(Path(summary["evidence"]), root, repository / "target/release/ast-index", directory / "batch-verification")
                             if not result["verified"]:
-                                raise ToolError("the original problem batch still fails or is unsupported; refusing to commit")
+                                summary["verification"] = result
+                                set_phase(state, round_id, "agent", summary_json=canonical_json(summary))
+                                continue
                         logged(["cargo", "test", "--release", "--workspace"], repository, directory, "workspace-tests")
                         git(repository, "diff", "--check")
                         set_phase(state, round_id, "commit")
