@@ -26,7 +26,8 @@ class SearchSections(unittest.TestCase):
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()
-            (root / 'Example.java').write_text('class Example {\n' + '    // TODO repair\n' * 21 + '    @Deprecated void old() {}\n}\n')
+            (root / 'Example.java').write_text('class Example {\n' + '    // TODO repair\n' * 21 +
+                                             '    // DeepLink route\n' * 21 + '    @Deprecated void old() {}\n}\n')
             binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
             database = directory / 'index.sqlite'
             build_ast_index(str(binary), root, database, 'grep')
@@ -39,7 +40,7 @@ class SearchSections(unittest.TestCase):
                         return {'matches': [{'file': 'Example.java', 'line': i} for i, line in
                             enumerate((root / 'Example.java').read_text().splitlines(), 1) if pattern.search(line)]}
                 fixture = Fixture(root, binary, database, state, GrepOracle())
-                for feature in ('todo', 'deprecated'):
+                for feature in ('todo', 'deprecated', 'deeplinks'):
                     state.execute("INSERT INTO checks(id,feature,subject) VALUES (?,?, 'patterns')", (feature, feature))
                     state.commit()
                     fixture.evaluate(state.execute('SELECT * FROM checks WHERE id=?', (feature,)).fetchone())

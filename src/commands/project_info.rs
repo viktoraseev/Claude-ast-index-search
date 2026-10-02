@@ -210,7 +210,7 @@ fn cmd_map_summary(
         })
         .collect();
 
-    groups.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    groups.sort_by(|a, b| b.file_count.cmp(&a.file_count).then(a.path.cmp(&b.path)));
     let total_dirs = groups.len();
     groups.truncate(limit);
 
@@ -292,20 +292,21 @@ fn cmd_map_detailed(
     depth: usize,
     format: &str,
 ) -> Result<()> {
-    let module_filter = module.map(|m| format!("{}%", m));
+    // A module path is a literal, case-sensitive prefix, not a SQL LIKE pattern.
+    let module_filter = module.map(str::to_string);
     let sql = if module_filter.is_some() {
         r#"
-        SELECT s.name, s.kind, s.line, f.path
+        SELECT s.id, s.name, s.kind, s.line, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.parent_id IS NULL
           AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
-          AND f.path LIKE ?1
+          AND substr(f.path, 1, length(?1)) = ?1 COLLATE BINARY
         ORDER BY f.path, s.line
         "#
     } else {
         r#"
-        SELECT s.name, s.kind, s.line, f.path
+        SELECT s.id, s.name, s.kind, s.line, f.path
         FROM symbols s
         JOIN files f ON s.file_id = f.id
         WHERE s.parent_id IS NULL
@@ -317,17 +318,21 @@ fn cmd_map_detailed(
     let mut stmt = conn.prepare(sql)?;
 
     struct RawSym {
+        id: i64,
         name: String,
         kind: String,
+        line: i64,
         path: String,
     }
 
     let rows: Vec<RawSym> = if let Some(ref mf) = module_filter {
         stmt.query_map(params![mf], |row| {
             Ok(RawSym {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                path: row.get(3)?,
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                path: row.get(4)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -335,9 +340,11 @@ fn cmd_map_detailed(
     } else {
         stmt.query_map([], |row| {
             Ok(RawSym {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                path: row.get(3)?,
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                line: row.get(3)?,
+                path: row.get(4)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -345,44 +352,44 @@ fn cmd_map_detailed(
     };
 
     // Batch-load inheritance (deduplicated)
-    let mut inheritance_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut inheritance_map: HashMap<i64, Vec<String>> = HashMap::new();
     {
         let inh_sql = if module_filter.is_some() {
             r#"
-            SELECT DISTINCT s.name, i.parent_name
+            SELECT DISTINCT s.id, i.parent_name
             FROM inheritance i
             JOIN symbols s ON i.child_id = s.id
             JOIN files f ON s.file_id = f.id
-            WHERE s.parent_id IS NULL AND f.path LIKE ?1
-            ORDER BY s.name
+            WHERE s.parent_id IS NULL AND substr(f.path, 1, length(?1)) = ?1 COLLATE BINARY
+            ORDER BY s.id, i.parent_name COLLATE BINARY
             "#
         } else {
             r#"
-            SELECT DISTINCT s.name, i.parent_name
+            SELECT DISTINCT s.id, i.parent_name
             FROM inheritance i
             JOIN symbols s ON i.child_id = s.id
             WHERE s.parent_id IS NULL
-            ORDER BY s.name
+            ORDER BY s.id, i.parent_name COLLATE BINARY
             "#
         };
         let mut inh_stmt = conn.prepare(inh_sql)?;
         let inh_rows = if let Some(ref mf) = module_filter {
             inh_stmt
                 .query_map(params![mf], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
                 .filter_map(|r| r.ok())
                 .collect::<Vec<_>>()
         } else {
             inh_stmt
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 })?
                 .filter_map(|r| r.ok())
                 .collect::<Vec<_>>()
         };
-        for (name, parent) in inh_rows {
-            let parents = inheritance_map.entry(name).or_default();
+        for (id, parent) in inh_rows {
+            let parents = inheritance_map.entry(id).or_default();
             if !parents.contains(&parent) {
                 parents.push(parent);
             }
@@ -400,7 +407,7 @@ fn cmd_map_detailed(
     let mut dir_file_counts: HashMap<String, i64> = HashMap::new();
     {
         let fc_sql = if module_filter.is_some() {
-            "SELECT path FROM files WHERE path LIKE ?1"
+            "SELECT path FROM files WHERE substr(path, 1, length(?1)) = ?1 COLLATE BINARY"
         } else {
             "SELECT path FROM files"
         };
@@ -427,7 +434,7 @@ fn cmd_map_detailed(
     dir_keys.sort_by(|a, b| {
         let fa = dir_file_counts.get(a).copied().unwrap_or(0);
         let fb = dir_file_counts.get(b).copied().unwrap_or(0);
-        fb.cmp(&fa)
+        fb.cmp(&fa).then(a.cmp(b))
     });
     dir_keys.truncate(limit);
 
@@ -439,13 +446,16 @@ fn cmd_map_detailed(
             kind_priority(&a.kind)
                 .cmp(&kind_priority(&b.kind))
                 .then(a.name.cmp(&b.name))
+                .then(a.path.cmp(&b.path))
+                .then(a.line.cmp(&b.line))
+                .then(a.id.cmp(&b.id))
         });
         sorted.truncate(per_dir);
 
         let map_syms: Vec<MapSymbol> = sorted
             .iter()
             .map(|s| {
-                let parents = inheritance_map.get(&s.name).cloned().unwrap_or_default();
+                let parents = inheritance_map.get(&s.id).cloned().unwrap_or_default();
                 let file = s.path.rsplit('/').next().unwrap_or(&s.path).to_string();
                 MapSymbol {
                     name: s.name.clone(),

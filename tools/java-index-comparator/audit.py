@@ -11,16 +11,19 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import fnmatch
 from functools import lru_cache
 import json
+from itertools import islice
 import os
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 from typing import Any
 
@@ -32,6 +35,7 @@ from common import (
 )
 from build_index import build_ast_index, freeze_binary
 from java_structure import structure_server
+from oracle_store import Metrics, OracleStore, Reply, ReplyCache, SCHEMA as ORACLE_SCHEMA
 
 
 SCHEMA = """
@@ -47,19 +51,10 @@ CREATE TABLE IF NOT EXISTS checks(
     UNIQUE(feature,subject)
 );
 CREATE INDEX IF NOT EXISTS checks_status ON checks(status, feature, subject);
-CREATE TABLE IF NOT EXISTS pages(
-    check_id TEXT NOT NULL REFERENCES checks(id) ON DELETE CASCADE,
-    page INTEGER NOT NULL, request_json TEXT NOT NULL, response_json TEXT NOT NULL,
-    tool TEXT NOT NULL,
-    PRIMARY KEY(check_id,page)
-);
 CREATE TABLE IF NOT EXISTS source_structures(
     path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL, entries_json TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS invocation_cache(
-    request_key TEXT PRIMARY KEY, response_json TEXT NOT NULL
-);
-"""
+""" + ORACLE_SCHEMA
 
 
 class Unsupported(ToolError):
@@ -74,30 +69,89 @@ class InvocationOracle:
     READ_ONLY = {"ide_find_class", "ide_find_symbol", "ide_find_file", "ide_find_references",
                  "ide_find_implementations", "ide_type_hierarchy", "ide_search_text"}
 
-    def __init__(self, client: Any, state: sqlite3.Connection):
+    def __init__(self, client: Any, state: sqlite3.Connection, *, metrics=None,
+                 max_entries=256, max_bytes=16 * 1024 * 1024):
         self.client, self.state = client, state
+        self.metrics = metrics or Metrics(state)
+        self.store = OracleStore(state, self.metrics)
+        self.memory = ReplyCache(max_entries, max_bytes)
 
     def call(self, tool: str, arguments: dict[str, Any]) -> Any:
-        if tool not in self.READ_ONLY or "cursor" in arguments:
+        reusable = tool in self.READ_ONLY and "cursor" not in arguments
+        key = stable_id({"tool": tool, "arguments": arguments}) if reusable else None
+        if reusable:
+            cached = self.memory.get(key)
+            if cached is not None:
+                self.metrics.record('oracle.memory_hit')
+                return cached
+            row = self.state.execute("""SELECT r.* FROM oracle_cache c JOIN oracle_responses r
+                ON r.id=c.response_id WHERE c.request_key=?""", (key,)).fetchone()
+            if row is not None:
+                started = time.perf_counter()
+                cached = Reply(json.loads(row['response_json']), self.state, row['id'], tool,
+                               row['request_json'], len(row['response_json'].encode()))
+                self.metrics.record('oracle.disk_decode', time.perf_counter() - started)
+                self.memory.put(key, cached)
+                return cached
+        response = self._network_call(tool, arguments)
+        return self._capture_reply(tool, arguments, response, key)
+
+    def _network_call(self, tool, arguments):
+        started = time.perf_counter()
+        try:
             return self.client.call(tool, arguments)
-        key = stable_id({"tool": tool, "arguments": arguments})
-        row = self.state.execute("SELECT response_json FROM invocation_cache WHERE request_key=?", (key,)).fetchone()
-        if row is not None:
-            return json.loads(row[0])
-        response = self.client.call(tool, arguments)
+        finally:
+            self.metrics.record('mcp.tool.' + tool, time.perf_counter() - started)
+
+    def _capture_reply(self, tool, arguments, response, key):
         # Cursor snapshots may expire independently. Reuse single-page answers;
         # paginated() still rejects the search collection cap on every use.
-        if isinstance(response, dict) and not any(response.get(flag) for flag in ("stale", "truncated", "hasMore", "nextCursor")):
-            with self.state:
-                self.state.execute("INSERT OR REPLACE INTO invocation_cache VALUES (?,?)", (key, canonical_json(response)))
-        return response
+        with self.state:
+            capture = self.store.capture(tool, arguments, response)
+            if key is not None and isinstance(capture, Reply) and not any(capture.get(flag) for flag in ("stale", "truncated", "hasMore", "nextCursor")):
+                self.state.execute('INSERT OR REPLACE INTO oracle_cache VALUES (?,?)', (key, capture.response_id))
+                self.memory.put(key, capture)
+            self.metrics.flush()
+        return capture if isinstance(capture, Reply) else response
+
+    def prefetch(self, tool, requests, *, workers=4):
+        """Network workers never touch SQLite; pages remain demand-recorded."""
+        if tool not in self.READ_ONLY or not 1 <= workers <= 4:
+            raise ToolError('prefetch requires a read-only tool and 1..4 workers')
+        if getattr(self.client, 'parallel_safe', False) is not True:
+            workers = 1
+        iterator = iter(requests)
+        started = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while chunk := list(islice(iterator, workers)):
+                missing = {}
+                for arguments in chunk:
+                    if 'cursor' in arguments:
+                        raise ToolError('cursor pages cannot be prefetched or reused')
+                    key = stable_id({'tool': tool, 'arguments': arguments})
+                    if self.memory.get(key) is None and not self.state.execute('SELECT 1 FROM oracle_cache WHERE request_key=?', (key,)).fetchone():
+                        missing[key] = arguments
+                if workers == 1:
+                    for arguments in missing.values():
+                        response = self.call(tool, arguments)
+                        if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
+                            raise Unsupported('MCP prefetch snapshot is stale or truncated')
+                    continue
+                futures = {executor.submit(self._network_call, tool, arguments): (key, arguments)
+                           for key, arguments in missing.items()}
+                for future in as_completed(futures):
+                    key, arguments = futures[future]
+                    response = self._capture_reply(tool, arguments, future.result(), key)
+                    if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
+                        raise Unsupported('MCP prefetch snapshot is stale or truncated')
+        self.metrics.record('oracle.prefetch_wall', time.perf_counter() - started)
 
 
-INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list'}
+INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
 LIVE_FEATURES = INTERNAL_FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
-                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated"}
+                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks"}
 
 
 def coverage_sources(state: sqlite3.Connection) -> dict[str, int]:
@@ -291,6 +345,9 @@ class Fixture:
     def __init__(self, root: Path, binary: Path, database: Path, state: sqlite3.Connection, client: Any,
                  *, schedule_followups: bool = True):
         self.root, self.binary, self.state, self.client = root, binary, state, client
+        client_metrics = getattr(client, 'metrics', None)
+        self.metrics = client_metrics if isinstance(client_metrics, Metrics) else Metrics(state)
+        self.oracle_store = OracleStore(state, self.metrics)
         self.database = database
         structure_digest = file_sha256(Path(__file__).with_name('JavaStructure.java'))
         old_structure = state.execute("SELECT value FROM metadata WHERE key='structure_sha256'").fetchone()
@@ -377,7 +434,11 @@ class Fixture:
         return entries, actual, expected_keys, actual_keys
 
     def cli(self, *arguments: str) -> Any:
-        value = run_command([str(self.binary), "--format", "json", *arguments], self.root, self.environment)
+        started = time.perf_counter()
+        try:
+            value = run_command([str(self.binary), "--format", "json", *arguments], self.root, self.environment)
+        finally:
+            self.metrics.record('cli.' + arguments[0], time.perf_counter() - started)
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError as error:
@@ -385,21 +446,21 @@ class Fixture:
         return parsed
 
     def text_cli(self, *arguments: str) -> str:
-        return run_command([str(self.binary), *arguments], self.root, self.environment)
+        started = time.perf_counter()
+        try:
+            return run_command([str(self.binary), *arguments], self.root, self.environment)
+        finally:
+            self.metrics.record('cli.' + arguments[0], time.perf_counter() - started)
 
     def paginated(self, check_id: str, tool: str, arguments: dict[str, Any], field: str) -> list[dict[str, Any]]:
         items = []
         cursors = set()
         # Several oracle operations (e.g. overloads) share one check. Preserve
         # every operation, in call order, for exact request-bound replay.
-        page = self.state.execute("SELECT coalesce(max(page)+1,0) FROM pages WHERE check_id=?", (check_id,)).fetchone()[0]
+        page = self.state.execute("SELECT coalesce(max(page)+1,0) FROM oracle_pages WHERE check_id=?", (check_id,)).fetchone()[0]
         while True:
             response = self.client.call(tool, arguments)
-            with self.state:
-                self.state.execute(
-                    "INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?)",
-                    (check_id, page, canonical_json(arguments), canonical_json(response), tool),
-                )
+            self.oracle_store.page(check_id, page, tool, arguments, response)
             # Current Index MCP uses `usages`; older captures use `references`.
             response_field = field
             if tool == "ide_find_references" and isinstance(response, dict) and field not in response:
@@ -507,7 +568,15 @@ class Fixture:
     def outline_check(self, check: sqlite3.Row) -> tuple[Any, Any, set[Any], set[Any]]:
         file = relative_path(check["subject"], self.root)
         code = java_code_without_literals((self.root / file).read_text(encoding="utf-8"))
-        candidates = sorted(set(re.findall(r"\b[\w$]+\b", code)))
+        # Keep legal dollar/Unicode identifiers, but never ask Go-to-Symbol
+        # about numeric literals: Java declaration names cannot start with digits.
+        candidates = sorted({name for name in re.findall(r"(?<![\w$])[_$\w]+", code)
+                             if not name[0].isdigit()})
+        if isinstance(self.client, InvocationOracle) and getattr(self.client.client, 'parallel_safe', False) is True:
+            self.client.prefetch('ide_find_symbol', ({
+                'project_path': str(self.root), 'query': initial, 'language': 'Java',
+                'scope': 'project_files', 'includeGenerated': False, 'pageSize': 500,
+            } for initial in sorted({name[0] for name in candidates})))
         expected = []
         for name in candidates:
             expected.extend(item for item in self.oracle_symbols(check, name)
@@ -774,6 +843,7 @@ class Fixture:
         patterns = {
             'todo': r'//.*(TODO|FIXME|HACK)|#.*(TODO|FIXME|HACK)',
             'deprecated': r'@Deprecated|@Obsolete|@available\s*\([^)]*deprecated|#\[deprecated|#.*DEPRECATED|=head.*DEPRECATED|@deprecated|\[\[deprecated',
+            'deeplinks': r'[Dd]eep[Ll]ink|@DeepLink|DeepLinkHandler|@AppLink|NavDeepLink|android:scheme|openURL|application\([^)]*open:|handleOpen|CFBundleURLSchemes|UniversalLink|NSUserActivity',
         }
         expected = self.oracle_text(check, {
             'project_path': str(self.root), 'query': patterns[feature], 'regex': True,
@@ -1034,9 +1104,84 @@ class Fixture:
         finally:
             source.close()
 
+    def map_check(self, check: sqlite3.Row):
+        """Check presentation against indexed declarations, not MCP equivalence.
+
+        Stream DB rows and retain at most twenty symbols per directory. Inheritance
+        belongs to a symbol ID, even when several files declare the same name.
+        """
+        module = json.loads(check['subject'])['module']
+        source = connect(self.database, read_only=True)
+        try:
+            file_count = source.execute('SELECT count(*) FROM files').fetchone()[0]
+            module_count = source.execute('SELECT count(*) FROM modules').fetchone()[0]
+            depth = 3 if file_count > 5000 else 2
+
+            def directory(path):
+                parts = path.split('/')
+                prefix = '/'.join(parts[:min(depth, len(parts) - 1)])
+                return prefix + '/' if prefix else '.'
+
+            counts, kinds, symbols = Counter(), {}, {}
+            for row in source.execute('SELECT path FROM files'):
+                if module is None or row['path'].startswith(module):
+                    counts[directory(row['path'])] += 1
+            # Order candidates before retaining each group's bounded top slice.
+            rows = source.execute('''SELECT s.id,s.name,s.kind,s.line,f.path FROM symbols s
+                JOIN files f ON f.id=s.file_id WHERE s.parent_id IS NULL
+                AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
+                ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'interface' THEN 1
+                    WHEN 'protocol' THEN 1 WHEN 'trait' THEN 1 WHEN 'struct' THEN 2
+                    WHEN 'enum' THEN 3 WHEN 'object' THEN 4 WHEN 'actor' THEN 5 ELSE 10 END,
+                    s.name COLLATE BINARY,f.path COLLATE BINARY,s.line,s.id''')
+            for row in rows:
+                if module is not None and not row['path'].startswith(module):
+                    continue
+                group = directory(row['path'])
+                kinds.setdefault(group, Counter())[row['kind']] += 1
+                selected = symbols.setdefault(group, [])
+                if len(selected) < 20:
+                    parents = [entry[0] for entry in source.execute(
+                        'SELECT DISTINCT parent_name FROM inheritance WHERE child_id=? ORDER BY parent_name COLLATE BINARY',
+                        (row['id'],))]
+                    item = {'name': row['name'], 'kind': row['kind'], 'file': Path(row['path']).name}
+                    if parents:
+                        item['parents'] = parents
+                    selected.append(item)
+            ordered = sorted(counts if module is None else symbols, key=lambda path: (-counts[path], path))
+            outputs, expected_keys, actual_keys = {}, set(), set()
+            for limit in sorted({0, 1, 3, len(ordered)}):
+                for per_dir in ([None] if module is None else [0, 1, 5, 20]):
+                    arguments = ['--limit', str(limit)]
+                    if module is not None:
+                        arguments += ['--module', module, '--per-dir', str(per_dir)]
+                    expected = {'file_count': file_count, 'module_count': module_count, 'groups': []}
+                    for path in ordered[:limit]:
+                        group = {'path': path, 'file_count': counts[path]}
+                        if module is None:
+                            if kinds.get(path):
+                                group['kinds'] = dict(kinds[path])
+                        else:
+                            group['symbols'] = symbols[path][:per_dir]
+                        expected['groups'].append(group)
+                    if module is None:
+                        expected.update(showing=min(limit, len(ordered)), total_dirs=len(ordered))
+                    label = source.execute("SELECT value FROM metadata WHERE key='project_label'").fetchone()
+                    if label:
+                        expected['project'] = label[0]
+                    actual = self.cli('map', *arguments)
+                    key = (limit, per_dir if per_dir is not None else -1)
+                    outputs[str(key)] = actual
+                    expected_keys.add((*key, canonical_json(expected)))
+                    actual_keys.add((*key, canonical_json(actual)))
+            return {'module': module, 'directories': len(ordered)}, outputs, expected_keys, actual_keys
+        finally:
+            source.close()
+
     def evaluate(self, check: sqlite3.Row) -> None:
-        with self.state:
-            self.state.execute("DELETE FROM pages WHERE check_id=?", (check["id"],))
+        started = time.perf_counter()
+        with self.metrics.checkpoint('checkpoint.start'):
+            self.state.execute("DELETE FROM oracle_pages WHERE check_id=?", (check["id"],))
             self.state.execute("UPDATE checks SET status='running' WHERE id=?", (check["id"],))
         try:
             handler = {"class": self.class_check, "class-qualified": self.class_check, "symbol": self.symbol_check,
@@ -1044,13 +1189,13 @@ class Fixture:
                        "search": self.search_check, "search:files": self.search_files_check,
                        "symbol:options": self.option_check, "class:options": self.option_check,
                        "symbol:qualified-pattern": self.option_check, "class:qualified-pattern": self.option_check,
-                       "todo": self.grep_check, "deprecated": self.grep_check,
+                       "todo": self.grep_check, "deprecated": self.grep_check, "deeplinks": self.grep_check,
                        "search:references": self.search_aggregation_check, "search:ranking": self.search_ranking_check,
                        "search:content": self.text_search_check, "annotations": self.text_search_check, **dict.fromkeys(("implementations", "hierarchy", "refs", "usages", "callers"), self.semantic_check)}.get(check["feature"])
             if check["feature"] in {"stats", "query", "schema", "db-path"}:
                 handler = self.introspection_check
             if check['feature'] in INTERNAL_FEATURES:
-                handler = self.analysis_management_check
+                handler = self.map_check if check['feature'] == 'map' else self.analysis_management_check
             if handler is None:
                 raise Unsupported(f"no live handler for {check['feature']}")
             expected, actual, expected_keys, actual_keys = handler(check)
@@ -1058,7 +1203,7 @@ class Fixture:
             missing = sorted(missing_keys.elements() if isinstance(missing_keys, Counter) else missing_keys)
             unexpected = sorted(unexpected_keys.elements() if isinstance(unexpected_keys, Counter) else unexpected_keys)
             verdict = "fail" if missing or unexpected else "pass"
-            with self.state:
+            with self.metrics.checkpoint('checkpoint.finish'):
                 # Lexical candidates include keywords, locals and external
                 # symbols. Only confirmed project declarations have semantic
                 # reference contracts; do not manufacture empty oracle scopes.
@@ -1081,11 +1226,13 @@ class Fixture:
                 )
         except (ToolError, OSError, subprocess.TimeoutExpired) as error:
             verdict = "unsupported" if isinstance(error, Unsupported) else "error"
-            with self.state:
+            with self.metrics.checkpoint('checkpoint.finish'):
                 self.state.execute(
                     "UPDATE checks SET status='complete',verdict=?,error=?,completed_at=? WHERE id=?",
                     (verdict, str(error), now_ms(), check["id"]),
                 )
+        finally:
+            self.metrics.record('check.' + check['feature'], time.perf_counter() - started)
 
 
 def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_text: str, candidates: Any = (), root: Path | None = None) -> None:
@@ -1106,6 +1253,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
     pending_contracts = {
         "search:rank-presets": "history/graph ranking presets and test exclusion contracts not implemented yet",
+        "deeplinks:non-java": "non-Java deeplink scopes require separate text/applicability contracts",
     }
     type_names = {Path(entry["path"]).stem for entry in source_files}
     annotation_names = set()
@@ -1120,6 +1268,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
                 ("internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
                  "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
+                 "live MCP text locations (Java scope only; other language scopes remain pending)" if feature == "deeplinks" else
                  "live MCP text locations" if feature in {"annotations", "search:content", "todo", "deprecated"} else
                  "independent JDK syntax: qualified patterns and combined fuzzy/kind filters" if feature in {"symbol:qualified-pattern", "class:qualified-pattern"} else
                  "independent JDK syntax: patterns, filters, fuzzy lookup and source bodies" if feature in {"symbol:options", "class:options"} else
@@ -1157,7 +1306,13 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": entry["path"]}), feature, entry["path"],
                 ))
-        for feature in ("stats", "query", "schema", "db-path", "todo", "deprecated", *sorted(INTERNAL_FEATURES)):
+        for module in [None, '', *sorted({str(Path(entry['path']).parent) + '/' for entry in source_files
+                                        if str(Path(entry['path']).parent) != '.'})]:
+            subject = canonical_json({'module': module})
+            state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
+                stable_id({'feature': 'map', 'subject': subject}), 'map', subject,
+            ))
+        for feature in ("stats", "query", "schema", "db-path", "todo", "deprecated", "deeplinks", *sorted(INTERNAL_FEATURES - {'map'})):
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
@@ -1207,7 +1362,8 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             # Keep case evidence, not cached answers from an earlier IDE session.
             state.execute("DELETE FROM invocation_cache")
         url = arguments.mcp_url or discover_mcp_url(arguments.mcp_name)
-        client = StreamableHttpMcpClient(url, arguments.timeout)
+        metrics = Metrics(state)
+        client = StreamableHttpMcpClient(url, arguments.timeout, metrics=metrics)
         server = client.initialize()
         tools = client.tools()
         required = {"ide_find_class", "ide_find_symbol", "ide_find_file", "ide_find_references",
@@ -1223,7 +1379,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             state.execute("INSERT OR REPLACE INTO metadata VALUES ('mcp_server',?)", (canonical_json(server),))
         database = directory / "index.sqlite"
         build_ast_index(str(binary), root, database, snapshot, 4, False)
-        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state))
+        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state, metrics=metrics))
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
         plan(state, source_files, help_text, java_identifier_candidates(root), root)
         limit = arguments.case_limit
@@ -1251,6 +1407,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             "counts": counts, "remaining_checks": remaining,
             "unimplemented_features": pending_features,
             "coverage_sources": coverage_sources(state),
+            "performance": metrics.summary(),
             "complete": remaining == 0 and pending_features == 0 and not any(counts.get(key, 0) for key in ("fail", "unsupported", "error")),
             "evidence": str(directory / "evidence.sqlite"),
         }

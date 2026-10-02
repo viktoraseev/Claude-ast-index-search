@@ -11,6 +11,7 @@ import re
 import sqlite3
 import subprocess
 import time
+import threading
 from typing import Any, Iterator
 from urllib import request as urllib_request
 from urllib.error import HTTPError, URLError
@@ -31,6 +32,14 @@ def stable_id(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
+def oracle_response_id(tool: str, request_json: str, response_json: str) -> str:
+    digest = hashlib.sha256()
+    for value in (tool, request_json, response_json):
+        digest.update(value.encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -43,7 +52,7 @@ def adapter_digest() -> str:
     """Invalidate checkpoints when execution or normalization code changes."""
     directory = Path(__file__).parent
     return stable_id({name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-                      for name in ("audit.py", "common.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java")})
+                      for name in ("audit.py", "common.py", "oracle_store.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java")})
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -53,6 +62,7 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
+    connection.create_function("oracle_response_id", 3, oracle_response_id, deterministic=True)
     connection.execute("PRAGMA foreign_keys = ON")
     if not read_only:
         connection.execute("PRAGMA journal_mode = WAL")
@@ -166,11 +176,15 @@ def discover_mcp_url(server_name: str, codex_binary: str = "codex") -> str:
 
 
 class StreamableHttpMcpClient:
-    def __init__(self, url: str, timeout: float = 120.0) -> None:
+    parallel_safe = True
+
+    def __init__(self, url: str, timeout: float = 120.0, *, metrics=None) -> None:
         self.url = url
         self.timeout = timeout
         self.next_id = 1
         self.session_id: str | None = None
+        self.metrics = metrics
+        self.lock = threading.Lock()
 
     def _decode(self, body: bytes, content_type: str) -> Any:
         text = body.decode("utf-8")
@@ -186,16 +200,18 @@ class StreamableHttpMcpClient:
         if params is not None:
             message["params"] = params
         request_id = None
-        if not notification:
-            request_id = self.next_id
-            self.next_id += 1
-            message["id"] = request_id
+        with self.lock:
+            if not notification:
+                request_id = self.next_id
+                self.next_id += 1
+                message["id"] = request_id
+            session = self.session_id
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
-        if self.session_id:
-            headers["Mcp-Session-Id"] = self.session_id
+        if session:
+            headers["Mcp-Session-Id"] = session
         http_request = urllib_request.Request(
             self.url,
             data=canonical_json(message).encode(),
@@ -203,11 +219,21 @@ class StreamableHttpMcpClient:
             method="POST",
         )
         try:
+            started = time.perf_counter()
             with urllib_request.urlopen(http_request, timeout=self.timeout) as response:
                 session_id = response.headers.get("Mcp-Session-Id")
                 if session_id:
-                    self.session_id = session_id
-                decoded = self._decode(response.read(), response.headers.get("Content-Type", ""))
+                    with self.lock:
+                        if self.session_id and self.session_id != session_id:
+                            raise ToolError('MCP session changed during an active invocation')
+                        self.session_id = session_id
+                body = response.read()
+                if self.metrics is not None:
+                    self.metrics.record('mcp.http', time.perf_counter() - started, len(body))
+                started = time.perf_counter()
+                decoded = self._decode(body, response.headers.get("Content-Type", ""))
+                if self.metrics is not None:
+                    self.metrics.record('mcp.envelope_decode', time.perf_counter() - started)
         except (HTTPError, URLError, TimeoutError) as error:
             raise ToolError(f"MCP HTTP request failed for {method}: {error}") from error
         if notification:
@@ -246,7 +272,11 @@ class StreamableHttpMcpClient:
             raise ToolError(f"MCP tool {name} returned no text")
         text = "\n".join(texts)
         try:
-            return json.loads(text)
+            started = time.perf_counter()
+            value = json.loads(text)
+            if self.metrics is not None:
+                self.metrics.record('mcp.payload_decode', time.perf_counter() - started, len(text.encode()))
+            return value
         except json.JSONDecodeError:
             return {"text": text}
 
