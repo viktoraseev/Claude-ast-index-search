@@ -31,11 +31,19 @@ def stable_id(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def adapter_digest() -> str:
     """Invalidate checkpoints when execution or normalization code changes."""
     directory = Path(__file__).parent
     return stable_id({name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-                      for name in ("audit.py", "common.py", "build_index.py", "replay.py")})
+                      for name in ("audit.py", "common.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java")})
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:

@@ -10,9 +10,9 @@ the round from being declared successful.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import fcntl
 from functools import lru_cache
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,8 +26,10 @@ from common import (
     StreamableHttpMcpClient, ToolError, canonical_json, connect,
     discover_mcp_url, java_identifier_candidates, now_ms, source_snapshot, stable_id,
     java_code_without_literals, adapter_digest,
+    file_sha256,
 )
-from build_index import build_ast_index
+from build_index import build_ast_index, freeze_binary
+from java_structure import structure_server
 
 
 SCHEMA = """
@@ -49,6 +51,12 @@ CREATE TABLE IF NOT EXISTS pages(
     tool TEXT NOT NULL,
     PRIMARY KEY(check_id,page)
 );
+CREATE TABLE IF NOT EXISTS source_structures(
+    path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL, entries_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS invocation_cache(
+    request_key TEXT PRIMARY KEY, response_json TEXT NOT NULL
+);
 """
 
 
@@ -56,9 +64,36 @@ class Unsupported(ToolError):
     pass
 
 
+class SearchCollectionCap(Unsupported):
+    pass
+
+
+class InvocationOracle:
+    READ_ONLY = {"ide_find_class", "ide_find_symbol", "ide_find_file", "ide_find_references",
+                 "ide_find_implementations", "ide_type_hierarchy", "ide_search_text"}
+
+    def __init__(self, client: Any, state: sqlite3.Connection):
+        self.client, self.state = client, state
+
+    def call(self, tool: str, arguments: dict[str, Any]) -> Any:
+        if tool not in self.READ_ONLY or "cursor" in arguments:
+            return self.client.call(tool, arguments)
+        key = stable_id({"tool": tool, "arguments": arguments})
+        row = self.state.execute("SELECT response_json FROM invocation_cache WHERE request_key=?", (key,)).fetchone()
+        if row is not None:
+            return json.loads(row[0])
+        response = self.client.call(tool, arguments)
+        # Cursor snapshots may expire independently. Reuse single-page answers;
+        # paginated() still rejects the search collection cap on every use.
+        if isinstance(response, dict) and not any(response.get(flag) for flag in ("stale", "truncated", "hasMore", "nextCursor")):
+            with self.state:
+                self.state.execute("INSERT OR REPLACE INTO invocation_cache VALUES (?,?)", (key, canonical_json(response)))
+        return response
+
+
 LIVE_FEATURES = {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
-                 "stats", "query", "schema", "db-path"}
+                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations"}
 
 
 def location_keys(items: list[dict[str, Any]], root: Path) -> set[tuple[str, int]]:
@@ -203,14 +238,14 @@ def callable_context(root: Path, file: str, name: str, line: int) -> tuple[bool,
     return java_callable_context(path, stat.st_mtime_ns, stat.st_size).get((name, line), (False, False))
 
 
-def declaration_keys(items: list[dict[str, Any]], root: Path, name: str) -> set[tuple[Any, ...]]:
+def declaration_keys(items: list[dict[str, Any]], root: Path, name: str) -> Counter:
     kinds = {
         "class": "type", "interface": "type", "enum": "type", "record": "type",
         "method": "method", "function": "method", "constructor": "method",
         "field": "field", "property": "field", "enum_constant": "field",
         "constant": "field", "symbol": "declaration",
     }
-    result = set()
+    result = Counter()
     for item in items:
         if not isinstance(item, dict):
             raise Unsupported("declaration result contains a non-object")
@@ -225,11 +260,7 @@ def declaration_keys(items: list[dict[str, Any]], root: Path, name: str) -> set[
         line = item.get("line")
         if not isinstance(line, int) or line < 1:
             raise Unsupported("invalid declaration line")
-        constructor, anonymous = callable_context(root, file, name, line)
-        if constructor and kinds[kind] == "method":
-            # IntelliJ Go-to-Symbol omits constructors. They remain available
-            # through ast-index; their independent outline contract stays pending.
-            continue
+        _, anonymous = callable_context(root, file, name, line)
         qualified = item.get("qualifiedName", item.get("qualified_name")) or ""
         if anonymous and kinds[kind] == "method":
             # Anonymous types have no Java FQN. IntelliJ attributes their
@@ -238,7 +269,7 @@ def declaration_keys(items: list[dict[str, Any]], root: Path, name: str) -> set[
         # Go to Symbol reports enum constants as CLASS and ordinary fields as
         # SYMBOL. Its kind is not an authoritative Java declaration category.
         # Class navigation has its own contract; here compare declaration identity.
-        result.add((name, "declaration", file, line, qualified))
+        result[(name, "declaration", file, line, qualified)] += 1
     return result
 
 
@@ -252,6 +283,76 @@ class Fixture:
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
         }
+
+    def structure(self, file: str) -> list[dict[str, Any]]:
+        path = self.root / relative_path(file, self.root)
+        if not path.is_file():
+            return []
+        stat = path.stat()
+        cached = self.state.execute("SELECT entries_json FROM source_structures WHERE path=? AND modified=? AND size=?",
+                                    (file, stat.st_mtime_ns, stat.st_size)).fetchone()
+        if cached:
+            return json.loads(cached[0])
+        entries = structure_server(self.database.parent).read(path)
+        with self.state:
+            self.state.execute("INSERT OR REPLACE INTO source_structures VALUES (?,?,?,?)",
+                               (file, stat.st_mtime_ns, stat.st_size, canonical_json(entries)))
+        return entries
+
+    def native_navigation_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        excluded = Counter()
+        for file in {relative_path(item.get("path", item.get("file")), self.root) for item in items}:
+            if file.endswith('.java'):
+                excluded.update((file, entry['name'], entry['line']) for entry in self.structure(file)
+                                if entry['kind'] in {'constructor', 'accessor'})
+        result = []
+        for item in items:
+            key = (relative_path(item.get('path', item.get('file')), self.root), item['name'], item['line'])
+            if item.get('kind') == 'function' and excluded[key]:
+                excluded[key] -= 1
+            else:
+                result.append(item)
+        return result
+
+    def structure_check(self, check: sqlite3.Row):
+        file = relative_path(check['subject'], self.root)
+        if not (self.root / file).is_file():
+            raise ToolError('source file disappeared during structure verification')
+        entries = self.structure(file)
+        annotations = {'@' + name for name in (
+            'RestController Controller Service Repository Component Entity Table Configuration Bean GetMapping '
+            'PostMapping PutMapping DeleteMapping PatchMapping RequestMapping Autowired Override Transactional '
+            'SpringBootApplication EnableAutoConfiguration Test BeforeEach AfterEach BeforeAll AfterAll Inject '
+            'Singleton Provides Binds Module Data Value Builder AllArgsConstructor NoArgsConstructor Getter Setter Slf4j Log4j2'
+        ).split()}
+        special = {(entry['name'], entry['line']) for entry in entries
+                   if entry['kind'] in {'constructor', 'component', 'accessor'}}
+        expected = Counter()
+        for entry in entries:
+            kind, name = entry['kind'], entry['name']
+            if kind == 'parent':
+                continue
+            if kind == 'annotation':
+                if name in annotations:
+                    expected[(name, kind, entry['line'])] += 1
+            elif (name, entry['line']) in special:
+                expected[(name, 'property' if kind == 'component' else 'function', entry['line'])] += 1
+        actual = {'outline': self.cli('outline', file, '--full'),
+                  'index': self.cli('symbol', '--pattern', '*', '--in-file', file, '--limit', '1000000')}
+        expected_keys = Counter()
+        actual_keys = Counter()
+        for section, field in (('outline', 'symbols'), ('index', 'items')):
+            for key, count in expected.items():
+                # Java outlines intentionally omit annotation usages; symbol lookup includes them.
+                if section != 'outline' or key[1] != 'annotation':
+                    expected_keys[(section, *key)] += count
+            for item in complete_items(actual[section], field):
+                if section == 'index' and relative_path(item['path'], self.root) != file:
+                    continue
+                if item['kind'] == 'annotation' or (item['kind'] in {'function', 'property'}
+                                                   and (item['name'], item['line']) in special):
+                    actual_keys[(section, item['name'], item['kind'], item['line'])] += 1
+        return entries, actual, expected_keys, actual_keys
 
     def cli(self, *arguments: str) -> Any:
         value = run_command([str(self.binary), "--format", "json", *arguments], self.root, self.environment)
@@ -290,7 +391,7 @@ class Fixture:
             if not cursor:
                 # This plugin has a hard 500-result search collection cap.
                 if tool in {"ide_find_class", "ide_find_symbol", "ide_find_file"} and len(items) >= 500:
-                    raise Unsupported("search reached server collection cap; query needs partitioning")
+                    raise SearchCollectionCap("search reached server collection cap; query needs partitioning")
                 break
             if cursor in cursors:
                 raise Unsupported("MCP returned a repeated cursor")
@@ -317,16 +418,13 @@ class Fixture:
 
     def symbol_check(self, check: sqlite3.Row) -> tuple[Any, Any, set[Any], set[Any]]:
         subject = check["subject"]
-        expected = self.paginated(check["id"], "ide_find_symbol", {
-            "project_path": str(self.root), "query": subject, "language": "Java",
-            "scope": "project_files", "includeGenerated": False, "pageSize": 500,
-        }, "symbols")
+        expected = self.oracle_symbols(check, subject)
         actual = self.cli("symbol", subject, "--limit", "1000000")
         if not isinstance(actual, dict) or not isinstance(actual.get("items"), list):
             raise Unsupported("symbol JSON has no items")
         if any(actual.get("pagination", {}).get(key) for key in ("has_more", "hasMore", "truncated")):
             raise Unsupported("ast-index symbol results are truncated")
-        return expected, actual, declaration_keys(expected, self.root, subject), declaration_keys(actual["items"], self.root, subject)
+        return expected, actual, declaration_keys(expected, self.root, subject), declaration_keys(self.native_navigation_items(actual["items"]), self.root, subject)
 
     def file_check(self, check: sqlite3.Row) -> tuple[Any, Any, set[Any], set[Any]]:
         subject = check["subject"]
@@ -348,8 +446,18 @@ class Fixture:
         }
         if types:
             arguments["matchMode"] = "exact"
-        items = self.paginated(check["id"], "ide_find_class" if types else "ide_find_symbol",
-                               arguments, "classes" if types else "symbols")
+            items = self.paginated(check["id"], "ide_find_class", arguments, "classes")
+        else:
+            # Complete broad symbol searches contain the exact-name subset.
+            # Reuse short queries across checks; refine only the collection cap,
+            # never stale pages, invalid responses, or real transport errors.
+            for width in range(1, len(name) + 1):
+                try:
+                    items = self.paginated(check["id"], "ide_find_symbol", {**arguments, "query": name[:width]}, "symbols")
+                    break
+                except SearchCollectionCap:
+                    if width == len(name):
+                        raise
         return [item for item in items if item.get("name") == name
                 and relative_path(item.get("file", item.get("path")), self.root).endswith(".java")]
 
@@ -369,18 +477,46 @@ class Fixture:
         items = [{**item, "path": file} for item in complete_items(actual, "symbols")
                  if item.get("kind") != "annotation"]
         def keys(values):
-            return {key[:4] for name in {item["name"] for item in values}
-                    for key in declaration_keys(values, self.root, name)}
-        return expected, actual, keys(expected), keys(items)
+            result = Counter()
+            for name in {item["name"] for item in values}:
+                for key, count in declaration_keys(values, self.root, name).items():
+                    result[key[:4]] += count
+            return result
+        return expected, actual, keys(expected), keys(self.native_navigation_items(items))
 
     def imports_check(self, check: sqlite3.Row) -> tuple[Any, Any, set[Any], set[Any]]:
-        # The CLI lists import statements rather than references to an imported
-        # class. Its lexical contract includes unused and wildcard imports.
         file = relative_path(check["subject"], self.root)
-        code = java_code_without_literals((self.root / file).read_text(encoding="utf-8"))
-        expected = [re.sub(r"\s+", "", match[1]) if not match[0] else
-                    "static " + re.sub(r"\s+", "", match[1])
-                    for match in re.findall(r"\bimport\s+(static\s+)?([\w$.*\s]+?)\s*;", code)]
+        references = self.paginated(check["id"], "ide_search_text", {
+            "project_path": str(self.root), "query": "import", "wholeWord": True,
+            "context": "code", "filePattern": "*.java", "paths": [file], "pageSize": 500,
+        }, "matches")
+        source = (self.root / file).read_text(encoding="utf-8")
+        source_lines = source.splitlines(keepends=True)
+        expected = []
+        for reference in references:
+            if relative_path(reference.get("file"), self.root) != file:
+                raise Unsupported("import oracle returned a different file")
+            line, column = reference.get("line"), reference.get("column")
+            if not isinstance(line, int) or not isinstance(column, int) or not 1 <= line <= len(source_lines) or column < 1:
+                raise Unsupported("invalid import oracle position")
+            # IntelliJ columns count UTF-16 code units. Only server-confirmed
+            # import anchors are rendered into the CLI's statement representation.
+            row = source_lines[line - 1]
+            units, character = 0, 0
+            while units < column - 1 and character < len(row):
+                units += 2 if ord(row[character]) > 0xffff else 1
+                character += 1
+            if units != column - 1:
+                raise Unsupported("import column is not a character boundary")
+            tail = row[character:] + "".join(source_lines[line:])
+            end = tail.find(";")
+            if end < 0 or not re.match(r"import\b", tail):
+                raise Unsupported("import oracle anchor does not match the source snapshot")
+            code = java_code_without_literals(tail[:end + 1])
+            match = re.fullmatch(r"import\s+(static\s+)?([\w$.*\s]+?)\s*;", code)
+            if not match:
+                raise Unsupported("unrecognized server-confirmed import statement")
+            expected.append(("static " if match[1] else "") + re.sub(r"\s+", "", match[2]))
         output = self.text_cli("imports", file)
         lines = output.splitlines()
         if not lines or lines[0] != f"Imports in {file}:":
@@ -399,7 +535,51 @@ class Fixture:
         expected = self.oracle_symbols(check, check["subject"])
         actual = self.cli("search", check["subject"], "--limit", "1000000")
         items = complete_items(actual, "symbols")
-        return expected, actual, declaration_keys(expected, self.root, check["subject"]), declaration_keys(items, self.root, check["subject"])
+        return expected, actual, declaration_keys(expected, self.root, check["subject"]), declaration_keys(self.native_navigation_items(items), self.root, check["subject"])
+
+    def search_files_check(self, check: sqlite3.Row):
+        name = check['subject']
+        expected = self.paginated(check['id'], 'ide_find_file', {
+            'project_path': str(self.root), 'query': name, 'scope': 'project_files',
+            'includeGenerated': False, 'pageSize': 500,
+        }, 'files')
+        actual = self.cli('search', name, '--limit', '1000000')
+        def paths(items, *, oracle=False):
+            return {relative_path(item['path'], self.root) for item in items
+                    if item['path'].endswith('.java') and (not oracle or name.lower() in item['path'].lower())}
+        if not isinstance(actual, dict) or not isinstance(actual.get('files'), list):
+            raise Unsupported('search JSON has no files array')
+        pagination = actual.get('pagination', {})
+        if not isinstance(pagination, dict) or not isinstance(pagination.get('files', {}), dict):
+            raise Unsupported('invalid search file pagination')
+        page = pagination.get('files', {})
+        if any(page.get(key) for key in ('has_more', 'hasMore', 'truncated')):
+            raise Unsupported('search file results are truncated')
+        if any(not isinstance(path, str) for path in actual['files']):
+            raise Unsupported('search file result contains a non-path')
+        return expected, actual, paths(expected, oracle=True), paths([{'path': path} for path in actual['files']])
+
+    def text_search_check(self, check: sqlite3.Row):
+        annotation = check['feature'] == 'annotations'
+        query = '@' + check['subject'].lstrip('@') if annotation else check['subject']
+        expected = self.paginated(check['id'], 'ide_search_text', {
+            'project_path': str(self.root), 'query': query, 'caseSensitive': True,
+            'context': 'all', 'filePattern': '*.java', 'pageSize': 500,
+        }, 'matches')
+        if annotation:
+            actual = self.text_cli('annotations', check['subject'], '--limit', '1000000')
+            lines = actual.splitlines()
+            header = re.fullmatch(r'Classes with .+ \((\d+)\):', lines[0]) if lines else None
+            if not header:
+                raise Unsupported('unrecognized annotations output')
+            items = [{'path': match[1], 'line': int(match[2])} for line in lines[1:]
+                     if (match := re.fullmatch(r'  (\S.*):(\d+)', line))]
+            if len(items) != int(header[1]) or len(items) >= 1000000:
+                raise Unsupported('incomplete annotations output')
+        else:
+            actual = self.cli('search', query, '--limit', '1000000')
+            items = complete_items(actual, 'content_matches')
+        return expected, actual, location_keys(expected, self.root), location_keys(items, self.root)
 
     def semantic_check(self, check: sqlite3.Row) -> tuple[Any, Any, set[Any], set[Any]]:
         feature, name = check["feature"], check["subject"]
@@ -421,8 +601,12 @@ class Fixture:
                     raise Unsupported("unknown hierarchy response")
                 if any(response.get(key) for key in ("stale", "truncated", "hasMore", "nextCursor")):
                     raise Unsupported("incomplete hierarchy response")
-                parents.update(item["name"] for item in response["supertypes"] if item.get("name"))
-                children.update((item["name"], relative_path(item.get("file", item.get("path")), self.root))
+                # The CLI exposes explicit parents, including external types, while
+                # project-only IDE hierarchy omits libraries and adds implicit JVM parents.
+                # Parse those source edges independently; retain MCP for child navigation.
+                parents.update(entry['name'].rsplit('.', 1)[-1] for entry in self.structure(arguments['file'])
+                               if entry['kind'] == 'parent' and entry['owner'] == name)
+                children.update((item["name"].rsplit(".", 1)[-1], relative_path(item.get("file", item.get("path")), self.root))
                                 for item in response["subtypes"])
             else:
                 tool, field = ("ide_find_implementations", "implementations") if feature == "implementations" else ("ide_find_references", "references")
@@ -435,7 +619,7 @@ class Fixture:
                 parent = re.fullmatch(r"(.+) \((?:extends|implements)\)", value)
                 child = re.fullmatch(r"(.+) \[[\w_]+\]: (.+)", value)
                 if parent:
-                    actual_parents.add(parent[1])
+                    actual_parents.add(parent[1].rsplit(".", 1)[-1])
                 elif child:
                     actual_children.add((child[1].rsplit(".", 1)[-1], relative_path(child[2], self.root)))
                 elif not value or value.startswith(("Hierarchy for '", "Parents:", "Children (")):
@@ -518,14 +702,17 @@ class Fixture:
             self.state.execute("UPDATE checks SET status='running' WHERE id=?", (check["id"],))
         try:
             handler = {"class": self.class_check, "class-qualified": self.class_check, "symbol": self.symbol_check,
-                       "file": self.file_check, "outline": self.outline_check, "imports": self.imports_check,
-                       "search": self.search_check, **dict.fromkeys(("implementations", "hierarchy", "refs", "usages", "callers"), self.semantic_check)}.get(check["feature"])
+                       "file": self.file_check, "outline": self.outline_check, "outline:constructors": self.structure_check, "imports": self.imports_check,
+                       "search": self.search_check, "search:files": self.search_files_check,
+                       "search:content": self.text_search_check, "annotations": self.text_search_check, **dict.fromkeys(("implementations", "hierarchy", "refs", "usages", "callers"), self.semantic_check)}.get(check["feature"])
             if check["feature"] in {"stats", "query", "schema", "db-path"}:
                 handler = self.introspection_check
             if handler is None:
                 raise Unsupported(f"no live handler for {check['feature']}")
             expected, actual, expected_keys, actual_keys = handler(check)
-            missing, unexpected = sorted(expected_keys - actual_keys), sorted(actual_keys - expected_keys)
+            missing_keys, unexpected_keys = expected_keys - actual_keys, actual_keys - expected_keys
+            missing = sorted(missing_keys.elements() if isinstance(missing_keys, Counter) else missing_keys)
+            unexpected = sorted(unexpected_keys.elements() if isinstance(unexpected_keys, Counter) else unexpected_keys)
             verdict = "fail" if missing or unexpected else "pass"
             with self.state:
                 # Lexical candidates include keywords, locals and external
@@ -570,28 +757,29 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     if not {"class", "symbol", "file"}.issubset(features):
         raise Unsupported("cannot enumerate required CLI commands")
     features.update({"global:format", "global:walk-up", "global:subtree", "global:local"})
-    features.add("class-qualified")
+    features.update(LIVE_FEATURES)
     # A base navigation handler does not establish coverage of source bodies,
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
     pending_contracts = {
-        "outline:constructors": "constructor and annotation entries need an independent structure oracle",
-        "search:files": "search file-path matching contract not implemented yet",
         "search:references": "search reference aggregation contract not implemented yet",
-        "search:content": "search content fallback contract not implemented yet",
         "search:ranking": "search ranking contract not implemented yet",
         "symbol:options": "pattern, fuzzy, filters and source-body contracts not implemented yet",
         "class:options": "pattern, fuzzy and scoped-filter contracts not implemented yet",
     }
     type_names = {Path(entry["path"]).stem for entry in source_files}
+    annotation_names = set()
     if root is not None:
         for entry in source_files:
             code = java_code_without_literals((root / entry["path"]).read_text(encoding="utf-8"))
+            annotation_names.update(re.findall(r"@([\w$]+)", code))
             type_names.update(re.findall(r"\b(?:class|interface|enum|record)\s+([\w$]+)", code))
     with state:
         for feature in sorted(features):
             state.execute("INSERT OR IGNORE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                ("live CLI against lexical source" if feature == "imports" else
+                ("independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
+                 "live MCP text locations" if feature in {"annotations", "search:content"} else
+                 "live MCP code anchors rendered as import statements" if feature == "imports" else
                  "live CLI against database state" if feature in {"stats", "query", "schema", "db-path"} else
                  "live MCP navigation identity") if feature in LIVE_FEATURES else "comparison contract not implemented yet",
             ))
@@ -603,16 +791,21 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                     stable_id({"feature": feature, "subject": name}), feature, name,
                 ))
         for name in sorted(candidates):
-            for feature in ("symbol", "search"):
+            for feature in ("symbol", "search", "search:content"):
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": name}), feature, name,
                 ))
         for name in sorted({Path(entry["path"]).name for entry in source_files}):
+            for feature in ('file', 'search:files'):
+                state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
+                    stable_id({"feature": feature, "subject": name}), feature, name,
+                ))
+        for name in sorted(annotation_names):
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
-                stable_id({"feature": "file", "subject": name}), "file", name,
+                stable_id({"feature": 'annotations', "subject": name}), 'annotations', name,
             ))
         for entry in source_files:
-            for feature in ("outline", "imports"):
+            for feature in ("outline", "imports", "outline:constructors"):
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": entry["path"]}), feature, entry["path"],
                 ))
@@ -647,11 +840,12 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
     snapshot, source_files = source_snapshot(root)
     if not source_files:
         raise Unsupported("target has no Java source files; language contract needed")
-    binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+    binary_hash = file_sha256(binary)
     contract = adapter_digest()
     epoch = stable_id({"root": str(root), "snapshot": snapshot, "binary": binary_hash, "contract": contract})[:20]
     directory = output / epoch
     directory.mkdir(parents=True, exist_ok=True)
+    binary = freeze_binary(binary, directory, binary_hash)
     state = connect(directory / "evidence.sqlite")
     try:
         state.executescript(SCHEMA)
@@ -662,12 +856,14 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         with state:
             state.executemany("INSERT OR REPLACE INTO metadata VALUES (?,?)", metadata.items())
             state.execute("UPDATE checks SET status='pending' WHERE status='running'")
+            # Keep case evidence, not cached answers from an earlier IDE session.
+            state.execute("DELETE FROM invocation_cache")
         url = arguments.mcp_url or discover_mcp_url(arguments.mcp_name)
         client = StreamableHttpMcpClient(url, arguments.timeout)
         server = client.initialize()
         tools = client.tools()
         required = {"ide_find_class", "ide_find_symbol", "ide_find_file", "ide_find_references",
-                    "ide_find_implementations", "ide_type_hierarchy"}
+                    "ide_find_implementations", "ide_type_hierarchy", "ide_search_text"}
         missing = required - tools.keys()
         if missing:
             raise Unsupported("Index MCP Server lacks tools required by live contracts: " + ", ".join(sorted(missing)))
@@ -679,7 +875,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             state.execute("INSERT OR REPLACE INTO metadata VALUES ('mcp_server',?)", (canonical_json(server),))
         database = directory / "index.sqlite"
         build_ast_index(str(binary), root, database, snapshot, 4, False)
-        fixture = Fixture(root, binary, database, state, client)
+        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state))
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
         plan(state, source_files, help_text, java_identifier_candidates(root), root)
         limit = arguments.case_limit
@@ -695,7 +891,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             if state.execute("SELECT verdict FROM checks WHERE id=?", (check["id"],)).fetchone()[0] == "error":
                 break
         # Source changes invalidate evidence rather than manufacturing defects.
-        if source_snapshot(root)[0] != snapshot or hashlib.sha256(binary.read_bytes()).hexdigest() != binary_hash:
+        if source_snapshot(root)[0] != snapshot or file_sha256(binary) != binary_hash:
             raise ToolError("target sources or binary changed while scanning; evidence is invalid")
         counts = {row[0]: row[1] for row in state.execute(
             "SELECT verdict,count(*) FROM checks WHERE status='complete' GROUP BY verdict"

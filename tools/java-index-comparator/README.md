@@ -12,14 +12,22 @@ ready for an upstream PR.
 
 Live handlers compare class identities, Java qualified names, file navigation,
 symbol and outline declaration identities, references, usages, callers,
-implementations, and hierarchy. Imports are checked against source statements;
+implementations, and hierarchy. Import statements are anchored by MCP code search;
 stats, query, schema, and db-path are checked against the isolated database.
-Universal search currently checks its exact declaration results. Its other
-sections, ranking, command options, and independent constructor outline
-coverage remain explicitly pending, along with the other command contracts.
-A passing subset is never reported as a complete audit. MCP Go-to-Symbol kinds
-are coarse and constructors are outside its navigation scope. Anonymous-class
-methods have no Java qualified name, so their identity uses name, file and line.
+Universal search checks declaration results, file matches and Java content locations;
+annotation grep checks all text contexts against MCP. Constructor, record component,
+implicit accessor and tracked annotation checks use an independent JDK syntax parser
+and execute both outline and indexed symbol lookup. This requires JDK 17+ (or a
+newer JDK supporting the target's Java syntax). The parser only reads sources;
+its generated files stay in the artifact directory.
+
+MCP Go-to-Symbol omits constructors and implicit record accessors. Navigation
+normalization accounts for that narrower scope; separate structure checks detect
+missing constructors or accessors. Anonymous-class methods have no Java qualified
+name, so their navigation identity uses name, file and line. Hierarchy compares
+explicit source parent edges, including external parents, and MCP project children.
+Search reference aggregation, ranking, command options, and other command contracts
+remain explicitly pending. A passing subset never establishes a complete audit.
 
 Replay streams the first 100 failures in capture order plus every unsupported
 or error contract. Each check executes the current CLI against a rebuilt index;
@@ -30,7 +38,8 @@ declarations, rather than lexical keywords and unresolved external names.
 The cycle driver automates build, audit, agent work, original-batch replay,
 workspace tests, commit and push. It requires a feature branch and a clean
 worktree, except for local AGENTS.md instructions. Its coding-agent command is
-replaceable. After a complete audit it reruns workspace tests and creates or
+replaceable. Failed repair tests or builds return to the agent with the original
+evidence and failure logs, without committing. After a complete audit it reruns workspace tests and creates or
 verifies an upstream PR at the tested commit. Missing contracts prevent that
 final step.
 

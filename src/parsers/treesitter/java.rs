@@ -140,12 +140,12 @@ impl LanguageParser for JavaParser {
         let idx_annotation_call_name = idx("annotation_call_name");
         let idx_definition = idx("definition");
 
+        // Distinct declarations may share a line (including overloads and constructors).
         let mut emitted: std::collections::HashSet<(String, usize)> =
             std::collections::HashSet::new();
         let mut explicit_methods: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
-        let mut pending_record_accessors: Vec<(String, String, usize, Option<usize>, String)> =
-            Vec::new();
+        let mut pending_record_accessors = Vec::new();
 
         let mut matches = cursor.matches(query, tree.root_node(), content.as_bytes());
 
@@ -156,7 +156,7 @@ impl LanguageParser for JavaParser {
             if let Some(name_cap) = find_capture(m, idx_class_name) {
                 let name = node_text(content, &name_cap.node);
                 let line = node_line(&name_cap.node);
-                if emitted.insert((name.to_string(), line)) {
+                if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                     let parents = find_capture(m, idx_class_node)
                         .map(|n| extract_class_parents(content, &n.node))
                         .unwrap_or_default();
@@ -176,7 +176,7 @@ impl LanguageParser for JavaParser {
             if let Some(name_cap) = find_capture(m, idx_interface_name) {
                 let name = node_text(content, &name_cap.node);
                 let line = node_line(&name_cap.node);
-                if emitted.insert((name.to_string(), line)) {
+                if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                     let parents = find_capture(m, idx_interface_node)
                         .map(|n| extract_interface_parents(content, &n.node))
                         .unwrap_or_default();
@@ -196,7 +196,7 @@ impl LanguageParser for JavaParser {
             if let Some(name_cap) = find_capture(m, idx_enum_name) {
                 let name = node_text(content, &name_cap.node);
                 let line = node_line(&name_cap.node);
-                if emitted.insert((name.to_string(), line)) {
+                if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                     let parents = find_capture(m, idx_enum_node)
                         .map(|n| extract_enum_parents(content, &n.node))
                         .unwrap_or_default();
@@ -216,7 +216,7 @@ impl LanguageParser for JavaParser {
             if let Some(name_cap) = find_capture(m, idx_enum_constant_name) {
                 let name = node_text(content, &name_cap.node);
                 let line = node_line(&name_cap.node);
-                if emitted.insert((name.to_string(), line)) {
+                if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                     symbols.push(ParsedSymbol {
                         name: name.to_string(),
                         kind: SymbolKind::Constant,
@@ -234,11 +234,18 @@ impl LanguageParser for JavaParser {
                 if let Some(node_cap) = find_capture(m, idx_method_node) {
                     if is_inside_type_body(&node_cap.node) {
                         let name = node_text(content, &name_cap.node);
-                        if let Some(owner) = enclosing_type_name(content, &node_cap.node) {
-                            explicit_methods.insert((owner, name.to_string()));
+                        // Only a no-argument method replaces a record's implicit accessor.
+                        if node_cap
+                            .node
+                            .child_by_field_name("parameters")
+                            .is_some_and(|parameters| parameters.named_child_count() == 0)
+                        {
+                            if let Some(owner) = enclosing_type_name(content, &node_cap.node) {
+                                explicit_methods.insert((owner, name.to_string()));
+                            }
                         }
                         let line = node_line(&name_cap.node);
-                        if emitted.insert((name.to_string(), line)) {
+                        if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                             symbols.push(ParsedSymbol {
                                 name: name.to_string(),
                                 kind: SymbolKind::Function,
@@ -259,7 +266,7 @@ impl LanguageParser for JavaParser {
                     if is_inside_type_body(&node_cap.node) {
                         let name = node_text(content, &name_cap.node);
                         let line = node_line(&name_cap.node);
-                        if emitted.insert((name.to_string(), line)) {
+                        if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                             symbols.push(ParsedSymbol {
                                 name: name.to_string(),
                                 kind: SymbolKind::Function,
@@ -280,7 +287,7 @@ impl LanguageParser for JavaParser {
                     if is_inside_type_body(&node_cap.node) {
                         let name = node_text(content, &name_cap.node);
                         let line = node_line(&name_cap.node);
-                        if emitted.insert((name.to_string(), line)) {
+                        if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                             symbols.push(ParsedSymbol {
                                 name: name.to_string(),
                                 kind: SymbolKind::Property,
@@ -304,7 +311,7 @@ impl LanguageParser for JavaParser {
                     let owner = enclosing_type_name(content, &node_cap.node).unwrap_or_default();
 
                     // Record components are class-like fields
-                    if emitted.insert((name.to_string(), line)) {
+                    if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
                         symbols.push(ParsedSymbol {
                             name: name.to_string(),
                             kind: SymbolKind::Property,
@@ -323,6 +330,7 @@ impl LanguageParser for JavaParser {
                         owner,
                         name.to_string(),
                         line,
+                        name_cap.node.start_byte(),
                         end_line,
                         accessor_signature,
                     ));
@@ -332,10 +340,11 @@ impl LanguageParser for JavaParser {
 
             // === Marker annotations (no arguments) ===
             if let Some(name_cap) = find_capture(m, idx_annotation_name) {
-                let name = node_text(content, &name_cap.node);
+                let full_name = node_text(content, &name_cap.node);
+                let name = full_name.rsplit('.').next().unwrap_or(full_name).trim();
                 if SIGNIFICANT_ANNOTATIONS.contains(&name) {
                     let line = node_line(&name_cap.node);
-                    if emitted.insert((format!("@{}", name), line)) {
+                    if emitted.insert((format!("@{}", name), name_cap.node.start_byte())) {
                         symbols.push(ParsedSymbol {
                             name: format!("@{}", name),
                             kind: SymbolKind::Annotation,
@@ -351,10 +360,11 @@ impl LanguageParser for JavaParser {
 
             // === Annotations with arguments ===
             if let Some(name_cap) = find_capture(m, idx_annotation_call_name) {
-                let name = node_text(content, &name_cap.node);
+                let full_name = node_text(content, &name_cap.node);
+                let name = full_name.rsplit('.').next().unwrap_or(full_name).trim();
                 if SIGNIFICANT_ANNOTATIONS.contains(&name) {
                     let line = node_line(&name_cap.node);
-                    if emitted.insert((format!("@{}", name), line)) {
+                    if emitted.insert((format!("@{}", name), name_cap.node.start_byte())) {
                         symbols.push(ParsedSymbol {
                             name: format!("@{}", name),
                             kind: SymbolKind::Annotation,
@@ -370,11 +380,11 @@ impl LanguageParser for JavaParser {
         }
 
         // Java records synthesize public accessor methods for components unless explicitly overridden.
-        for (owner, name, line, end_line, signature) in pending_record_accessors {
+        for (owner, name, line, byte, end_line, signature) in pending_record_accessors {
             if explicit_methods.contains(&(owner, name.clone())) {
                 continue;
             }
-            if emitted.insert((format!("{}#record_accessor", name), line)) {
+            if emitted.insert((format!("{}#record_accessor", name), byte)) {
                 symbols.push(ParsedSymbol {
                     name: name.to_string(),
                     kind: SymbolKind::Function,
@@ -477,7 +487,9 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
                             }
                         }
                     }
-                    "method_declaration" | "constructor_declaration" => {
+                    "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration" => {
                         // Every callable other than this declaration encloses a
                         // local or anonymous type, which has no Java FQN.
                         if parent.child_by_field_name("name").map(|owner| owner.id())

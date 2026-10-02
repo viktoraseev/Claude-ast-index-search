@@ -23,17 +23,82 @@ class Oracle:
     def call(self, tool, arguments):
         if tool in {'ide_find_symbol', 'ide_find_class'}:
             field = 'symbols' if tool == 'ide_find_symbol' else 'classes'
-            return {field: [d for d in self.declarations if d['name'] == arguments['query']]}
+            return {field: [d for d in self.declarations if
+                (d['name'] == arguments['query'] if tool == 'ide_find_class' else arguments['query'] in d['name'])]}
         if tool == 'ide_find_implementations':
             return {'implementations': [self.declarations[1]]}
         if tool == 'ide_type_hierarchy':
             return {'supertypes': [], 'subtypes': [self.declarations[1]]}
         if tool == 'ide_find_references':
             return {'references': [{'file': 'Child.java', 'line': line, 'type': 'REFERENCE'} for line in (5, 6)]}
+        if tool == 'ide_search_text':
+            return {'matches': [{'file': 'Child.java', 'line': 2, 'column': 1}]}
         raise AssertionError('unexpected oracle operation: ' + tool)
 
 
 class NavigationContractTests(unittest.TestCase):
+    def test_same_line_overloads_detect_one_removed_production_index_row(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'A.java').write_text('package example;\nclass A { void run() {} void run(int x) {} }\n')
+            item = {'name': 'run', 'kind': 'METHOD', 'file': 'A.java', 'line': 2,
+                    'qualifiedName': 'example.A.run'}
+            oracle = Oracle()
+            oracle.declarations = [item, item]
+            binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+            database = directory / 'index.sqlite'
+            build_ast_index(str(binary), root, database, 'synthetic-overloads')
+            state = connect(directory / 'evidence.sqlite')
+            native = connect(database)
+            try:
+                state.executescript(SCHEMA)
+                state.execute("INSERT INTO checks(id,feature,subject) VALUES ('overloads','symbol','run')")
+                state.commit()
+                check = state.execute("SELECT * FROM checks WHERE id='overloads'").fetchone()
+                fixture = Fixture(root, binary, database, state, oracle)
+                fixture.evaluate(check)
+                baseline = state.execute("SELECT verdict,diff_json,error FROM checks WHERE id='overloads'").fetchone()
+                self.assertEqual(baseline[0], 'pass', tuple(baseline))
+                with native:
+                    native.execute("DELETE FROM symbols WHERE id=(SELECT id FROM symbols WHERE name='run' LIMIT 1)")
+                fixture.evaluate(check)
+                outcome = state.execute("SELECT verdict,diff_json FROM checks WHERE id='overloads'").fetchone()
+                self.assertEqual(outcome[0], 'fail')
+                self.assertEqual(len(json.loads(outcome[1])['missing']), 1)
+            finally:
+                native.close()
+                state.close()
+
+    def test_hierarchy_prefers_exact_interface_over_class_substring(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'Base.java').write_text('package example;\ninterface Base {}\n')
+            (root / 'Child.java').write_text('package example;\nclass BaseAdapter implements Base {}\n')
+            binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+            database = directory / 'index.sqlite'
+            build_ast_index(str(binary), root, database, 'interface-shadow')
+            state = connect(directory / 'evidence.sqlite')
+            try:
+                state.executescript(SCHEMA)
+                state.execute("INSERT INTO checks(id,feature,subject) VALUES ('hierarchy','hierarchy','Base')")
+                state.commit()
+                class HierarchyOracle(Oracle):
+                    def call(self, tool, arguments):
+                        if tool == 'ide_type_hierarchy':
+                            return {'supertypes': [], 'subtypes': [
+                                {'name': 'example.BaseAdapter', 'file': 'Child.java', 'line': 2}]}
+                        return super().call(tool, arguments)
+                fixture = Fixture(root, binary, database, state, HierarchyOracle())
+                fixture.evaluate(state.execute("SELECT * FROM checks WHERE id='hierarchy'").fetchone())
+                outcome = state.execute('SELECT verdict,diff_json,error FROM checks').fetchone()
+                self.assertEqual(outcome[0], 'pass', tuple(outcome))
+            finally:
+                state.close()
+
     def test_missing_handlers_execute_production_and_detect_a_removed_declaration(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

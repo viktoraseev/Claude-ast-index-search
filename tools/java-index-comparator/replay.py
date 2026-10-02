@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Replay a stored problem batch through the live production CLI fixture."""
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import sys
 
 from audit import Fixture, SCHEMA
-from build_index import build_ast_index
-from common import ToolError, adapter_digest, canonical_json, connect, source_snapshot, stable_id
+from build_index import build_ast_index, freeze_binary
+from common import ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot, stable_id
 
 
 class StoredOracle:
@@ -54,10 +53,11 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
         snapshot, _ = source_snapshot(root)
         if str(root) != metadata.get("project_root") or snapshot != metadata.get("snapshot_sha256"):
             raise ToolError("replay target differs from the captured source snapshot")
-        binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+        binary_hash = file_sha256(binary)
         epoch = stable_id({"evidence": str(evidence.resolve()), "snapshot": snapshot, "binary": binary_hash, "limit": limit,
                            "fixture": adapter_digest()})[:20]
         directory = output / epoch
+        binary = freeze_binary(binary, directory, binary_hash)
         database = directory / "index.sqlite"
         build_ast_index(str(binary), root, database, snapshot)
         state = connect(directory / "verification.sqlite")
@@ -67,7 +67,10 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 state.executemany("INSERT OR REPLACE INTO metadata VALUES (?,?)", {
                     "project_root": str(root), "snapshot_sha256": snapshot,
                     "binary_sha256": binary_hash, "original_evidence": str(evidence.resolve()),
+                    "fixture_sha256": adapter_digest(),
                 }.items())
+                state.executemany("INSERT OR REPLACE INTO coverage VALUES (?,?,?)",
+                                  source.execute("SELECT feature,status,reason FROM coverage"))
             for check in problem_batch(source, limit):
                 existing = state.execute("SELECT status FROM checks WHERE id=?", (check["id"],)).fetchone()
                 if existing and existing[0] == "complete":
@@ -82,7 +85,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 except ToolError as error:
                     with state:
                         state.execute("UPDATE checks SET verdict='error',error=? WHERE id=?", (str(error), check["id"]))
-            if source_snapshot(root)[0] != snapshot or hashlib.sha256(binary.read_bytes()).hexdigest() != binary_hash:
+            if source_snapshot(root)[0] != snapshot or file_sha256(binary) != binary_hash:
                 raise ToolError("sources or binary changed during replay; verification is invalid")
             counts = {row[0]: row[1] for row in state.execute("SELECT verdict,count(*) FROM checks GROUP BY verdict")}
             remaining = state.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0]

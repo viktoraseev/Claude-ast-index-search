@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 
-from audit import Fixture, SCHEMA, Unsupported, declaration_keys, plan, type_keys
+from audit import Fixture, InvocationOracle, SCHEMA, Unsupported, declaration_keys, plan, type_keys
 from common import connect
 
 
@@ -65,6 +65,68 @@ class LiveFixtureTests(unittest.TestCase):
         self.fixture.evaluate(self.state.execute("SELECT * FROM checks WHERE feature='db-path'").fetchone())
         self.assertEqual(self.state.execute("SELECT verdict FROM checks WHERE feature='db-path'").fetchone()[0], "pass")
 
+    def test_imports_use_only_mcp_confirmed_code_anchors_and_utf16_columns(self):
+        prefix = '@Label("😀") package p; '
+        source = prefix + 'import static a.b.C.*;\nimport unconfirmed.Name;\n'
+        (self.root / "A.java").write_text(source)
+        self.client.call.return_value = {"matches": [{"file": "A.java", "line": 1,
+            "column": len(prefix.encode("utf-16-le")) // 2 + 1}]}
+        self.fixture.text_cli = Mock(return_value="Imports in A.java:\n  static a.b.C.*\nTotal: 1 imports\n")
+        check = self.state.execute("SELECT * FROM checks WHERE feature='imports' AND subject='A.java'").fetchone()
+        self.fixture.evaluate(check)
+        outcome = self.state.execute("SELECT verdict,expected_json FROM checks WHERE id=?", (check["id"],)).fetchone()
+        self.assertEqual(outcome["verdict"], "pass")
+        self.assertEqual(json.loads(outcome["expected_json"]), ["static a.b.C.*"])
+        arguments = self.client.call.call_args.args[1]
+        self.assertEqual(arguments["context"], "code")
+        self.assertEqual(arguments["paths"], ["A.java"])
+
+    def test_complete_read_only_requests_reuse_disk_cache_within_invocation(self):
+        self.client.call.return_value = {"symbols": [{"name": "A"}], "hasMore": False}
+        oracle = InvocationOracle(self.client, self.state)
+        request = {"project_path": str(self.root), "query": "A", "scope": "project_files"}
+        self.assertEqual(oracle.call("ide_find_symbol", request), oracle.call("ide_find_symbol", request))
+        self.client.call.assert_called_once()
+        oracle.call("ide_find_symbol", {**request, "scope": "project_test_files"})
+        self.assertEqual(self.client.call.call_count, 2)
+
+    def test_partial_and_stale_answers_are_not_cached(self):
+        oracle = InvocationOracle(self.client, self.state)
+        for response in ({"symbols": [], "nextCursor": "next"}, {"symbols": [], "stale": True}):
+            self.client.call.return_value = response
+            oracle.call("ide_find_symbol", {"query": "A"})
+            oracle.call("ide_find_symbol", {"query": "A"})
+        self.assertEqual(self.client.call.call_count, 4)
+        self.assertEqual(self.state.execute("SELECT count(*) FROM invocation_cache").fetchone()[0], 0)
+
+    def test_symbol_queries_share_complete_short_query_without_extra_declarations(self):
+        check = self.state.execute("SELECT * FROM checks WHERE feature='class'").fetchone()
+        items = [{"name": name, "kind": "METHOD", "file": "A.java", "line": 1}
+                 for name in ("run", "read", "other")]
+        self.client.call.return_value = {"symbols": items}
+        self.fixture.client = InvocationOracle(self.client, self.state)
+        self.assertEqual([i["name"] for i in self.fixture.oracle_symbols(check, "run")], ["run"])
+        self.assertEqual([i["name"] for i in self.fixture.oracle_symbols(check, "read")], ["read"])
+        self.client.call.assert_called_once()
+        self.assertEqual(self.client.call.call_args.args[1]["query"], "r")
+        self.assertEqual([json.loads(row[0])["query"] for row in self.state.execute("SELECT request_json FROM pages ORDER BY page")],
+                         ["r", "r"])
+
+    def test_symbol_collection_cap_refines_query_and_keeps_both_oracle_operations(self):
+        check = self.state.execute("SELECT * FROM checks WHERE feature='class'").fetchone()
+        item = {"name": "run", "kind": "METHOD", "file": "A.java", "line": 1}
+        self.client.call.side_effect = [{"symbols": [item] * 500}, {"symbols": [item]}]
+        self.assertEqual(self.fixture.oracle_symbols(check, "run"), [item])
+        self.assertEqual([call.args[1]["query"] for call in self.client.call.call_args_list], ["r", "ru"])
+        self.assertEqual(self.state.execute("SELECT count(*) FROM pages").fetchone()[0], 2)
+
+    def test_stale_short_query_is_not_refined_into_an_apparent_success(self):
+        check = self.state.execute("SELECT * FROM checks WHERE feature='class'").fetchone()
+        self.client.call.return_value = {"symbols": [], "stale": True}
+        with self.assertRaisesRegex(Unsupported, "stale"):
+            self.fixture.oracle_symbols(check, "run")
+        self.client.call.assert_called_once()
+
     def test_coarse_oracle_kinds_do_not_turn_enum_constants_into_types(self):
         identity = {"name": "OPEN", "file": "Status.java", "line": 2, "qualifiedName": "p.Status.OPEN"}
         expected = declaration_keys([{**identity, "kind": "CLASS"}], self.root, "OPEN")
@@ -96,6 +158,19 @@ class LiveFixtureTests(unittest.TestCase):
         expected = {"name": "run", "kind": "METHOD", "file": "A.java", "line": 2, "qualifiedName": "example.A.run"}
         actual = {"name": "run", "kind": "function", "path": "A.java", "line": 2}
         self.assertNotEqual(declaration_keys([expected], self.root, "run"), declaration_keys([actual], self.root, "run"))
+
+    def test_same_line_overloads_are_not_collapsed_into_one_declaration(self):
+        (self.root / "A.java").write_text("package example;\nclass A { void run() {} void run(int x) {} }\n")
+        plan(self.state, [{"path": "A.java"}], "  class  Find classes", candidates=["run"])
+        item = {"name": "run", "kind": "METHOD", "file": "A.java", "line": 2,
+                "qualifiedName": "example.A.run"}
+        self.client.call.return_value = {"symbols": [item, item]}
+        self.fixture.cli = Mock(return_value={"items": [{**item, "kind": "function"}]})
+        check = self.state.execute("SELECT * FROM checks WHERE feature='symbol' AND subject='run'").fetchone()
+        self.fixture.evaluate(check)
+        outcome = self.state.execute("SELECT verdict,diff_json FROM checks WHERE id=?", (check["id"],)).fetchone()
+        self.assertEqual(outcome["verdict"], "fail")
+        self.assertEqual(len(json.loads(outcome["diff_json"])["missing"]), 1)
 
 
 if __name__ == "__main__":

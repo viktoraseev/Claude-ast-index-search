@@ -3,8 +3,36 @@ import os
 from pathlib import Path
 import sqlite3
 import subprocess
+import tempfile
 
-from common import ToolError, connect
+from common import ToolError, connect, file_sha256
+
+
+def freeze_binary(binary: Path, directory: Path, expected_hash: str) -> Path:
+    """Pin an executable so concurrent Cargo builds cannot change an audit."""
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / "ast-index"
+    if target.resolve() == binary.resolve():
+        raise ToolError("binary snapshot must be separate from the build output")
+    if target.exists():
+        if file_sha256(target) != expected_hash:
+            raise ToolError("pinned binary differs from the audit epoch")
+        return target
+    descriptor, name = tempfile.mkstemp(prefix=".binary-", dir=directory)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as output, binary.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if file_sha256(temporary) != expected_hash:
+            raise ToolError("binary changed while creating its snapshot")
+        temporary.chmod(0o755)
+        os.replace(temporary, target)
+        return target
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def build_ast_index(binary: str, root: Path, database: Path, snapshot: str,

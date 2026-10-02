@@ -32,6 +32,10 @@
 (constructor_declaration
   name: (identifier) @constructor_name) @constructor_node @definition
 
+; Compact record constructors have no parameter list.
+(compact_constructor_declaration
+  name: (identifier) @constructor_name) @constructor_node @definition
+
 ; Fields
 (field_declaration
   declarator: (variable_declarator
@@ -39,8 +43,8 @@
 
 ; Annotations (marker - no arguments, like @Override)
 (marker_annotation
-  name: (identifier) @annotation_name) @definition
+  name: [(identifier) (scoped_identifier)] @annotation_name) @definition
 
 ; Annotations (with arguments, like @GetMapping("/users"))
 (annotation
-  name: (identifier) @annotation_call_name) @definition
+  name: [(identifier) (scoped_identifier)] @annotation_call_name) @definition

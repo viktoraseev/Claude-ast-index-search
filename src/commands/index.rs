@@ -1171,14 +1171,21 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     // when multiple classes share the same name.
     let classes = db::find_symbols_by_name_scoped(&conn, name, Some("class"), 1, scope)?;
     let interfaces = db::find_symbols_by_name_scoped(&conn, name, Some("interface"), 1, scope)?;
+    let enums = db::find_symbols_by_name_scoped(&conn, name, Some("enum"), 1, scope)?;
     let packages = db::find_symbols_by_name_scoped(&conn, name, Some("package"), 1, scope)?;
     let protocols = db::find_symbols_by_name_scoped(&conn, name, Some("protocol"), 1, scope)?;
 
-    let target = classes
-        .first()
-        .or(interfaces.first())
-        .or(packages.first())
-        .or(protocols.first());
+    let mut candidates = classes
+        .iter()
+        .chain(&interfaces)
+        .chain(&enums)
+        .chain(&packages)
+        .chain(&protocols);
+    // An exact interface/enum must win over a class whose name merely contains the query.
+    let target = candidates
+        .clone()
+        .find(|symbol| symbol.name == name || symbol.qualified_name.as_deref() == Some(name))
+        .or_else(|| candidates.next());
 
     let Some(target) = target else {
         println!("{}", format!("Class '{}' not found.", name).red());

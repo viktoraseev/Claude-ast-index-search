@@ -74,6 +74,21 @@ class ReplayTests(unittest.TestCase):
                 replay(self.evidence, self.root, self.binary, self.directory / "replays")
             build.assert_not_called()
 
+    def test_revalidated_batch_preserves_pending_coverage(self):
+        with self.source:
+            self.source.execute("INSERT INTO coverage VALUES ('symbol:options','pending','missing contract')")
+        with patch("replay.build_ast_index"), patch("audit.Fixture.cli", return_value={"items": []}):
+            result = replay(self.evidence, self.root, self.binary, self.directory / "replays")
+        state = connect(Path(result["verification"]), read_only=True)
+        try:
+            self.assertEqual(tuple(state.execute("SELECT * FROM coverage").fetchone()),
+                             ('symbol:options', 'pending', 'missing contract'))
+            metadata = dict(state.execute("SELECT key,value FROM metadata"))
+            self.assertIn("fixture_sha256", metadata)
+            self.assertEqual(metadata["original_evidence"], str(self.evidence))
+        finally:
+            state.close()
+
 
 if __name__ == "__main__":
     unittest.main()

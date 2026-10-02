@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 from pathlib import Path
 import re
@@ -12,7 +11,7 @@ import sqlite3
 import subprocess
 import sys
 
-from common import ToolError, canonical_json, connect, now_ms, source_snapshot
+from common import ToolError, adapter_digest, canonical_json, connect, file_sha256, now_ms, source_snapshot
 
 
 SCHEMA = """
@@ -22,6 +21,12 @@ CREATE TABLE IF NOT EXISTS rounds(
  summary_json TEXT,commit_head TEXT,error TEXT,created_at INTEGER NOT NULL
 );
 """
+
+
+class CommandFailed(ToolError):
+    def __init__(self, stage: str, returncode: int):
+        self.stage, self.returncode = stage, returncode
+        super().__init__(f"{stage} failed ({returncode}); see round logs, payloads were not printed")
 
 
 def git(repository: Path, *arguments: str) -> str:
@@ -55,7 +60,7 @@ def logged(command: list[str], repository: Path, directory: Path, name: str,
         result = subprocess.run(command, cwd=repository, input=prompt.encode() if prompt is not None else None,
                                 stdout=stdout, stderr=stderr, timeout=timeout)
     if result.returncode not in acceptable_exit_codes:
-        raise ToolError(f"{name} failed ({result.returncode}); see round logs, payloads were not printed")
+        raise CommandFailed(name, result.returncode)
 
 
 def command_summary(command: list[str], directory: Path, label: str) -> dict:
@@ -99,6 +104,7 @@ automated differential repair, not permission to redefine the goal.
 Target is read-only: {root}. Evidence SQLite: {summary['evidence']}.
 Latest verification: {canonical_json(summary.get('verification', {}))}.
 Round logs: {summary.get('round_logs', 'not available')}.
+Oracle connection: {canonical_json(summary.get('oracle', {}))}.
 Read the checks table using a streaming cursor: up to the first 100 verdict=fail
 rows, plus unsupported/error and pending coverage contracts. Group by cause;
 do not generate one test per row. Add compact, public-safe regression fixtures
@@ -110,6 +116,10 @@ them. All applicable ast-index features remain in scope, not only class/symbol.
 Do not modify the target project. Do not commit target source, evidence databases,
 private names or large fixtures. Do not change AGENTS.md. Keep project payloads
 out of your messages. Do not commit or push: the driver verifies and commits.
+Preserve the existing harness changes and red regression tests. The production
+CLI test for same-line Java overloads is deliberately red: fix the parser, not
+the assertion. Validate broad-query normalization against full-name oracle
+queries before treating a navigation mismatch as a production defect.
 Do not install plugins/hooks/MCP configuration or write outside this repository
 and its artifact directory. Project content belongs only in private artifacts;
 public regression snippets must be small and synthetic.
@@ -166,7 +176,7 @@ def seed_summary(evidence: Path, root: Path, binary: Path) -> dict:
         metadata = dict(source.execute("SELECT key,value FROM metadata"))
         if metadata.get("project_root") != str(root) or metadata.get("snapshot_sha256") != source_snapshot(root)[0]:
             raise ToolError("seed evidence belongs to a different target or source snapshot")
-        if metadata.get("binary_sha256") != hashlib.sha256(binary.read_bytes()).hexdigest():
+        if metadata.get("binary_sha256") != file_sha256(binary):
             raise ToolError("seed evidence belongs to a different native binary")
         counts = dict(source.execute("SELECT verdict,count(*) FROM checks WHERE status='complete' GROUP BY verdict"))
         if not counts.get("fail") and not counts.get("unsupported"):
@@ -205,6 +215,22 @@ def run(arguments: argparse.Namespace) -> int:
                 raise ToolError("artifact directory belongs to a different target or branch")
             with state:
                 state.execute("INSERT OR REPLACE INTO configuration VALUES ('identity',?)", (identity,))
+            resume_batch = getattr(arguments, "resume_batch", None)
+            if resume_batch is not None:
+                row = state.execute("SELECT * FROM rounds WHERE phase!='done' ORDER BY id DESC LIMIT 1").fetchone()
+                if row is None or row["phase"] != "audit" or not row["error"]:
+                    raise ToolError("a revalidated batch can resume only a stopped audit checkpoint")
+                if git(repository, "rev-parse", "HEAD") != row["base_head"]:
+                    raise ToolError("HEAD changed since the interrupted audit")
+                batch = connect(resume_batch.resolve(), read_only=True)
+                try:
+                    metadata = dict(batch.execute("SELECT key,value FROM metadata"))
+                    if not metadata.get("original_evidence") or metadata.get("fixture_sha256") != adapter_digest():
+                        raise ToolError("resume batch must be replayed through the current fixture")
+                finally:
+                    batch.close()
+                summary = seed_summary(resume_batch, root, repository / "target/release/ast-index")
+                set_phase(state, row["id"], "agent", summary_json=canonical_json(summary))
             completed = 0
             while arguments.max_rounds is None or completed < arguments.max_rounds:
                 row = state.execute("SELECT * FROM rounds WHERE phase!='done' ORDER BY id DESC LIMIT 1").fetchone()
@@ -241,7 +267,8 @@ def run(arguments: argparse.Namespace) -> int:
                             continue
                         set_phase(state, round_id, "agent", summary_json=canonical_json(summary))
                     elif phase == "agent":
-                        summary = {**json.loads(row["summary_json"]), "round_logs": str(directory)}
+                        summary = {**json.loads(row["summary_json"]), "round_logs": str(directory),
+                                   "oracle": {"mcp_url": arguments.mcp_url, "mcp_name": arguments.mcp_name}}
                         logged(agent_command, repository, directory, "agent", prompt=agent_prompt(summary, root), timeout=arguments.agent_timeout)
                         if git(repository, "rev-parse", "HEAD") != row["base_head"]:
                             raise ToolError("HEAD changed during agent work; review before continuing")
@@ -249,16 +276,24 @@ def run(arguments: argparse.Namespace) -> int:
                             raise ToolError("agent made no code changes; the incomplete audit cannot count as success")
                         set_phase(state, round_id, "verify")
                     elif phase == "verify":
-                        logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
-                        logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
                         summary = json.loads(row["summary_json"])
-                        if summary["counts"].get("fail") or summary["counts"].get("unsupported"):
-                            result = replay(Path(summary["evidence"]), root, repository / "target/release/ast-index", directory / "batch-verification")
-                            if not result["verified"]:
-                                summary["verification"] = result
-                                set_phase(state, round_id, "agent", summary_json=canonical_json(summary))
-                                continue
-                        logged(["cargo", "test", "--release", "--workspace"], repository, directory, "workspace-tests")
+                        try:
+                            logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
+                            logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
+                            if summary["counts"].get("fail") or summary["counts"].get("unsupported"):
+                                result = replay(Path(summary["evidence"]), root, repository / "target/release/ast-index", directory / "batch-verification")
+                                if not result["verified"]:
+                                    summary["verification"] = result
+                                    set_phase(state, round_id, "agent", summary_json=canonical_json(summary))
+                                    continue
+                            logged(["cargo", "test", "--release", "--workspace"], repository, directory, "workspace-tests")
+                        except CommandFailed as error:
+                            # A failed repair is another repair attempt, not a
+                            # terminal driver error. Preserve evidence and logs.
+                            summary["verification"] = {"verified": False, "stage": error.stage,
+                                                       "returncode": error.returncode}
+                            set_phase(state, round_id, "agent", summary_json=canonical_json(summary))
+                            continue
                         git(repository, "diff", "--check")
                         set_phase(state, round_id, "commit")
                     elif phase == "commit":
@@ -307,6 +342,8 @@ def main() -> int:
     parser.add_argument("--mcp-name", default="intellij-index")
     parser.add_argument("--pr-repo", default="defendend/Claude-ast-index-search")
     parser.add_argument("--seed-evidence", type=Path)
+    parser.add_argument("--resume-batch", type=Path,
+                        help="Resume a stopped audit using a batch revalidated against the current binary")
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--agent-command", default='["codex","exec","--approve-for-me","--json","-"]')
     parser.add_argument("--agent-timeout", type=float)
