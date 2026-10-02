@@ -335,14 +335,16 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         plan(state, source_files, help_text, java_identifier_candidates(root))
         limit = arguments.case_limit
         processed = 0
-        problems = state.execute("SELECT count(*) FROM checks WHERE verdict='fail'").fetchone()[0]
+        problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
         while problems < arguments.problem_limit and (limit is None or processed < limit):
             check = state.execute("SELECT * FROM checks WHERE status='pending' ORDER BY feature,subject LIMIT 1").fetchone()
             if check is None:
                 break
             fixture.evaluate(check)
             processed += 1
-            problems = state.execute("SELECT count(*) FROM checks WHERE verdict='fail'").fetchone()[0]
+            problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
+            if state.execute("SELECT verdict FROM checks WHERE id=?", (check["id"],)).fetchone()[0] == "error":
+                break
         # Source changes invalidate evidence rather than manufacturing defects.
         if source_snapshot(root)[0] != snapshot or hashlib.sha256(binary.read_bytes()).hexdigest() != binary_hash:
             raise ToolError("target sources or binary changed while scanning; evidence is invalid")

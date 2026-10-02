@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -12,7 +13,7 @@ import subprocess
 import sys
 
 from audit import scan
-from common import ToolError, canonical_json, connect, now_ms
+from common import ToolError, canonical_json, connect, now_ms, source_snapshot
 from replay import replay
 
 
@@ -73,6 +74,9 @@ them. All applicable ast-index features remain in scope, not only class/symbol.
 Do not modify the target project. Do not commit target source, evidence databases,
 private names or large fixtures. Do not change AGENTS.md. Keep project payloads
 out of your messages. Do not commit or push: the driver verifies and commits.
+Do not install plugins/hooks/MCP configuration or write outside this repository
+and its artifact directory. Project content belongs only in private artifacts;
+public regression snippets must be small and synthetic.
 Run relevant tests. Finish with a concise cause/fix/test summary.
 """
 
@@ -120,6 +124,24 @@ def create_or_find_pr(repository: Path, target: str, branch: str, directory: Pat
     return result
 
 
+def seed_summary(evidence: Path, root: Path, binary: Path) -> dict:
+    source = connect(evidence.resolve(), read_only=True)
+    try:
+        metadata = dict(source.execute("SELECT key,value FROM metadata"))
+        if metadata.get("project_root") != str(root) or metadata.get("snapshot_sha256") != source_snapshot(root)[0]:
+            raise ToolError("seed evidence belongs to a different target or source snapshot")
+        if metadata.get("binary_sha256") != hashlib.sha256(binary.read_bytes()).hexdigest():
+            raise ToolError("seed evidence belongs to a different native binary")
+        counts = dict(source.execute("SELECT verdict,count(*) FROM checks WHERE status='complete' GROUP BY verdict"))
+        if not counts.get("fail") and not counts.get("unsupported"):
+            raise ToolError("seed evidence has no recorded repair work")
+        return {"evidence": str(evidence.resolve()), "counts": counts, "complete": False,
+                "remaining_checks": source.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0],
+                "unimplemented_features": source.execute("SELECT count(*) FROM coverage WHERE status='pending'").fetchone()[0]}
+    finally:
+        source.close()
+
+
 def run(arguments: argparse.Namespace) -> int:
     repository = Path(__file__).resolve().parents[2]
     root = Path(arguments.project_root).expanduser().resolve()
@@ -154,7 +176,12 @@ def run(arguments: argparse.Namespace) -> int:
                     if changed_files(repository):
                         raise ToolError("commit or preserve existing work before starting a new automated round")
                     with state:
-                        cursor = state.execute("INSERT INTO rounds(phase,base_head,created_at) VALUES ('build',?,?)", (git(repository, "rev-parse", "HEAD"), now_ms()))
+                        initial = None
+                        if getattr(arguments, "seed_evidence", None) and not state.execute("SELECT 1 FROM rounds LIMIT 1").fetchone():
+                            initial = seed_summary(arguments.seed_evidence, root, repository / "target/release/ast-index")
+                        cursor = state.execute("INSERT INTO rounds(phase,base_head,summary_json,created_at) VALUES (?,?,?,?)", (
+                            "agent" if initial else "build", git(repository, "rev-parse", "HEAD"),
+                            canonical_json(initial) if initial else None, now_ms()))
                     row = state.execute("SELECT * FROM rounds WHERE id=?", (cursor.lastrowid,)).fetchone()
                 round_id = row["id"]
                 directory = output / "rounds" / str(round_id)
@@ -240,6 +267,7 @@ def main() -> int:
     parser.add_argument("--mcp-url")
     parser.add_argument("--mcp-name", default="intellij-index")
     parser.add_argument("--pr-repo", default="defendend/Claude-ast-index-search")
+    parser.add_argument("--seed-evidence", type=Path)
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--agent-command", default='["codex","exec","--approve-for-me","--json","-"]')
     parser.add_argument("--agent-timeout", type=float)

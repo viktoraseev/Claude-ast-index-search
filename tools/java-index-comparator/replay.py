@@ -55,7 +55,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     "project_root": str(root), "snapshot_sha256": snapshot,
                     "binary_sha256": binary_hash, "original_evidence": str(evidence.resolve()),
                 }.items())
-            for check in source.execute("SELECT * FROM checks WHERE verdict='fail' ORDER BY feature,subject LIMIT ?", (limit,)):
+            for check in source.execute("SELECT * FROM checks WHERE verdict IN ('fail','unsupported') AND status='complete' ORDER BY feature,subject LIMIT ?", (limit,)):
                 existing = state.execute("SELECT status FROM checks WHERE id=?", (check["id"],)).fetchone()
                 if existing and existing[0] == "complete":
                     continue
