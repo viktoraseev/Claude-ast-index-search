@@ -6948,6 +6948,17 @@ pub fn glob_to_like(pattern: &str) -> String {
     result
 }
 
+/// Check which separator a qualified glob pattern uses.
+fn qualified_pattern_separator(pattern: &str) -> Option<&'static str> {
+    if pattern.contains("::") {
+        Some("::")
+    } else if pattern.contains('.') {
+        Some(".")
+    } else {
+        None
+    }
+}
+
 /// Find class-like symbols matching a glob pattern
 pub fn find_class_like_pattern(
     conn: &Connection,
@@ -6956,7 +6967,8 @@ pub fn find_class_like_pattern(
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
     let (scope_clause, scope_params) = scope.path_condition();
-    let qualified = like_pattern.contains("::");
+    let separator = qualified_pattern_separator(like_pattern);
+    let qualified = separator.is_some();
     let search_pattern = if qualified && like_pattern.starts_with("::") {
         format!("%{}", like_pattern)
     } else {
@@ -6964,7 +6976,7 @@ pub fn find_class_like_pattern(
     };
     let suffix_pattern =
         if qualified && !like_pattern.starts_with('%') && !like_pattern.starts_with("::") {
-            Some(format!("%::{}", like_pattern))
+            Some(format!("%{}{}", separator.unwrap(), like_pattern))
         } else {
             None
         };
@@ -7024,7 +7036,8 @@ pub fn find_symbols_by_pattern(
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
     let (scope_clause, scope_params) = scope.path_condition();
-    let qualified = like_pattern.contains("::");
+    let separator = qualified_pattern_separator(like_pattern);
+    let qualified = separator.is_some();
     let search_pattern = if qualified && like_pattern.starts_with("::") {
         format!("%{}", like_pattern)
     } else {
@@ -7032,7 +7045,7 @@ pub fn find_symbols_by_pattern(
     };
     let suffix_pattern =
         if qualified && !like_pattern.starts_with('%') && !like_pattern.starts_with("::") {
-            Some(format!("%::{}", like_pattern))
+            Some(format!("%{}{}", separator.unwrap(), like_pattern))
         } else {
             None
         };
@@ -7043,7 +7056,10 @@ pub fn find_symbols_by_pattern(
     };
 
     let kind_clause = if kind.is_some() {
-        format!(" AND s.kind = ?{}", 2 + scope_params.len())
+        format!(
+            " AND s.kind = ?{}",
+            2 + scope_params.len() + usize::from(suffix_pattern.is_some())
+        )
     } else {
         String::new()
     };
@@ -8276,7 +8292,8 @@ pub fn count_symbols_by_pattern_scoped(
     scope: &SearchScope,
     class_only: bool,
 ) -> Result<usize> {
-    let qualified = like_pattern.contains("::");
+    let separator = qualified_pattern_separator(like_pattern);
+    let qualified = separator.is_some();
     let search_pattern = if qualified && like_pattern.starts_with("::") {
         format!("%{like_pattern}")
     } else {
@@ -8291,7 +8308,10 @@ pub fn count_symbols_by_pattern_scoped(
         count_symbol_matches(
             conn,
             &format!("{name_expr} LIKE ? ESCAPE '\\' OR {name_expr} LIKE ? ESCAPE '\\'"),
-            vec![search_pattern, format!("%::{like_pattern}")],
+            vec![
+                search_pattern,
+                format!("%{}{like_pattern}", separator.unwrap()),
+            ],
             kind,
             scope,
             class_only,

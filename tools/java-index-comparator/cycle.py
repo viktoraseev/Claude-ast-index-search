@@ -134,14 +134,18 @@ them. All applicable ast-index features remain in scope, not only class/symbol.
 Do not modify the target project. Do not commit target source, evidence databases,
 private names or large fixtures. Do not change AGENTS.md. Keep project payloads
 out of your messages. Do not commit or push: the driver verifies and commits.
-Preserve the existing harness changes and red regression tests. The production
-CLI test for same-line Java overloads is deliberately red: fix the parser, not
-the assertion. Validate broad-query normalization against full-name oracle
+Preserve the existing harness changes and regression assertions. Establish
+red/green evidence for the current batch, not a defect fixed in an earlier round.
+Validate broad-query normalization against full-name oracle
 queries before treating a navigation mismatch as a production defect.
 Do not install plugins/hooks/MCP configuration or write outside this repository
 and its artifact directory. Project content belongs only in private artifacts;
 public regression snippets must be small and synthetic.
-Run relevant tests. Finish with a concise cause/fix/test summary.
+Run relevant tests. The driver independently runs the tool suite, original-batch
+replay and release workspace suite before committing. Do not spend the round on
+unrelated baseline lint warnings or repeated whole-workspace checks; investigate
+a broader check only when it exposes a regression caused by this repair.
+Finish with a concise cause/fix/test summary.
 """
 
 
@@ -297,8 +301,10 @@ def run(arguments: argparse.Namespace) -> int:
                     elif phase == "verify":
                         summary = json.loads(row["summary_json"])
                         try:
-                            logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
                             logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
+                            # Fixture tests invoke the production release CLI;
+                            # never test new adapters against a stale executable.
+                            logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
                             if summary["counts"].get("fail") or summary["counts"].get("unsupported"):
                                 result = replay(Path(summary["evidence"]), root, repository / "target/release/ast-index", directory / "batch-verification", mcp_url=arguments.mcp_url or discover_mcp_url(arguments.mcp_name),
                                                 oracle_evidence=Path(summary['verification']['verification']) if summary.get('verification', {}).get('verification') else None)

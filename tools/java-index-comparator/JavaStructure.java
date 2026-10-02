@@ -61,10 +61,30 @@ public class JavaStructure {
                     emit(kind, name, position, position);
                 }
                 void emit(String kind, String name, int position, int finish) {
+                    String qualified = qualifiedName(kind, name);
                     entries.add("{\"kind\":" + quote(kind) + ",\"name\":" + quote(name)
                         + ",\"line\":" + unit.getLineMap().getLineNumber(position)
                         + ",\"column\":" + (position - source.lastIndexOf('\n', position - 1))
-                        + ",\"end_line\":" + unit.getLineMap().getLineNumber(Math.max(position, finish - 1)) + "}");
+                        + ",\"end_line\":" + unit.getLineMap().getLineNumber(Math.max(position, finish - 1))
+                        + (qualified == null ? "" : ",\"qualified_name\":" + quote(qualified)) + "}");
+                }
+                String qualifiedName(String kind, String name) {
+                    if (List.of("import", "usage", "annotation").contains(kind)) return null;
+                    List<String> owners = new ArrayList<>();
+                    TreePath current = getCurrentPath();
+                    for (TreePath path = current; path != null; path = path.getParentPath()) {
+                        Tree tree = path.getLeaf();
+                        if (tree instanceof ClassTree type) {
+                            if (type.getSimpleName().length() == 0) return null;
+                            owners.add(type.getSimpleName().toString());
+                        } else if (path != current && (tree instanceof MethodTree || tree instanceof BlockTree)) {
+                            return null; // Local and anonymous declarations have no Java qualified name.
+                        }
+                    }
+                    Collections.reverse(owners);
+                    if (!List.of("class", "interface", "enum").contains(kind)) owners.add(name);
+                    String prefix = unit.getPackageName() == null ? "" : unit.getPackageName() + ".";
+                    return prefix + String.join(".", owners);
                 }
                 @Override public Void visitMethod(MethodTree tree, Void unused) {
                     if (tree.getName().contentEquals("<init>")) {

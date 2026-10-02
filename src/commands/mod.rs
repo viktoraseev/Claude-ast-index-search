@@ -30,7 +30,7 @@ pub mod watch;
 
 pub use test_paths::{is_test_path, is_test_symbol};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -674,7 +674,8 @@ where
 }
 
 /// Scan file matches, apply caller-side filtering before pagination, and
-/// retain an exact total without storing every accepted result. This is used
+/// retain an exact total and the first source-ordered page without storing
+/// every accepted result. This is used
 /// by commands whose validity checks (for example, excluding definitions)
 /// cannot safely be applied by the regex scanner itself.
 pub fn search_files_page<T, F>(
@@ -761,7 +762,10 @@ pub fn search_files_page_in_kept<T, F>(
 where
     F: FnMut(&Path, usize, &str) -> Option<T>,
 {
-    let mut items = Vec::with_capacity(limit.min(1024));
+    // Parallel workers deliver matches in completion order. Keeping the first
+    // arrivals makes both ordering and page membership depend on scheduling.
+    // Retain only the smallest source positions, using O(limit) memory.
+    let mut items = BTreeMap::new();
     let mut total = 0usize;
     search_files_in_kept(
         root,
@@ -773,13 +777,18 @@ where
         |path, line_num, line| {
             if let Some(item) = filter_map(path, line_num, line) {
                 total = total.saturating_add(1);
-                if items.len() < limit {
-                    items.push(item);
+                if limit > 0 {
+                    // The ordinal preserves duplicate matches at one position
+                    // when overlapping roots are explicitly requested.
+                    items.insert((path.to_path_buf(), line_num, total), item);
+                    if items.len() > limit {
+                        items.pop_last();
+                    }
                 }
             }
         },
     )?;
-    Ok(Page::new(items, total, limit))
+    Ok(Page::new(items.into_values().collect(), total, limit))
 }
 
 /// Runs `searcher` over `path` unless it is minified. A file type minifiers

@@ -55,6 +55,7 @@ class CycleTests(unittest.TestCase):
             )
             status = {"head": "before", "dirty": False, "failed": False}
             commands = []
+            stages = []
 
             def git(repository, *args):
                 commands.append(("git", *args))
@@ -70,6 +71,8 @@ class CycleTests(unittest.TestCase):
 
             def logged(command, *args, **kwargs):
                 commands.append(tuple(command))
+                if len(args) >= 3:
+                    stages.append(args[2])
                 if command == ["test-agent"]:
                     status["dirty"] = True
                     self.assertIn("Evidence SQLite", kwargs["prompt"])
@@ -107,6 +110,9 @@ class CycleTests(unittest.TestCase):
             self.assertEqual(sum(command[:4] == ("cargo", "test", "--release", "--workspace") for command in commands),
                              4 if failed_stage == "workspace-tests" else 3)
             self.assertEqual(commands.count(("test-agent",)), 2 if failed_stage else 1)
+            # Production fixture tests must see the repaired binary even when
+            # the coding agent ran only targeted/debug tests.
+            self.assertEqual(stages[stages.index("tool-tests") - 1], "fixed-build")
             if failed_stage:
                 agent_positions = [index for index, command in enumerate(commands) if command == ("test-agent",)]
                 commit_position = next(index for index, command in enumerate(commands) if command[:2] == ("git", "commit"))

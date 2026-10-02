@@ -757,10 +757,10 @@ pub fn cmd_symbol(
         )
     } else {
         let name = name.unwrap();
-        if fuzzy && kind.is_none() {
-            let total = db::count_symbols_fuzzy_scoped(&conn, name, None, scope, false)?;
+        if fuzzy {
+            let total = db::count_symbols_fuzzy_scoped(&conn, name, kind, scope, false)?;
             let matches =
-                db::search_symbols_for_command(&conn, name, None, limit, scope, true, false)?;
+                db::search_symbols_for_command(&conn, name, kind, limit, scope, true, false)?;
             (matches, total)
         } else {
             let total = db::count_symbols_by_name_scoped(&conn, name, kind, scope, false)?;

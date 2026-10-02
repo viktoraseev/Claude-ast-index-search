@@ -94,7 +94,7 @@ class InvocationOracle:
 
 LIVE_FEATURES = {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
-                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "search:references", "search:ranking", "todo", "deprecated"}
+                 "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated"}
 
 
 def coverage_sources(state: sqlite3.Connection) -> dict[str, int]:
@@ -786,6 +786,7 @@ class Fixture:
     def option_check(self, check: sqlite3.Row):
         file = relative_path(check['subject'], self.root)
         command = check['feature'].split(':')[0]
+        qualified_contract = check['feature'].endswith(':qualified-pattern')
         kind_map = {'constructor': 'function', 'method': 'function', 'accessor': 'function',
                     'component': 'property'}
         significant = set(('RestController Controller Service Repository Component Entity Table Configuration Bean '
@@ -814,6 +815,11 @@ class Fixture:
                 expected[(label, item['name'], item['kind'], item['path'], item['line'])] += 1
             for item in items:
                 actual[(label, item['name'], item['kind'], relative_path(item['path'], self.root), item['line'])] += 1
+            if qualified_contract:
+                for item in selected:
+                    expected[(label, 'qualified', item['name'], item['kind'], item['path'], item['line'], item.get('qualified_name'))] += 1
+                for item in items:
+                    actual[(label, 'qualified', item['name'], item['kind'], relative_path(item['path'], self.root), item['line'], item.get('qualified_name'))] += 1
             pagination = value.get('pagination', {})
             expected[(label, 'total', len(selected))] += 1
             actual[(label, 'total', pagination.get('total'))] += 1
@@ -840,6 +846,28 @@ class Fixture:
                     expected_rows = list(enumerate(lines[start - 1:min(end, start + 59)], start))
                     expected[(label, 'body', *key, canonical_json(expected_rows), end, end >= start + 60)] += 1
                     actual[(label, 'body', *key, canonical_json(rendered), item.get('end_line'), item.get('truncated'))] += 1
+        if qualified_contract:
+            # Qualified patterns must use independent syntax names, not names
+            # read from the same native index that the CLI searches.
+            patterns = {'*.*'}
+            for entry in entries:
+                qualified = entry.get('qualified_name')
+                if qualified and '.' in qualified:
+                    patterns.add(qualified.rsplit('.', 1)[0] + '.*')
+                    break
+            for pattern in sorted(patterns):
+                record('qualified:' + pattern, ['--pattern', pattern], [entry for entry in entries
+                    if fnmatch.fnmatchcase((entry.get('qualified_name') or entry['name']).lower(), pattern.lower())])
+            if command == 'symbol' and entries:
+                seed = entries[0]['name']
+                pattern = next((value for value in sorted(patterns) if value != '*.*'), '*.*')
+                for kind in sorted({entry['kind'] for entry in entries}):
+                    record('qualified-kind:' + kind, ['--pattern', pattern, '--type', kind], [entry for entry in entries
+                        if entry['kind'] == kind and fnmatch.fnmatchcase(
+                            (entry.get('qualified_name') or entry['name']).lower(), pattern.lower())])
+                    record('fuzzy-kind:' + kind, [seed, '--fuzzy', '--type', kind], [entry for entry in entries
+                        if entry['kind'] == kind and seed.lower() in entry['name'].lower()])
+            return entries, outputs, expected, actual
         record('pattern', ['--pattern', '*'], entries)
         if entries:
             seed = next((i['name'] for i in entries if i['kind'] in {'class', 'interface', 'enum'}), entries[0]['name'])
@@ -955,6 +983,7 @@ class Fixture:
                        "file": self.file_check, "outline": self.outline_check, "outline:constructors": self.structure_check, "imports": self.imports_check,
                        "search": self.search_check, "search:files": self.search_files_check,
                        "symbol:options": self.option_check, "class:options": self.option_check,
+                       "symbol:qualified-pattern": self.option_check, "class:qualified-pattern": self.option_check,
                        "todo": self.grep_check, "deprecated": self.grep_check,
                        "search:references": self.search_aggregation_check, "search:ranking": self.search_ranking_check,
                        "search:content": self.text_search_check, "annotations": self.text_search_check, **dict.fromkeys(("implementations", "hierarchy", "refs", "usages", "callers"), self.semantic_check)}.get(check["feature"])
@@ -1015,8 +1044,6 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
     pending_contracts = {
         "search:rank-presets": "history/graph ranking presets and test exclusion contracts not implemented yet",
-        "symbol:qualified-pattern": "qualified glob and combined fuzzy/kind contracts not implemented yet",
-        "class:qualified-pattern": "qualified glob contract not implemented yet",
     }
     type_names = {Path(entry["path"]).stem for entry in source_files}
     annotation_names = set()
@@ -1031,6 +1058,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
                 ("independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
                  "live MCP text locations" if feature in {"annotations", "search:content", "todo", "deprecated"} else
+                 "independent JDK syntax: qualified patterns and combined fuzzy/kind filters" if feature in {"symbol:qualified-pattern", "class:qualified-pattern"} else
                  "independent JDK syntax: patterns, filters, fuzzy lookup and source bodies" if feature in {"symbol:options", "class:options"} else
                  "internal CLI/DB reference aggregation and ordering; not MCP equivalence" if feature == "search:references" else
                  "internal CLI relevance tiers, limited-page stability and totals; not MCP equivalence" if feature == "search:ranking" else
@@ -1062,7 +1090,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 stable_id({"feature": 'annotations', "subject": name}), 'annotations', name,
             ))
         for entry in source_files:
-            for feature in ("outline", "imports", "outline:constructors", "symbol:options", "class:options"):
+            for feature in ("outline", "imports", "outline:constructors", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern"):
                 state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                     stable_id({"feature": feature, "subject": entry["path"]}), feature, entry["path"],
                 ))

@@ -17,7 +17,8 @@ class CoverageSourcesTests(unittest.TestCase):
                 for feature in ('hierarchy', 'refs', 'usages', 'callers'):
                     self.assertTrue(reasons[feature].startswith('hybrid MCP/JDK'), reasons[feature])
                 for feature in ('stats', 'query', 'schema', 'db-path', 'search:references',
-                                'search:ranking', 'symbol:options', 'class:options', 'outline:constructors'):
+                                'search:ranking', 'symbol:options', 'class:options', 'outline:constructors',
+                                'symbol:qualified-pattern', 'class:qualified-pattern'):
                     self.assertFalse(reasons[feature].startswith('live MCP'), reasons[feature])
                 counts = coverage_sources(state)
                 implemented = state.execute("SELECT count(*) FROM coverage WHERE status='implemented'").fetchone()[0]
