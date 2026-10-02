@@ -20,6 +20,10 @@
 (enum_declaration
   name: (identifier) @enum_name) @enum_node @definition
 
+; Enum constants, including constants with arguments or anonymous bodies
+(enum_constant
+  name: (identifier) @enum_constant_name) @definition
+
 ; Methods
 (method_declaration
   name: (identifier) @method_name) @method_node @definition

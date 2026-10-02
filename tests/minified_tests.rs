@@ -279,6 +279,7 @@ fn grep_commands_do_not_read_minified_files() {
 #[test]
 fn outline_and_imports_report_a_minified_file_instead_of_parsing_it() {
     let project = project();
+    fs::create_dir(project.path().join(".git")).unwrap();
     let cache = TempDir::new().unwrap();
     let root = project.path();
 

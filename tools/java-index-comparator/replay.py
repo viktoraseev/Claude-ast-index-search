@@ -8,7 +8,7 @@ import sys
 
 from audit import Fixture, SCHEMA
 from build_index import build_ast_index
-from common import ToolError, canonical_json, connect, source_snapshot, stable_id
+from common import ToolError, adapter_digest, canonical_json, connect, source_snapshot, stable_id
 
 
 class StoredOracle:
@@ -30,6 +30,19 @@ class StoredOracle:
         self.page += 1
         return json.loads(row["response_json"])
 
+    def assert_consumed(self):
+        if self.source.execute("SELECT 1 FROM pages WHERE check_id=? AND page>=? LIMIT 1",
+                               (self.check_id, self.page)).fetchone():
+            raise ToolError("recorded oracle operations were not all replayed")
+
+
+def problem_batch(source, limit: int):
+    """Stream the bounded failure batch and every recorded contract error."""
+    yield from source.execute(
+        "SELECT * FROM checks WHERE verdict='fail' ORDER BY rowid LIMIT ?", (limit,))
+    yield from source.execute(
+        "SELECT * FROM checks WHERE verdict IN ('unsupported','error') ORDER BY rowid")
+
 
 def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 100) -> dict:
     root, binary, output = root.resolve(), binary.resolve(), output.resolve()
@@ -43,7 +56,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
             raise ToolError("replay target differs from the captured source snapshot")
         binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
         epoch = stable_id({"evidence": str(evidence.resolve()), "snapshot": snapshot, "binary": binary_hash, "limit": limit,
-                           "fixture": hashlib.sha256(Path(__file__).with_name("audit.py").read_bytes()).hexdigest()})[:20]
+                           "fixture": adapter_digest()})[:20]
         directory = output / epoch
         database = directory / "index.sqlite"
         build_ast_index(str(binary), root, database, snapshot)
@@ -55,18 +68,25 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     "project_root": str(root), "snapshot_sha256": snapshot,
                     "binary_sha256": binary_hash, "original_evidence": str(evidence.resolve()),
                 }.items())
-            for check in source.execute("SELECT * FROM checks WHERE verdict IN ('fail','unsupported') AND status='complete' ORDER BY feature,subject LIMIT ?", (limit,)):
+            for check in problem_batch(source, limit):
                 existing = state.execute("SELECT status FROM checks WHERE id=?", (check["id"],)).fetchone()
                 if existing and existing[0] == "complete":
                     continue
                 with state:
                     state.execute("INSERT OR REPLACE INTO checks(id,feature,subject) VALUES (?,?,?)", (check["id"], check["feature"], check["subject"]))
-                fixture = Fixture(root, binary, database, state, StoredOracle(source, check["id"]))
+                oracle = StoredOracle(source, check["id"])
+                fixture = Fixture(root, binary, database, state, oracle, schedule_followups=False)
                 fixture.evaluate(check)
+                try:
+                    oracle.assert_consumed()
+                except ToolError as error:
+                    with state:
+                        state.execute("UPDATE checks SET verdict='error',error=? WHERE id=?", (str(error), check["id"]))
             if source_snapshot(root)[0] != snapshot or hashlib.sha256(binary.read_bytes()).hexdigest() != binary_hash:
                 raise ToolError("sources or binary changed during replay; verification is invalid")
             counts = {row[0]: row[1] for row in state.execute("SELECT verdict,count(*) FROM checks GROUP BY verdict")}
-            return {"counts": counts, "verified": bool(counts.get("pass")) and not any(counts.get(key) for key in ("fail", "unsupported", "error")),
+            remaining = state.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0]
+            return {"counts": counts, "verified": bool(counts.get("pass")) and not remaining and not any(counts.get(key) for key in ("fail", "unsupported", "error")),
                     "verification": str(directory / "verification.sqlite")}
         finally:
             state.close()

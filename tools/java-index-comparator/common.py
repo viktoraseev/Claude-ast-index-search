@@ -31,6 +31,13 @@ def stable_id(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
+def adapter_digest() -> str:
+    """Invalidate checkpoints when execution or normalization code changes."""
+    directory = Path(__file__).parent
+    return stable_id({name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
+                      for name in ("audit.py", "common.py", "build_index.py", "replay.py")})
+
+
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
         connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

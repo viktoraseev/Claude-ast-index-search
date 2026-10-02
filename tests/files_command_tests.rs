@@ -137,6 +137,7 @@ fn cmd_outline_handles_unsupported_extension() {
 }
 
 fn run_outline(dir: &std::path::Path, args: &[&str]) -> String {
+    fs::create_dir_all(dir.join(".git")).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_ast-index"))
         .current_dir(dir)
         .env("NO_COLOR", "1")
@@ -251,6 +252,7 @@ fn cmd_imports_handles_file_with_no_imports() {
 #[test]
 fn imports_lists_every_typescript_import_on_one_line() {
     let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
     let src = dir.path().join("src/Invoice.tsx");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(

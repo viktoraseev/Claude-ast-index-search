@@ -257,12 +257,27 @@ pub(crate) fn detect_git_default_branch_compat(root: &Path) -> &'static str {
 }
 
 pub(crate) fn discover_vcs_root(invocation_cwd: &Path) -> Result<VcsRoot> {
+    let git_ceilings: Vec<PathBuf> = std::env::var_os("GIT_CEILING_DIRECTORIES")
+        .map(|value| {
+            std::env::split_paths(&value)
+                .filter(|path| path.is_absolute())
+                .map(|path| path.canonicalize().unwrap_or(path))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut search_git = true;
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
         .map(|path| path.canonicalize().unwrap_or(path));
     for ancestor in invocation_cwd.ancestors() {
+        let at_git_ceiling = git_ceilings.iter().any(|path| path == ancestor);
+        // Git excludes ceiling directories from ancestor discovery, while
+        // always allowing the invocation directory itself to be a repository.
+        if at_git_ceiling && ancestor != invocation_cwd {
+            search_git = false;
+        }
         let is_home = home.as_deref() == Some(ancestor);
         if !is_home && is_arc_root(ancestor) {
             return Ok(VcsRoot {
@@ -270,11 +285,17 @@ pub(crate) fn discover_vcs_root(invocation_cwd: &Path) -> Result<VcsRoot> {
                 path: ancestor.to_path_buf(),
             });
         }
-        if is_git_root(ancestor) {
+        if search_git && is_git_root(ancestor) {
             return Ok(VcsRoot {
                 vcs: Vcs::Git,
                 path: ancestor.to_path_buf(),
             });
+        }
+        if is_home {
+            break;
+        }
+        if at_git_ceiling {
+            search_git = false;
         }
     }
     bail!(

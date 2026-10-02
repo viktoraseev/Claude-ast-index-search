@@ -7,7 +7,7 @@ use tree_sitter::{Language, Query, QueryCursor, StreamingIterator};
 
 use super::{node_line, node_text, parse_tree, signature_line, text_end_line, LanguageParser};
 use crate::db::SymbolKind;
-use crate::parsers::ParsedSymbol;
+use crate::parsers::{FileType, ParsedRef, ParsedSymbol};
 
 static JAVA_LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_java::LANGUAGE.into());
 
@@ -78,6 +78,35 @@ impl LanguageParser for JavaParser {
         Some(&NON_CODE)
     }
 
+    fn extract_refs(&self, content: &str, defined: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
+        self.extract_refs_for_lang(content, defined, FileType::Java)
+    }
+
+    fn extract_refs_for_lang(
+        &self,
+        content: &str,
+        defined: &[ParsedSymbol],
+        file_type: FileType,
+    ) -> Result<Vec<ParsedRef>> {
+        let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+        java_refs(content, &tree, defined, file_type)
+    }
+
+    fn parse_symbols_and_refs(
+        &self,
+        content: &str,
+        file_type: FileType,
+    ) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+        super::forget_last_tree();
+        let symbols = self.parse_symbols(content)?;
+        let tree = match super::reuse_tree(content, &JAVA_LANGUAGE) {
+            Some(tree) => tree,
+            None => parse_tree(content, &JAVA_LANGUAGE)?,
+        };
+        let refs = java_refs(content, &tree, &symbols, file_type)?;
+        Ok((symbols, refs))
+    }
+
     fn parse_symbols(&self, content: &str) -> Result<Vec<ParsedSymbol>> {
         let tree = parse_tree(content, &JAVA_LANGUAGE)?;
         let mut symbols = Vec::new();
@@ -98,6 +127,7 @@ impl LanguageParser for JavaParser {
         let idx_interface_node = idx("interface_node");
         let idx_enum_name = idx("enum_name");
         let idx_enum_node = idx("enum_node");
+        let idx_enum_constant_name = idx("enum_constant_name");
         let idx_method_name = idx("method_name");
         let idx_method_node = idx("method_node");
         let idx_constructor_name = idx("constructor_name");
@@ -176,6 +206,23 @@ impl LanguageParser for JavaParser {
                         line,
                         signature: signature_line(content, line),
                         parents,
+                        end_line,
+                    });
+                }
+                continue;
+            }
+
+            // === Enum constants ===
+            if let Some(name_cap) = find_capture(m, idx_enum_constant_name) {
+                let name = node_text(content, &name_cap.node);
+                let line = node_line(&name_cap.node);
+                if emitted.insert((name.to_string(), line)) {
+                    symbols.push(ParsedSymbol {
+                        name: name.to_string(),
+                        kind: SymbolKind::Constant,
+                        line,
+                        signature: signature_line(content, line),
+                        parents: vec![],
                         end_line,
                     });
                 }
@@ -343,6 +390,45 @@ impl LanguageParser for JavaParser {
     }
 }
 
+/// Include method-reference targets, which have no call parentheses.
+fn java_refs(
+    content: &str,
+    tree: &tree_sitter::Tree,
+    defined: &[ParsedSymbol],
+    file_type: FileType,
+) -> Result<Vec<ParsedRef>> {
+    let masked = super::mask_non_code(content, tree.root_node(), &NON_CODE);
+    let mut refs = super::extract_refs_masked(content, &masked, defined, Some(file_type))?;
+    let mut seen: std::collections::HashSet<(String, usize)> =
+        refs.iter().map(|r| (r.name.clone(), r.line)).collect();
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        if node.kind() == "method_reference" {
+            // The final child is the target identifier after any type
+            // arguments, or the unnamed `new` token for constructor references.
+            let mut cursor = node.walk();
+            if let Some(target) = node
+                .children(&mut cursor)
+                .last()
+                .filter(|n| n.kind() == "identifier")
+            {
+                let name = node_text(content, &target);
+                let line = node_line(&target);
+                if seen.insert((name.to_string(), line)) {
+                    refs.push(ParsedRef {
+                        name: name.to_string(),
+                        line,
+                        context: crate::parsers::truncate_context(
+                            super::line_text(content, line).trim(),
+                        ),
+                    });
+                }
+            }
+        }
+        super::WalkControl::Continue
+    });
+    Ok(refs)
+}
+
 pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, String), String>> {
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let root = tree.root_node();
@@ -368,6 +454,7 @@ pub fn collect_qualified_names(content: &str) -> Result<HashMap<(String, usize, 
                 "class_name" => &[SymbolKind::Class],
                 "interface_name" => &[SymbolKind::Interface],
                 "enum_name" => &[SymbolKind::Enum],
+                "enum_constant_name" => &[SymbolKind::Constant],
                 "method_name" | "constructor_name" => &[SymbolKind::Function],
                 "field_name" => &[SymbolKind::Property],
                 "record_component_name" => &[SymbolKind::Property, SymbolKind::Function],

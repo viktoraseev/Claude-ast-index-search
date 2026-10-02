@@ -31,6 +31,8 @@ fn stdout(output: &Output) -> String {
 fn fixture() -> (TempDir, TempDir) {
     let project = TempDir::new().unwrap();
     let cache = TempDir::new().unwrap();
+    // Keep an unindexed fixture independent of any enclosing project markers.
+    fs::create_dir(project.path().join(".git")).unwrap();
     let lib = project.path().join("lib");
     fs::create_dir(&lib).unwrap();
     fs::write(

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from audit import SCHEMA
 from common import ToolError, canonical_json, connect, source_snapshot
-from replay import StoredOracle, replay
+from replay import StoredOracle, problem_batch, replay
 
 
 class ReplayTests(unittest.TestCase):
@@ -38,6 +38,13 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, "scope/query"):
             StoredOracle(self.source, "case").call("ide_find_class", {**self.arguments, "scope": "project_and_libraries"})
 
+    def test_failure_limit_does_not_drop_unsupported_or_error_contracts(self):
+        with self.source:
+            for subject, verdict in (("second", "fail"), ("unknown", "unsupported"), ("broken", "error")):
+                self.source.execute("INSERT INTO checks(id,feature,subject,status,verdict) VALUES (?,'symbol',?,'complete',?)",
+                                    (subject, subject, verdict))
+        self.assertEqual([row["id"] for row in problem_batch(self.source, 1)], ["case", "unknown", "broken"])
+
     def test_replay_executes_fixture_and_does_not_reuse_old_actual_results(self):
         output = self.directory / "replays"
         with patch("replay.build_ast_index"), patch("audit.Fixture.cli", return_value={"items": [{"name": "A", "path": "A.java", "line": 1}]}) as cli:
@@ -50,6 +57,15 @@ class ReplayTests(unittest.TestCase):
             result = replay(self.evidence, self.root, self.binary, output)
             self.assertTrue(result["verified"])
             self.assertEqual(result["counts"], {"pass": 1})
+
+    def test_unused_recorded_operations_prevent_a_replay_pass(self):
+        with self.source:
+            self.source.execute("INSERT INTO pages VALUES ('case',1,?,?,?)", (
+                canonical_json({"file": "A.java", "line": 1}), canonical_json({"references": []}), "ide_find_references"))
+        with patch("replay.build_ast_index"), patch("audit.Fixture.cli", return_value={"items": [{"name": "A", "path": "A.java", "line": 1, "qualified_name": "p.A"}]}):
+            result = replay(self.evidence, self.root, self.binary, self.directory / "replays")
+        self.assertFalse(result["verified"])
+        self.assertEqual(result["counts"], {"error": 1})
 
     def test_changed_sources_fail_before_native_build(self):
         (self.root / "A.java").write_text("package p; class Changed {}\n")

@@ -597,6 +597,26 @@ fn changed_ignores_home_level_arc_markers_outside_a_repository() {
 }
 
 #[test]
+fn changed_respects_git_discovery_ceilings() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    let cwd = repo.join("module");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(&cwd)
+        .env("GIT_CEILING_DIRECTORIES", &repo)
+        .env("NO_COLOR", "1")
+        .args(["changed", "--base", "main"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no Git") && stderr.contains("working tree found"));
+}
+
+#[test]
 fn changed_normalizes_legacy_arc_origin_base() {
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("repo");

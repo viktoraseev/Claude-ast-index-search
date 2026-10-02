@@ -10,11 +10,22 @@ pushes to a feature branch, then rebuilds and starts a full audit again.
 Full coverage and zero unresolved problems are required before the work is
 ready for an upstream PR.
 
-The current auditor compares class identities, Java qualified names, file
-navigation, and symbol declaration identities. Other command contracts remain
-explicitly pending: a passing subset is never reported as a complete audit.
-MCP Go-to-Symbol kinds are coarse and are not treated as authoritative Java
-declaration categories.
+Live handlers compare class identities, Java qualified names, file navigation,
+symbol and outline declaration identities, references, usages, callers,
+implementations, and hierarchy. Imports are checked against source statements;
+stats, query, schema, and db-path are checked against the isolated database.
+Universal search currently checks its exact declaration results. Its other
+sections, ranking, command options, and independent constructor outline
+coverage remain explicitly pending, along with the other command contracts.
+A passing subset is never reported as a complete audit. MCP Go-to-Symbol kinds
+are coarse and constructors are outside its navigation scope. Anonymous-class
+methods have no Java qualified name, so their identity uses name, file and line.
+
+Replay streams the first 100 failures in capture order plus every unsupported
+or error contract. Each check executes the current CLI against a rebuilt index;
+all recorded oracle operations and pagination requests are bound to their
+original scope. Reference checks are planned only for confirmed project
+declarations, rather than lexical keywords and unresolved external names.
 
 The cycle driver automates build, audit, agent work, original-batch replay,
 workspace tests, commit and push. It requires a feature branch and a clean

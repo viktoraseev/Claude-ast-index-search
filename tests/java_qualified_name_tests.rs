@@ -46,6 +46,12 @@ fn java_index_preserves_package_and_declaring_type_names() {
         ("interface", "Reader", "example.audit.Portfolio.Reader"),
         ("function", "read", "example.audit.Portfolio.Reader.read"),
         ("enum", "Status", "example.audit.Portfolio.Status"),
+        ("constant", "OPEN", "example.audit.Portfolio.Status.OPEN"),
+        (
+            "constant",
+            "CLOSED",
+            "example.audit.Portfolio.Status.CLOSED",
+        ),
         ("class", "Position", "example.audit.Portfolio.Position"),
         (
             "property",
