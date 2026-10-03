@@ -62,7 +62,16 @@ class CycleTests(unittest.TestCase):
     def test_revalidated_batch_resumes_stopped_audit_then_runs_a_fresh_full_audit(self):
         self.exercise_cycle(resume=True)
 
-    def exercise_cycle(self, failed_stage=None, resume=False):
+    def test_deferred_pr_still_requires_a_complete_audit_and_final_tests(self):
+        self.exercise_cycle(defer_pr=True)
+
+    def test_pr_deferral_survives_driver_reload_without_the_flag(self):
+        self.exercise_cycle(defer_pr=None, persisted_defer=True)
+
+    def test_explicit_pr_creation_overrides_persisted_deferral(self):
+        self.exercise_cycle(defer_pr=False, persisted_defer=True)
+
+    def exercise_cycle(self, failed_stage=None, resume=False, defer_pr=False, persisted_defer=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             arguments = argparse.Namespace(
@@ -70,6 +79,7 @@ class CycleTests(unittest.TestCase):
                 agent_command='["test-agent"]', timeout=5, agent_timeout=10,
                 mcp_url="http://localhost/test", mcp_name="test", max_rounds=None,
                 pr_repo="owner/repository",
+                defer_pr=defer_pr,
             )
             status = {"head": "before", "dirty": False, "failed": False}
             commands = []
@@ -104,6 +114,12 @@ class CycleTests(unittest.TestCase):
                        "remaining_checks": 20, "unimplemented_features": 1, "complete": False}
             final = {**summary, "counts": {"pass": 120}, "remaining_checks": 0,
                      "unimplemented_features": 0, "complete": True}
+            if persisted_defer:
+                journal = connect(root / 'artifacts/cycle.sqlite')
+                journal.executescript(cycle.SCHEMA)
+                with journal:
+                    journal.execute("INSERT INTO configuration VALUES ('defer_pr','true')")
+                journal.close()
             if resume:
                 journal = connect(root / "artifacts/cycle.sqlite")
                 journal.executescript(cycle.SCHEMA)
@@ -119,8 +135,12 @@ class CycleTests(unittest.TestCase):
                         "fixture_sha256": cycle.adapter_digest(),
                     }.items())
                 batch.close()
-            with patch.object(cycle, "git", side_effect=git), patch.object(cycle, "changed_files", side_effect=lambda _: ["src/fix.rs"] if status["dirty"] else []), patch.object(cycle, "logged", side_effect=logged), patch.object(cycle, "replay", return_value={"verified": True}), patch.object(cycle, "seed_summary", return_value=summary), patch.object(cycle, "create_or_find_pr", return_value="https://github.com/owner/repository/pull/1"), patch.object(cycle, "scan", side_effect=[final] if resume else [summary, final]) as scan, contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(cycle, "git", side_effect=git), patch.object(cycle, "changed_files", side_effect=lambda _: ["src/fix.rs"] if status["dirty"] else []), patch.object(cycle, "logged", side_effect=logged), patch.object(cycle, "replay", return_value={"verified": True}), patch.object(cycle, "seed_summary", return_value=summary), patch.object(cycle, "create_or_find_pr", return_value="https://github.com/owner/repository/pull/1") as create_pr, patch.object(cycle, "scan", side_effect=[final] if resume else [summary, final]) as scan, contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(cycle.run(arguments), 0)
+            deferred = persisted_defer if defer_pr is None else defer_pr
+            self.assertEqual(create_pr.call_count, 0 if deferred else 1)
+            if deferred:
+                self.assertIn('"pr_deferred":true', output.getvalue())
             self.assertEqual(scan.call_count, 1 if resume else 2)
             self.assertTrue(all(call.args[0].case_limit is None for call in scan.call_args_list))
             self.assertIn(("git", "add", "--", "src/fix.rs"), commands)

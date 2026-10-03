@@ -8,6 +8,7 @@ import sys
 from audit import Fixture, InvocationOracle, SCHEMA
 from build_index import build_ast_index, freeze_binary
 from common import StreamableHttpMcpClient, ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot, stable_id
+import mobile_contracts
 
 
 class StoredOracle:
@@ -70,15 +71,20 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
     try:
         metadata = dict(source.execute("SELECT key,value FROM metadata"))
         snapshot, _ = source_snapshot(root)
+        inventory_hash = mobile_contracts.inventory_snapshot(root)
         if str(root) != metadata.get("project_root") or snapshot != metadata.get("snapshot_sha256"):
             raise ToolError("replay target differs from the captured source snapshot")
+        if metadata.get('inventory_sha256', inventory_hash) != inventory_hash:
+            raise ToolError('replay file-type inventory differs from captured evidence')
         if oracle_evidence is not None:
             archive = connect(oracle_evidence, read_only=True)
             archived_metadata = dict(archive.execute("SELECT key,value FROM metadata"))
             if archived_metadata.get('project_root') != str(root) or archived_metadata.get('snapshot_sha256') != snapshot:
                 raise ToolError('supplemental oracle target differs from the captured source snapshot')
+            if archived_metadata.get('inventory_sha256', inventory_hash) != inventory_hash:
+                raise ToolError('supplemental oracle file-type inventory differs from target')
         binary_hash = file_sha256(binary)
-        epoch = stable_id({"evidence": str(evidence.resolve()), "snapshot": snapshot, "binary": binary_hash, "limit": limit,
+        epoch = stable_id({"evidence": str(evidence.resolve()), "snapshot": snapshot, "inventory": inventory_hash, "binary": binary_hash, "limit": limit,
                            "fixture": adapter_digest(), "mcp_url": mcp_url,
                            "oracle_evidence": str(oracle_evidence.resolve()) if oracle_evidence else None})[:20]
         directory = output / epoch
@@ -93,6 +99,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     "project_root": str(root), "snapshot_sha256": snapshot,
                     "binary_sha256": binary_hash, "original_evidence": str(evidence.resolve()),
                     "fixture_sha256": adapter_digest(),
+                    "inventory_sha256": inventory_hash,
                 }.items())
                 state.executemany("INSERT OR REPLACE INTO coverage VALUES (?,?,?)",
                                   source.execute("SELECT feature,status,reason FROM coverage"))
@@ -129,7 +136,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     refreshed_oracle = ArchiveOracle(archive, check['id'], live) if archive is not None else live
                     Fixture(root, binary, database, state, refreshed_oracle, schedule_followups=False).evaluate(check)
                     refreshed += 1
-            if source_snapshot(root)[0] != snapshot or file_sha256(binary) != binary_hash:
+            if source_snapshot(root)[0] != snapshot or mobile_contracts.inventory_snapshot(root) != inventory_hash or file_sha256(binary) != binary_hash:
                 raise ToolError("sources or binary changed during replay; verification is invalid")
             counts = {row[0]: row[1] for row in state.execute("SELECT verdict,count(*) FROM checks GROUP BY verdict")}
             remaining = state.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0]

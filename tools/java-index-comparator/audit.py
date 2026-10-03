@@ -36,6 +36,7 @@ from common import (
 from build_index import build_ast_index, freeze_binary
 from java_structure import structure_server
 from oracle_store import Metrics, OracleStore, Reply, ReplyCache, SCHEMA as ORACLE_SCHEMA
+import mobile_contracts
 
 
 SCHEMA = """
@@ -58,7 +59,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -376,6 +377,7 @@ class Fixture:
                 state.execute("INSERT OR REPLACE INTO metadata VALUES ('structure_sha256',?)", (structure_digest,))
         self.schedule_followups = schedule_followups
         self._injection_ready = False
+        self._inventory_ready = False
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
@@ -893,6 +895,65 @@ class Fixture:
             raise Unsupported('suppression result reached CLI collection limit')
         return expected, actual, location_keys(expected, self.root), locations
 
+    def mobile_text_check(self, check: sqlite3.Row):
+        """Execute lexical searches; absent languages are independent evidence."""
+        if not self._inventory_ready:
+            mobile_contracts.inventory(self.state, self.root)
+            self._inventory_ready = True
+        feature = check['feature']
+        query = json.loads(check['subject'])['query']
+        status, reason = mobile_contracts.applicability(self.state, feature)
+        if status == 'pending':
+            raise Unsupported(reason)
+        expected = set()
+        for row in mobile_contracts.applicable_paths(self.state, feature):
+            file = row['path']
+            path = self.root / file
+            if file_sha256(path) != row['sha256']:
+                raise ToolError('mobile source changed after inventory')
+            pattern = mobile_contracts.query_pattern(feature, query, row['extension'])
+            # Partition by inventory file before querying, so every pagination
+            # chain has an explicit language/root scope and the Java fallback
+            # cannot silently erase Kotlin/Swift matches at the collection cap.
+            matches = self.paginated(check['id'], 'ide_search_text', {
+                'project_path': str(self.root), 'query': pattern, 'regex': True,
+                'caseSensitive': True, 'context': 'all',
+                'filePattern': '*' + row['extension'], 'paths': [file], 'pageSize': 500,
+            }, 'matches')
+            locations = set()
+            for match in matches:
+                line = match.get('line')
+                if relative_path(match.get('file', match.get('path')), self.root) != file or not isinstance(line, int) or line < 1:
+                    raise Unsupported('mobile text oracle returned an invalid scope/location')
+                locations.add(line)
+            # Only one file is retained at a time, and oracle columns on the
+            # same line collapse into the CLI's line-oriented identity.
+            with path.open(encoding='utf-8') as source:
+                for number, line in enumerate(source, 1):
+                    if number not in locations:
+                        continue
+                    locations.remove(number)
+                    if not re.search(pattern, line):
+                        raise Unsupported('mobile oracle anchor differs from source snapshot')
+                    if mobile_contracts.accepts(feature, query, line):
+                        expected.add((file, number))
+                        if len(expected) >= 1000000:
+                            raise Unsupported('mobile search exceeds bounded CLI collection limit')
+            if locations:
+                raise Unsupported('mobile oracle line exceeds source snapshot')
+        ordered = sorted(expected)
+        if len(ordered) >= 1000000:
+            raise Unsupported('mobile search exceeds bounded CLI collection limit')
+        arguments = [] if query is None else [query]
+        outputs, expected_keys, actual_keys = {}, set(), set()
+        for limit in sorted({0, 1, 3, 1000000}):
+            output = self.text_cli(feature, *arguments, '--limit', str(limit))
+            outputs[str(limit)] = output
+            actual = mobile_contracts.output_locations(feature, output, self.root, limit)
+            expected_keys.update((limit, index, *location) for index, location in enumerate(ordered[:limit]))
+            actual_keys.update((limit, index, *location) for index, location in enumerate(actual))
+        return {'source': reason, 'locations': ordered}, outputs, expected_keys, actual_keys
+
     def injection_check(self, check: sqlite3.Row):
         name = check['subject']
         if not self._injection_ready:
@@ -1258,6 +1319,8 @@ class Fixture:
                 handler = self.introspection_check
             if check['feature'] in INTERNAL_FEATURES:
                 handler = self.map_check if check['feature'] == 'map' else self.analysis_management_check
+            if check['feature'] in mobile_contracts.EXTENSIONS:
+                handler = self.mobile_text_check
             if handler is None:
                 raise Unsupported(f"no live handler for {check['feature']}")
             expected, actual, expected_keys, actual_keys = handler(check)
@@ -1398,6 +1461,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
+    mobile_contracts.plan_mobile(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -1423,11 +1487,13 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
     if output == root or root in output.parents:
         raise ToolError("artifact directory must be outside the target project")
     snapshot, source_files = source_snapshot(root)
+    inventory_hash = mobile_contracts.inventory_snapshot(root)
     if not source_files:
         raise Unsupported("target has no Java source files; language contract needed")
     binary_hash = file_sha256(binary)
     contract = adapter_digest()
-    epoch = stable_id({"root": str(root), "snapshot": snapshot, "binary": binary_hash, "contract": contract})[:20]
+    epoch = stable_id({"root": str(root), "snapshot": snapshot, "inventory": inventory_hash,
+                       "binary": binary_hash, "contract": contract})[:20]
     directory = output / epoch
     directory.mkdir(parents=True, exist_ok=True)
     binary = freeze_binary(binary, directory, binary_hash)
@@ -1477,7 +1543,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             if state.execute("SELECT verdict FROM checks WHERE id=?", (check["id"],)).fetchone()[0] == "error":
                 break
         # Source changes invalidate evidence rather than manufacturing defects.
-        if source_snapshot(root)[0] != snapshot or file_sha256(binary) != binary_hash:
+        if source_snapshot(root)[0] != snapshot or mobile_contracts.inventory_snapshot(root) != inventory_hash or file_sha256(binary) != binary_hash:
             raise ToolError("target sources or binary changed while scanning; evidence is invalid")
         counts = {row[0]: row[1] for row in state.execute(
             "SELECT verdict,count(*) FROM checks WHERE status='complete' GROUP BY verdict"
@@ -1489,6 +1555,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             "counts": counts, "remaining_checks": remaining,
             "unimplemented_features": pending_features,
             "coverage_sources": coverage_sources(state),
+            "inapplicable_features": state.execute("SELECT count(*) FROM coverage WHERE status='inapplicable'").fetchone()[0],
             "performance": metrics.summary(),
             "complete": remaining == 0 and pending_features == 0 and not any(counts.get(key, 0) for key in ("fail", "unsupported", "error")),
             "evidence": str(directory / "evidence.sqlite"),

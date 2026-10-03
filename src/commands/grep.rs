@@ -23,7 +23,10 @@ use colored::Colorize;
 use regex::Regex;
 
 use super::graph::short_name;
-use super::{print_truncation_notice, relative_path, search_files_limited, PathResolver};
+use super::{
+    print_truncation_notice, relative_path, search_files_filtered, search_files_limited,
+    PathResolver,
+};
 use crate::db;
 
 /// All source code extensions (for grep-based commands: todo, search, callers, etc.)
@@ -910,29 +913,33 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
 /// Captures a suspend function's name, skipping type parameters and an extension
 /// receiver (`suspend fun <T> Foo<T>.bar(`) so the receiver type isn't reported.
 const SUSPEND_FUN_NAME_PATTERN: &str =
-    r"suspend\s+fun\s+(?:<[^>]*>\s*)?(?:[\w.<>?,* ]+\.)?`?(\w+)`?\s*[(<]";
+    r"\bsuspend\s+fun\s+(?:<[^>]*>\s*)?(?:[\w.<>?,* ]+\.)?`?(\w+)`?\s*[(<]";
 
 /// Find suspend functions
 pub fn cmd_suspend(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let pattern = pattern_with_line_filter(r"suspend\s+fun\s", query);
     let func_regex = Regex::new(SUSPEND_FUN_NAME_PATTERN)?;
 
     let mut suspends: Vec<(String, String, usize)> = vec![];
 
-    search_files_limited(root, &pattern, &["kt"], limit, |path, line_num, line| {
-        if let Some(caps) = func_regex.captures(line) {
-            let func_name = caps.get(1).unwrap().as_str().to_string();
+    search_files_filtered(
+        root,
+        SUSPEND_FUN_NAME_PATTERN,
+        &["kt", "kts"],
+        limit,
+        |_, line| {
+            func_regex.captures(line).is_some_and(|caps| {
+                query.is_none_or(|q| caps[1].to_lowercase().contains(&q.to_lowercase()))
+            })
+        },
+        |path, line_num, line| {
+            if let Some(caps) = func_regex.captures(line) {
+                let func_name = caps.get(1).unwrap().as_str().to_string();
 
-            if let Some(q) = query {
-                if !func_name.to_lowercase().contains(&q.to_lowercase()) {
-                    return;
-                }
+                let rel_path = relative_path(root, path);
+                suspends.push((func_name, rel_path, line_num));
             }
-
-            let rel_path = relative_path(root, path);
-            suspends.push((func_name, rel_path, line_num));
-        }
-    })?;
+        },
+    )?;
 
     println!(
         "{}",
@@ -1310,8 +1317,11 @@ pub fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<(
 pub fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<()> {
     // Kotlin: fun ReceiverType.functionName
     // Swift: extension ReceiverType
-    let kotlin_pattern = format!(r"fun\s+{}\.(\w+)", regex::escape(receiver_type));
-    let swift_pattern = format!(r"extension\s+{}", regex::escape(receiver_type));
+    let kotlin_pattern = format!(r"\bfun\s+{}\.(\w+)", regex::escape(receiver_type));
+    let swift_pattern = format!(
+        r"\bextension\s+{}(?:\s|[<:{{]|$)",
+        regex::escape(receiver_type)
+    );
     let pattern = format!(r"{}|{}", kotlin_pattern, swift_pattern);
 
     let kotlin_regex = Regex::new(&kotlin_pattern)?;
@@ -1319,15 +1329,25 @@ pub fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<
 
     let mut items: Vec<(String, String, usize, String)> = vec![]; // (name, path, line, lang)
 
-    search_files_limited(
+    search_files_filtered(
         root,
         &pattern,
-        &["kt", "swift"],
+        &["kt", "kts", "swift"],
         limit,
+        |path, line| {
+            if path.extension().is_some_and(|ext| ext == "swift") {
+                swift_regex.is_match(line)
+            } else {
+                kotlin_regex.is_match(line)
+            }
+        },
         |path, line_num, line| {
             let rel_path = relative_path(root, path);
 
-            if let Some(caps) = kotlin_regex.captures(line) {
+            if path.extension().is_some_and(|ext| ext != "swift") {
+                let caps = kotlin_regex
+                    .captures(line)
+                    .expect("accepted Kotlin extension");
                 let func_name = caps.get(1).unwrap().as_str().to_string();
                 items.push((func_name, rel_path, line_num, "kt".to_string()));
             } else if swift_regex.is_match(line) {
@@ -1357,27 +1377,27 @@ pub fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<
 pub fn cmd_flows(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     // The search pattern must be exactly the extraction regex: lines like
     // `.asStateFlow()` would otherwise consume the limit without producing a result.
-    let flow_pattern = r"\b(MutableStateFlow|MutableSharedFlow|StateFlow|SharedFlow|Flow)<";
-    let pattern = pattern_with_line_filter(flow_pattern, query);
+    let flow_pattern = r"\b(MutableStateFlow|MutableSharedFlow|StateFlow|SharedFlow|Flow)\s*<";
     let flow_regex = Regex::new(flow_pattern)?;
 
     let mut items: Vec<(String, String, usize, String)> = vec![];
 
-    search_files_limited(root, &pattern, &["kt"], limit, |path, line_num, line| {
-        if let Some(caps) = flow_regex.captures(line) {
-            let flow_type = caps.get(1).unwrap().as_str().to_string();
+    search_files_filtered(
+        root,
+        flow_pattern,
+        &["kt", "kts"],
+        limit,
+        |_, line| query.is_none_or(|q| line.to_lowercase().contains(&q.to_lowercase())),
+        |path, line_num, line| {
+            if let Some(caps) = flow_regex.captures(line) {
+                let flow_type = caps.get(1).unwrap().as_str().to_string();
 
-            if let Some(q) = query {
-                if !line.to_lowercase().contains(&q.to_lowercase()) {
-                    return;
-                }
+                let rel_path = relative_path(root, path);
+                let content: String = line.trim().chars().take(70).collect();
+                items.push((flow_type, rel_path, line_num, content));
             }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(70).collect();
-            items.push((flow_type, rel_path, line_num, content));
-        }
-    })?;
+        },
+    )?;
 
     println!("{}", format!("Flow declarations ({}):", items.len()).bold());
 

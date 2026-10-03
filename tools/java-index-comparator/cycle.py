@@ -256,6 +256,9 @@ def run(arguments: argparse.Namespace) -> int:
                 raise ToolError("artifact directory belongs to a different target or branch")
             with state:
                 state.execute("INSERT OR REPLACE INTO configuration VALUES ('identity',?)", (identity,))
+                if getattr(arguments, 'defer_pr', None) is not None:
+                    state.execute("INSERT OR REPLACE INTO configuration VALUES ('defer_pr',?)",
+                                  (canonical_json(arguments.defer_pr),))
             resume_batch = getattr(arguments, "resume_batch", None)
             if resume_batch is not None:
                 row = state.execute("SELECT * FROM rounds WHERE phase!='done' ORDER BY id DESC LIMIT 1").fetchone()
@@ -362,6 +365,14 @@ def run(arguments: argparse.Namespace) -> int:
                     elif phase == "pr":
                         logged(["cargo", "test", "--release", "--workspace"], repository, directory, "final-tests")
                         logged(["git", "push", "origin", branch], repository, directory, "final-push")
+                        deferred = state.execute("SELECT value FROM configuration WHERE key='defer_pr'").fetchone()
+                        if deferred and deferred[0] not in {'true', 'false'}:
+                            raise ToolError('invalid persisted PR policy; no PR was created')
+                        if deferred and deferred[0] == 'true':
+                            set_phase(state, round_id, "done")
+                            print(canonical_json({"complete": True, "pr_deferred": True,
+                                                  "evidence": json.loads(row['summary_json'])['evidence']}), flush=True)
+                            return 0
                         url = create_or_find_pr(repository, arguments.pr_repo, branch, directory)
                         with state:
                             state.execute("INSERT OR REPLACE INTO configuration VALUES ('upstream_pr',?)", (url,))
@@ -386,6 +397,11 @@ def main() -> int:
     parser.add_argument("--mcp-url")
     parser.add_argument("--mcp-name", default="intellij-index")
     parser.add_argument("--pr-repo", default="defendend/Claude-ast-index-search")
+    pr_policy = parser.add_mutually_exclusive_group()
+    pr_policy.add_argument('--defer-pr', dest='defer_pr', action='store_true', default=None,
+                           help='Verify and finish this target without opening a PR; persists across resumes')
+    pr_policy.add_argument('--create-pr', dest='defer_pr', action='store_false', default=None,
+                           help='Create the PR after a complete audit, overriding a persisted deferral')
     parser.add_argument("--seed-evidence", type=Path)
     parser.add_argument("--resume-batch", type=Path,
                         help="Resume a stopped audit using a batch revalidated against the current binary")

@@ -15,7 +15,7 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
-use super::{relative_path, search_files};
+use super::{relative_path, search_files, search_files_filtered};
 use crate::db;
 
 /// Find storyboard usages of a class
@@ -394,38 +394,28 @@ pub fn cmd_async_funcs(root: &Path, query: Option<&str>, limit: usize) -> Result
 /// Find Combine publishers (PassthroughSubject, CurrentValueSubject, AnyPublisher)
 pub fn cmd_publishers(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     // Search for Combine publishers: PassthroughSubject, CurrentValueSubject, AnyPublisher, Published
-    let pattern = r"(PassthroughSubject|CurrentValueSubject|AnyPublisher|@Published)\s*[<(]";
-
-    let pub_regex = Regex::new(
-        r"(PassthroughSubject|CurrentValueSubject|AnyPublisher)(?:\s*<[^>]+>)?\s*(?:\(\)|[,;=])|@Published\s+(?:private\s+)?var\s+(\w+)",
-    )?;
+    let pattern =
+        r"\b(PassthroughSubject|CurrentValueSubject|AnyPublisher)\b\s*[<(]|(@Published)\b";
+    let pub_regex = Regex::new(pattern)?;
 
     let mut results: Vec<(String, String, String, usize)> = vec![];
 
-    search_files(root, pattern, &["swift"], |path, line_num, line| {
-        if results.len() >= limit {
-            return;
-        }
+    search_files_filtered(
+        root,
+        pattern,
+        &["swift"],
+        limit,
+        |_, line| query.is_none_or(|q| line.to_lowercase().contains(&q.to_lowercase())),
+        |path, line_num, line| {
+            if let Some(caps) = pub_regex.captures(line) {
+                let pub_type = caps.get(1).map(|m| m.as_str()).unwrap_or("@Published");
 
-        if let Some(caps) = pub_regex.captures(line) {
-            let pub_type = caps.get(1).map(|m| m.as_str()).unwrap_or("@Published");
-            let name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
-
-            if let Some(q) = query {
-                let q_lower = q.to_lowercase();
-                if !pub_type.to_lowercase().contains(&q_lower)
-                    && !name.to_lowercase().contains(&q_lower)
-                    && !line.to_lowercase().contains(&q_lower)
-                {
-                    return;
-                }
+                let rel_path = relative_path(root, path);
+                let content: String = line.trim().chars().take(80).collect();
+                results.push((pub_type.to_string(), content, rel_path, line_num));
             }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(80).collect();
-            results.push((pub_type.to_string(), content, rel_path, line_num));
-        }
-    })?;
+        },
+    )?;
 
     println!(
         "{}",
@@ -443,25 +433,22 @@ pub fn cmd_publishers(root: &Path, query: Option<&str>, limit: usize) -> Result<
 /// Find @MainActor usages
 pub fn cmd_main_actor(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     // Search for @MainActor
-    let pattern = r"@MainActor";
+    let pattern = r"@MainActor\b";
 
     let mut results: Vec<(String, usize, String)> = vec![];
 
-    search_files(root, pattern, &["swift"], |path, line_num, line| {
-        if results.len() >= limit {
-            return;
-        }
-
-        if let Some(q) = query {
-            if !line.to_lowercase().contains(&q.to_lowercase()) {
-                return;
-            }
-        }
-
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(100).collect();
-        results.push((rel_path, line_num, content));
-    })?;
+    search_files_filtered(
+        root,
+        pattern,
+        &["swift"],
+        limit,
+        |_, line| query.is_none_or(|q| line.to_lowercase().contains(&q.to_lowercase())),
+        |path, line_num, line| {
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(100).collect();
+            results.push((rel_path, line_num, content));
+        },
+    )?;
 
     println!(
         "{}",

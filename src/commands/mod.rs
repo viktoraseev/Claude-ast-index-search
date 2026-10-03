@@ -937,6 +937,33 @@ pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<Path
     Ok(files)
 }
 
+/// Search in path order, counting only extracted, accepted lines toward `limit`.
+pub fn search_files_filtered<K, F>(
+    root: &Path,
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    keep: K,
+    mut handler: F,
+) -> Result<()>
+where
+    K: Fn(&Path, &str) -> bool + Sync,
+    F: FnMut(&Path, usize, &str),
+{
+    if limit == 0 {
+        return Ok(());
+    }
+    let files = project_source_files(root, extensions)?;
+    search_files_limited_each(
+        &files,
+        pattern,
+        &[(pattern.to_string(), String::new())],
+        limit,
+        |_, path, line| keep(path, line),
+        |_, path, line_num, line| handler(path, line_num, line),
+    )
+}
+
 /// A line one of the [`search_files_limited_each`] patterns matched.
 struct PatternHit {
     pattern: usize,
