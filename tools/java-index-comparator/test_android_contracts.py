@@ -53,7 +53,10 @@ class AndroidContractsTests(unittest.TestCase):
                 ('build.gradle', "plugins { id 'com.android.library' }"),
                 ('Foreign.kt', 'import android.view.View'),
                 ('Use.java', 'class Use { int x = R.string.title; }'),
-                ('Raw.java', 'class Raw { int x = R.raw.sound; }')):
+                ('Raw.java', 'class Raw { int x = R.raw.sound; }'),
+                ('Spaced.java', 'class Spaced { int x = R /* separator */ . string . title; }'),
+                ('Imported.java', 'import fixture.library.R; class Imported {}'),
+                ('Nested.java', 'import fixture.library.R.string; class Nested { int x = string.title; }')):
             destination = self.root / path
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(content)

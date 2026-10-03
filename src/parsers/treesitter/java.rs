@@ -94,6 +94,160 @@ pub(crate) fn import_names(content: &str) -> Result<Vec<String>> {
     Ok(imports)
 }
 
+pub(crate) struct ResourceReference {
+    pub namespace: Option<String>,
+    pub resource_type: String,
+    pub name: String,
+    pub line: usize,
+    pub offset: usize,
+}
+
+/// Read Java R expressions and imported resource constants, excluding literals/import sites.
+pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference>> {
+    fn parts(node: tree_sitter::Node<'_>, content: &str) -> Option<Vec<String>> {
+        match node.kind() {
+            "identifier" | "asterisk" => Some(vec![node_text(content, &node).to_owned()]),
+            "field_access" | "scoped_identifier" => {
+                let mut output = Vec::new();
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if matches!(child.kind(), "line_comment" | "block_comment") {
+                        continue;
+                    }
+                    output.extend(parts(child, content)?);
+                }
+                Some(output)
+            }
+            _ => None,
+        }
+    }
+    fn unique(values: &[String]) -> Option<String> {
+        values
+            .first()
+            .filter(|first| values.iter().all(|v| v == *first))
+            .cloned()
+    }
+
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut imported_r = Vec::new();
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+    let mut constants: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut wildcards = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for declaration in tree.root_node().named_children(&mut cursor) {
+        if declaration.kind() != "import_declaration" {
+            continue;
+        }
+        let mut names = Vec::new();
+        super::walk_tree_preorder(&declaration, |node| {
+            if matches!(node.kind(), "identifier" | "asterisk") {
+                names.push(node_text(content, &node).to_owned());
+            }
+            super::WalkControl::Continue
+        });
+        let Some(r) = names.iter().rposition(|p| p == "R") else {
+            continue;
+        };
+        if r == 0 {
+            continue;
+        }
+        let namespace = names[..r].join(".");
+        let mut cursor = declaration.walk();
+        let is_static = declaration
+            .children(&mut cursor)
+            .any(|n| n.kind() == "static");
+        match (&names[r + 1..], is_static) {
+            ([], false) => imported_r.push(namespace),
+            ([kind], false) => aliases.entry(kind.clone()).or_default().push(namespace),
+            ([kind, name], true) => {
+                let target = (namespace, kind.clone());
+                if name == "*" {
+                    wildcards.push(target);
+                } else {
+                    constants.entry(name.clone()).or_default().push(target);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut output = Vec::new();
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        if matches!(
+            node.kind(),
+            "package_declaration"
+                | "import_declaration"
+                | "line_comment"
+                | "block_comment"
+                | "string_literal"
+                | "character_literal"
+        ) {
+            return super::WalkControl::SkipChildren;
+        }
+        let mut emit = |namespace, kind: &str, name: &str| {
+            output.push(ResourceReference {
+                namespace,
+                resource_type: kind.to_owned(),
+                name: name.to_owned(),
+                line: node_line(&node),
+                offset: node.start_byte(),
+            });
+        };
+        if node.kind() == "field_access" {
+            if let Some(names) = parts(node, content) {
+                let n = names.len();
+                if n >= 3 && names[n - 3] == "R" {
+                    let namespace = if n > 3 {
+                        Some(names[..n - 3].join("."))
+                    } else if imported_r.is_empty() {
+                        None
+                    } else {
+                        let Some(namespace) = unique(&imported_r) else {
+                            return super::WalkControl::Continue;
+                        };
+                        Some(namespace)
+                    };
+                    emit(namespace, &names[n - 2], &names[n - 1]);
+                } else if n == 2 {
+                    if let Some(namespace) = aliases.get(&names[0]).and_then(|v| unique(v)) {
+                        emit(Some(namespace), &names[0], &names[1]);
+                    }
+                }
+            }
+        } else if node.kind() == "identifier" {
+            if let Some(parent) = node.parent() {
+                // Declaration names, selectors, call names and type spellings
+                // are not static constant expression sites.
+                let named = parent
+                    .child_by_field_name("name")
+                    .is_some_and(|n| n.id() == node.id());
+                if !named
+                    && !matches!(
+                        parent.kind(),
+                        "field_access"
+                            | "scoped_identifier"
+                            | "scoped_type_identifier"
+                            | "marker_annotation"
+                            | "annotation"
+                            | "break_statement"
+                            | "continue_statement"
+                            | "labeled_statement"
+                    )
+                {
+                    let name = node_text(content, &node);
+                    let targets = constants.get(name).unwrap_or(&wildcards);
+                    // Explicit imports take precedence. Distinct wildcard
+                    // targets need resource ownership to disambiguate later.
+                    for (namespace, kind) in targets {
+                        emit(Some(namespace.clone()), kind, name);
+                    }
+                }
+            }
+        }
+        super::WalkControl::Continue
+    });
+    Ok(output)
+}
+
 /// Java dependency anchors retain qualified type spelling and import ownership.
 #[derive(Default)]
 pub(crate) struct DependencySyntax {

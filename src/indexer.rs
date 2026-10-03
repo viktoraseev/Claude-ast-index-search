@@ -15,6 +15,7 @@ use crate::minified;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
 mod android_xml;
+mod java_resources;
 mod maven_manifest;
 /// File-size cap for parsing. Larger files are recorded in the `files`
 /// table (so `update` still tracks their mtime) but never parsed — their
@@ -4192,6 +4193,7 @@ pub fn index_resources(
     progress: bool,
 ) -> Result<(usize, usize)> {
     let module_lookup = ModuleLookup::from_db(conn)?;
+    let namespace_owners = java_resources::namespace_owners(conn, root)?;
 
     if progress {
         eprintln!("Found {} resource files to analyze...", res_files.len());
@@ -4350,7 +4352,23 @@ pub fn index_resources(
                 .par_iter()
                 .map(|rel_path| {
                     let file_path = root_buf.join(rel_path);
-                    let content = match fs::read_to_string(file_path) {
+                    let content = match if rel_path.ends_with(".java") {
+                        use std::io::Read;
+                        fs::File::open(file_path).and_then(|file| {
+                            let limit = max_file_size_bytes();
+                            let mut content = String::new();
+                            file.take(limit.saturating_add(1))
+                                .read_to_string(&mut content)?;
+                            if content.len() as u64 > limit {
+                                return Err(std::io::Error::other(
+                                    "Java resource source exceeds parser budget",
+                                ));
+                            }
+                            Ok(content)
+                        })
+                    } else {
+                        fs::read_to_string(file_path)
+                    } {
                         Ok(content) => content,
                         Err(_) => return Vec::new(),
                     };
@@ -4373,6 +4391,51 @@ pub fn index_resources(
                             .then_some(*id)
                     };
                     let mut usages = Vec::new();
+
+                    // Java references are syntax expressions, not arbitrary
+                    // text. Preserve qualified/imported R ownership instead
+                    // of silently falling back to a colliding local resource.
+                    if rel_path.ends_with(".java") {
+                        let references =
+                            match crate::parsers::treesitter::java::resource_references(&content) {
+                                Ok(references) => references,
+                                Err(_) => return Vec::new(),
+                            };
+                        let mut sites: std::collections::BTreeMap<usize, (usize, Vec<i64>)> =
+                            std::collections::BTreeMap::new();
+                        for reference in references {
+                            let resource_id = if let Some(namespace) = &reference.namespace {
+                                namespace_owners.get(namespace).and_then(|owners| {
+                                    let [owner] = owners.as_slice() else {
+                                        return None;
+                                    };
+                                    resource_ids
+                                        .get(&reference.resource_type)?
+                                        .get(&reference.name)?
+                                        .iter()
+                                        .find(|(module, _)| *module == Some(*owner))
+                                        .map(|(_, id)| *id)
+                                })
+                            } else {
+                                resolve_resource(&reference.resource_type, &reference.name)
+                            };
+                            if let Some(id) = resource_id {
+                                let site = sites
+                                    .entry(reference.offset)
+                                    .or_insert((reference.line, Vec::new()));
+                                if !site.1.contains(&id) {
+                                    site.1.push(id);
+                                }
+                            }
+                        }
+                        for (line, ids) in sites.into_values() {
+                            // Two matching wildcard imports are ambiguous.
+                            if let [id] = ids.as_slice() {
+                                usages.push((*id, rel_path.clone(), line as i64, "code"));
+                            }
+                        }
+                        return usages;
+                    }
 
                     let visible;
                     let content = if is_xml {

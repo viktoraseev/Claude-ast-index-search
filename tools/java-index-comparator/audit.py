@@ -48,6 +48,7 @@ import delegate_contracts
 import route_contracts
 import android_contracts
 import android_syntax_contracts
+import java_resource_contracts
 import vcs_contracts
 import rank_contracts
 import stack_contracts
@@ -485,6 +486,7 @@ class Fixture:
         self._install_error = None
         self._android_results = None
         self._android_syntax_results = None
+        self._java_resource_results = None
         self._context_results = None
         self._unused_dep_results = None
         self._graph_results = None
@@ -1660,6 +1662,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def java_resource_check(self, check: sqlite3.Row):
+        if self._java_resource_results is None:
+            self._java_resource_results = java_resource_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._java_resource_results)
+        return {'source': java_resource_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def context_check(self, check: sqlite3.Row):
         if self._context_results is None:
             self._context_results = context_contracts.exercise(self.binary, self.database.parent)
@@ -1775,6 +1785,8 @@ class Fixture:
                 handler = self.android_check
             if check['feature'] in android_syntax_contracts.FEATURES:
                 handler = self.android_syntax_check
+            if check['feature'] in java_resource_contracts.FEATURES:
+                handler = self.java_resource_check
             if check['feature'] == 'api':
                 handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
@@ -1845,6 +1857,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(LIVE_FEATURES)
     features.update(route_contracts.FEATURES)
     features.update(android_syntax_contracts.FEATURES)
+    features.update(java_resource_contracts.FEATURES)
     features.update(context_contracts.PENDING)
     features.update(graph_contracts.FEATURES)
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
@@ -1974,6 +1987,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     route_contracts.plan_routes(state, root)
     android_contracts.plan_android(state, root)
     android_syntax_contracts.plan_syntax(state, root)
+    java_resource_contracts.plan_java_resources(state, root)
     vcs_contracts.plan_vcs(state, root)
     rank_contracts.plan_rank(state, root)
     stack_contracts.plan_stacks(state, root)

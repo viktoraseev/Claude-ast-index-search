@@ -100,7 +100,9 @@ def applicability(state, root):
                 raise ToolError('Android applicability source grew beyond its budget')
             content = '' if resource and row['extension'] not in {'.xml', '.java'} else data.decode(errors='replace')
             marker = resource or path.name == 'AndroidManifest.xml' or bool(re.search(
-                r'com\.android\.|android\.R\b|\bandroid\.[A-Za-z]|schemas\.android\.com/apk/res|\bR\s*\.\s*[\w$]+\s*\.', content))
+                r'com\.android\.|android\.R\b|\bandroid\.[A-Za-z]|schemas\.android\.com/apk/res|'
+                r'\bR(?:\s|/\*[\s\S]*?\*/|//[^\n]*)*\.|'
+                r'\bimport\s+(?:static\s+)?[\w$.]+\.R(?:\.[\w$]+)*(?:\.\*)?\s*;', content))
             fingerprint = hashlib.sha256(data).hexdigest()
             if row['sha256'] and row['sha256'] != fingerprint:
                 raise ToolError('Android applicability fingerprint changed after inventory')
@@ -137,7 +139,7 @@ def plan_android(state, root):
                               (stable_id({'feature': feature, 'subject': 'target-absence'}), feature, 'target-absence'))
         state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)',
                       ('android:syntax-resolution', 'pending',
-                       'Java static-import/namespaced/dependency resource resolution and comment/string lexical scope, XML namespace/entity resolution and additional definition types remain unresolved; disposable XML syntax fixtures do not establish target Android syntax equivalence'))
+                       'Java compiler visibility/shadowing, merged dependency R classes, computed/manifest namespaces and attached-root resource resolution, XML namespace/entity resolution and additional definition types remain unresolved; disposable Java lexical/import/literal-namespace and XML syntax fixtures do not establish target Android syntax equivalence'))
 
 
 def observation(text):
