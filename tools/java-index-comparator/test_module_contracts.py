@@ -107,7 +107,8 @@ class ModuleContracts(unittest.TestCase):
                 self.assertEqual(tuple(map(int, summary.groups())), expected)
 
     def test_unused_dependency_android_checks_do_not_drop_tail_entries_or_include_siblings(self):
-        for variant in ('xml-cap', 'resource-cap', 'resource-scope'):
+        for variant in ('xml-cap', 'xml-suffix', 'xml-package', 'xml-nested', 'xml-dollar-package',
+                        'xml-dollar-nested', 'resource-cap', 'resource-scope'):
             with self.subTest(variant=variant):
                 library, consumer = variant + '-lib', variant + '-consumer'
                 dependency = ('<dependencies><dependency><groupId>fixture</groupId>'
@@ -116,10 +117,26 @@ class ModuleContracts(unittest.TestCase):
                     self.write(f'{variant}/{path}/pom.xml', '<project><groupId>fixture</groupId>'
                                f'<artifactId>{name}</artifactId>{deps}</project>')
                 padding = ''.join(f'class Padding{i:03d} {{}}\n' for i in range(75)) if variant == 'xml-cap' else ''
-                self.write(f'{variant}/lib/Widget.java', 'package fixture;\n' + padding + 'public class Widget {}\n')
+                nested = variant in ('xml-nested', 'xml-dollar-nested')
+                declaration = ('public class Outer { public static class Widget {} }'
+                               if nested else 'public class Widget {}')
+                filename = 'Outer.java' if nested else 'Widget.java'
+                package = {'xml-dollar-package': 'fixture.sub',
+                           'xml-dollar-nested': 'fixture$sub'}.get(variant, 'fixture')
+                self.write(f'{variant}/lib/{filename}', f'package {package};\n' + padding + declaration + '\n')
                 self.write(f'{variant}/consumer/Work.java', 'package app; public class Work {}\n')
-                if variant == 'xml-cap':
-                    self.write(f'{variant}/consumer/res/layout/main.xml', '<fixture.Widget/>')
+                if variant.startswith('xml-'):
+                    if variant == 'xml-suffix':
+                        self.write(f'{variant}/consumer/OtherWidget.java', 'package app; public class OtherWidget {}')
+                    if variant == 'xml-package':
+                        self.write(f'{variant}/consumer/Widget.java', 'package app; public class Widget {}')
+                    if variant == 'xml-dollar-package':
+                        self.write(f'{variant}/consumer/Widget.java', 'package fixture$sub; public class Widget {}')
+                    tag = {'xml-suffix': 'app.OtherWidget', 'xml-package': 'app.Widget',
+                           'xml-dollar-package': 'fixture$sub.Widget',
+                           'xml-dollar-nested': 'fixture$sub.Outer$Widget',
+                           'xml-nested': 'fixture.Outer$Widget'}.get(variant, 'fixture.Widget')
+                    self.write(f'{variant}/consumer/res/layout/main.xml', f'<{tag}/>')
                 else:
                     count = 150 if variant == 'resource-cap' else 1
                     resource_prefix = 'title_' + variant.replace('-', '_') + '_'
@@ -145,15 +162,42 @@ class ModuleContracts(unittest.TestCase):
                 summary = re.search(r'^Total: (\d+) unused, (\d+) exported, (\d+) used of (\d+) dependencies$',
                                     output, re.MULTILINE)
                 self.assertIsNotNone(summary)
-                expected = (1, 0, 0, 1) if variant == 'resource-scope' else (0, 0, 1, 1)
+                unused = variant in ('resource-scope', 'xml-suffix', 'xml-package', 'xml-dollar-package')
+                expected = (1, 0, 0, 1) if unused else (0, 0, 1, 1)
                 self.assertEqual(tuple(map(int, summary.groups())), expected)
                 # A used dependency must be attributed to the branch under
                 # test, and disabling that branch must make it unused.
-                branch = 'XML' if variant == 'xml-cap' else 'Resources'
+                branch = 'XML' if variant.startswith('xml-') else 'Resources'
                 self.assertIn(f'  - {branch}: {expected[2]}\n', output)
-                flag = '--no-xml' if variant == 'xml-cap' else '--no-resources'
+                flag = '--no-xml' if variant.startswith('xml-') else '--no-resources'
                 disabled = self.fixture.text_cli('unused-deps', module_name, flag)
                 self.assertIn('Total: 1 unused, 0 exported, 0 used of 1 dependencies\n', disabled)
+
+    def test_java_dependency_syntax_respects_the_configured_read_budget(self):
+        for directory, dependency in (('lib', ''), ('consumer',
+                '<dependencies><dependency><groupId>fixture</groupId>'
+                '<artifactId>lib</artifactId></dependency></dependencies>')):
+            self.write(f'{directory}/pom.xml', '<project><groupId>fixture</groupId>'
+                       f'<artifactId>{directory}</artifactId>{dependency}</project>')
+        self.write('lib/Value.java', 'package dep; public class Value {}\n')
+        source = 'package app; import dep.Value; public class Use { Value value; }\n'
+        self.write('consumer/Use.java', source)
+        # Unrelated source is not parser input for this consumer, even if it
+        # would exceed the read budget. Index it before applying the budget.
+        self.write('outside/Other.java', 'class Other {\n' + ' // padding\n' * 100 + '}\n')
+        self.prepare()
+        for budget, succeeds in ((len(source.encode()), True), (8, False)):
+            with self.subTest(budget=budget):
+                environment = {**self.fixture.environment, 'AST_INDEX_MAX_FILE_SIZE': str(budget)}
+                result = subprocess.run([str(self.binary), 'unused-deps', 'consumer', '--strict'],
+                                        cwd=self.root, env=environment, capture_output=True,
+                                        text=True, timeout=30)
+                if succeeds:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn('Total: 0 unused, 0 exported, 1 used of 1 dependencies', result.stdout)
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('Java syntax source exceeds the 8 byte budget', result.stderr)
 
     def test_reactor_coordinates_direct_dependencies_and_scope_drive_all_navigation(self):
         # Root artifact comes after the parent/comment; directory and artifact

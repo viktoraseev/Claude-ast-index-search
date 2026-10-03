@@ -315,7 +315,7 @@ pub fn cmd_unused_deps(
             usage.direct_symbols = vec![format!("import {}", dep_module_name)];
         } else {
             let (direct_count, direct_names) =
-                count_symbols_used_in_module(&conn, dep_path, &module_path)?;
+                count_symbols_used_in_module(&conn, root, dep_path, &module_path)?;
             usage.direct_count = direct_count;
             usage.direct_symbols = direct_names;
         }
@@ -340,7 +340,8 @@ pub fn cmd_unused_deps(
             })?;
             for export in exports {
                 let (name, path) = export?;
-                let (count, names) = count_symbols_used_in_module(&conn, &path, &module_path)?;
+                let (count, names) =
+                    count_symbols_used_in_module(&conn, root, &path, &module_path)?;
                 if count > 0 {
                     usage.transitive_count += count;
                     usage.transitive_via.push((name, names));
@@ -352,28 +353,60 @@ pub fn cmd_unused_deps(
         if check_xml && usage.direct_count == 0 && usage.transitive_count == 0 {
             // Get classes from the dependency module
             let mut class_stmt = conn.prepare(&format!(
-                "SELECT DISTINCT s.name FROM symbols s
+                "SELECT DISTINCT s.name, s.qualified_name, substr(f.path,-5)='.java',
+                 CASE WHEN substr(f.path,-5)='.java' THEN (
+                     SELECT owner.qualified_name ||
+                            replace(substr(s.qualified_name,length(owner.qualified_name)+1),'.','$')
+                     FROM symbols owner
+                     WHERE owner.file_id=s.file_id
+                       AND owner.kind IN ('class','interface','enum')
+                       AND owner.qualified_name IS NOT NULL
+                       AND (owner.id=s.id OR (
+                           substr(s.qualified_name,1,length(owner.qualified_name)+1)=owner.qualified_name||'.'
+                           AND owner.line<=s.line
+                           AND COALESCE(owner.end_line,owner.line)>=COALESCE(s.end_line,s.line)
+                       ))
+                     ORDER BY length(owner.qualified_name),owner.id LIMIT 1
+                 ) END
+                 FROM symbols s
                  JOIN files f ON s.file_id = f.id
                  WHERE {MODULE_FILE_SCOPE} AND s.kind IN ('class', 'object')
-                 ORDER BY s.name"
+                 ORDER BY s.name,s.qualified_name"
             ))?;
-            let classes = class_stmt.query_map(params![dep_path], |row| row.get::<_, String>(0))?;
+            let classes = class_stmt.query_map(params![dep_path], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
 
             // Check if any class is used in XML layouts of the target module
             for class_name in classes {
-                let class_name = class_name?;
+                let (class_name, qualified_name, is_java, binary_name) = class_name?;
+                // Java package identity must not collapse to the last segment:
+                // app.Widget is not fixture.Widget. XML uses JVM '$' spelling
+                // for nested types; derive that spelling from the enclosing
+                // type, leaving legal '$' characters in package names intact.
                 let mut xml_stmt = conn.prepare(
                     "SELECT x.file_path, x.line FROM xml_usages x
                      JOIN modules m ON x.module_id = m.id
                      WHERE m.id = ?1 AND (
                          x.class_name = ?2
-                         OR substr(x.class_name,-length(?2)-1)='.'||?2
-                         OR substr(x.class_name,-length(?2)-1)='$'||?2
+                         OR (?4=1 AND ?3 IS NOT NULL AND (
+                             x.class_name=?3 OR x.class_name=?5
+                         ))
+                         OR (?4=0 AND (
+                             substr(x.class_name,-length(?2)-1)='.'||?2
+                             OR substr(x.class_name,-length(?2)-1)='$'||?2
+                         ))
                      )",
                 )?;
-                let xml_results = xml_stmt.query_map(params![module_id, &class_name], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?;
+                let xml_results = xml_stmt.query_map(
+                    params![module_id, &class_name, qualified_name, is_java, binary_name],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )?;
 
                 for result in xml_results {
                     let (_file_path, line) = result?;
@@ -412,9 +445,10 @@ pub fn cmd_unused_deps(
                      JOIN modules owner ON owner.id=r.module_id
                      WHERE {usage_scope} AND owner.name=?2 AND r.type=?3 AND r.name=?4"
                 ))?;
-                let usages = usage_stmt.query_map(params![module_path, dep_name, res_type, res_name], |row| {
-                    row.get::<_, String>(0)
-                })?;
+                let usages = usage_stmt
+                    .query_map(params![module_path, dep_name, res_type, res_name], |row| {
+                        row.get::<_, String>(0)
+                    })?;
 
                 let mut count = 0;
                 let mut first = None;
@@ -1695,16 +1729,123 @@ fn dispatch_render(format: &str, result: &ModuleRouteResult) -> Result<()> {
     }
 }
 
-/// Check if any symbols from a dependency are used in the target module (index-based)
-///
-/// Uses the refs table for fast lookups instead of scanning files on disk.
+/// Check dependency identities using Java syntax and other languages' indexed refs.
 fn count_symbols_used_in_module(
     conn: &Connection,
+    root: &Path,
     dependency_path: &str,
     module_path: &str,
 ) -> Result<(usize, Vec<String>)> {
-    let mut used_count = 0;
-    let mut used_names = Vec::new();
+    let mut used = std::collections::BTreeSet::new();
+
+    // Bare refs cannot distinguish alpha.Widget from beta.Widget and omit
+    // import-only/static anchors. Stream Java files, retaining one syntax tree
+    // at a time, and ask the index only for exact declaration identities.
+    let resolver = super::PathResolver::try_from_conn(root, conn)?.with_decoration(false);
+    let mut files = conn.prepare(&format!(
+        "SELECT f.path,f.root_path FROM files f WHERE {MODULE_FILE_SCOPE}
+         AND substr(f.path,-5)='.java' ORDER BY f.path,f.root_path"
+    ))?;
+    let rows = files.query_map(params![module_path], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut exists = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM symbols s JOIN files f ON s.file_id=f.id
+         WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
+         AND s.kind IN ('class','interface','enum'))",
+    )?;
+    let mut owners = conn.prepare_cached(&format!(
+        "SELECT DISTINCT s.name FROM symbols s JOIN files f ON s.file_id=f.id
+         WHERE {MODULE_FILE_SCOPE} AND substr(f.path,-5)='.java' AND s.qualified_name=?2
+         AND s.kind IN ('class','interface','enum') ORDER BY s.name"
+    ))?;
+    for row in rows {
+        let (path, root_path) = row?;
+        let source_path = root.join(resolver.resolve_with_root_raw(&path, Some(&root_path)));
+        let content = super::grep::read_java_syntax_source(
+            &source_path,
+            crate::indexer::max_file_size_bytes(),
+        )?;
+        let syntax = crate::parsers::treesitter::java::dependency_syntax(&content)?;
+        let mut identities = std::collections::BTreeSet::new();
+        let mut explicit = HashMap::new();
+        let mut wildcards = vec!["java.lang".to_string()];
+        for (import, is_static) in &syntax.imports {
+            if !is_static && import.ends_with(".*") {
+                wildcards.push(import.trim_end_matches(".*").to_owned());
+                continue;
+            }
+            let mut owner = import.as_str();
+            // A static import names either a nested type or a member of the
+            // longest indexed type prefix. Importing a member needs its owner
+            // even when the body contains no class-name reference.
+            while !exists.query_row(params![owner], |row| row.get::<_, bool>(0))? {
+                if !is_static {
+                    break;
+                }
+                let Some((prefix, _)) = owner.rsplit_once('.') else {
+                    break;
+                };
+                owner = prefix;
+            }
+            if exists.query_row(params![owner], |row| row.get::<_, bool>(0))? {
+                identities.insert(owner.to_owned());
+                if !import.ends_with(".*") && owner == import {
+                    explicit.insert(
+                        import.rsplit('.').next().unwrap_or(import).to_owned(),
+                        import.clone(),
+                    );
+                }
+            } else if !is_static {
+                // An external explicit import still blocks matching a project
+                // type with the same simple name through a wildcard import.
+                explicit.insert(
+                    import.rsplit('.').next().unwrap_or(import).to_owned(),
+                    import.clone(),
+                );
+            }
+        }
+        for name in &syntax.types {
+            let (first, suffix) = name
+                .split_once('.')
+                .map_or((name.as_str(), ""), |(first, _)| {
+                    (first, &name[first.len()..])
+                });
+            if syntax.declarations.contains(first) {
+                continue;
+            }
+            if let Some(import) = explicit.get(first) {
+                identities.insert(format!("{import}{suffix}"));
+                continue;
+            }
+            let local = if syntax.package.is_empty() {
+                name.clone()
+            } else {
+                format!("{}.{name}", syntax.package)
+            };
+            if exists.query_row(params![&local], |row| row.get::<_, bool>(0))? {
+                identities.insert(local);
+                continue;
+            }
+            if name.contains('.') && exists.query_row(params![name], |row| row.get::<_, bool>(0))? {
+                identities.insert(name.clone());
+                continue;
+            }
+            for package in &wildcards {
+                let candidate = format!("{package}.{name}");
+                if exists.query_row(params![&candidate], |row| row.get::<_, bool>(0))? {
+                    identities.insert(candidate);
+                }
+            }
+        }
+        for identity in identities {
+            for name in owners.query_map(params![dependency_path, identity], |row| {
+                row.get::<_, String>(0)
+            })? {
+                used.insert(name?);
+            }
+        }
+    }
 
     // Stream every indexed type instead of either truncating the dependency
     // at 100 types or retaining its whole type population in a Rust Vec.
@@ -1717,19 +1858,16 @@ fn count_symbols_used_in_module(
 
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT EXISTS(SELECT 1 FROM refs r JOIN files f ON r.file_id=f.id
-         WHERE {MODULE_FILE_SCOPE} AND r.name=?2)"
+         WHERE {MODULE_FILE_SCOPE} AND substr(f.path,-5)!='.java' AND r.name=?2)"
     ))?;
 
     for symbol in symbols {
         let symbol = symbol?;
         let count: i64 = stmt.query_row(params![module_path, &symbol], |row| row.get(0))?;
         if count > 0 {
-            used_count += 1;
-            if used_names.len() < 3 {
-                used_names.push(symbol);
-            }
+            used.insert(symbol);
         }
     }
 
-    Ok((used_count, used_names))
+    Ok((used.len(), used.into_iter().take(3).collect()))
 }

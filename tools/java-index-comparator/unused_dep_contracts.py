@@ -17,9 +17,9 @@ FEATURES = {'unused-deps', 'unused-deps:java-ownership', 'unused-deps:java-types
 REASON = ('independent source/state: disposable Java lexical dependency usage, '
           'module ownership, type collection, API-chain usage and rendered options; not MCP equivalence')
 PENDING = {
-    'unused-deps:semantic-resolution': 'Java qualified/import-only/static/wildcard imports, visibility, '
-        'colliding type names and attached-root resolution need a separate source/MCP contract; '
-        'lexical dependency usage does not establish semantic equivalence',
+    'unused-deps:semantic-resolution': 'Java visibility, ambiguous wildcard imports, lexical type/variable '
+        'shadowing, inherited/nested static members, receiver dispatch and attached-root resolution '
+        'remain unresolved; authored import/type identities do not establish compiler-wide or MCP equivalence',
     'unused-deps:android-ownership': 'Default XML/resource dependency usage, qualified class/resource '
         'ownership and Android module collisions need a separate applicable Java Android contract; '
         'zero XML/resource samples in the lexical fixture do not establish it',

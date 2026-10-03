@@ -54,6 +54,7 @@ import stack_contracts
 import context_contracts
 import graph_contracts
 import unused_dep_contracts
+import java_dependency_contracts
 
 
 SCHEMA = """
@@ -470,6 +471,7 @@ class Fixture:
         self.schedule_followups = schedule_followups
         self._injection_ready = False
         self._inventory_ready = False
+        self._java_dependency_results = None
         self.batch_text = batch_text
         self._text_batch_unavailable = False
         self._text_snapshot = None
@@ -1676,6 +1678,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def java_dependency_check(self, check: sqlite3.Row):
+        if self._java_dependency_results is None:
+            self._java_dependency_results = java_dependency_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._java_dependency_results)
+        return {'source': java_dependency_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def graph_check(self, check: sqlite3.Row):
         if self._graph_results is None:
             self._graph_results = graph_contracts.exercise(self.binary, self.database.parent)
@@ -1755,6 +1765,8 @@ class Fixture:
                 handler = self.context_check
             if check['feature'] in unused_dep_contracts.FEATURES | {'unused-deps:target'}:
                 handler = self.unused_dep_check
+            if check['feature'] in java_dependency_contracts.FEATURES:
+                handler = self.java_dependency_check
             if check['feature'] in graph_contracts.FEATURES:
                 handler = self.graph_check
             if check['feature'] in stack_contracts.FEATURES:
@@ -1836,6 +1848,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(context_contracts.PENDING)
     features.update(graph_contracts.FEATURES)
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
+    features.update(java_dependency_contracts.FEATURES)
     return features
 
 
@@ -1967,6 +1980,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     context_contracts.plan_context(state, root)
     graph_contracts.plan_graph(state, root)
     unused_dep_contracts.plan_unused(state, root)
+    java_dependency_contracts.plan_dependencies(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

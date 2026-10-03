@@ -22,6 +22,10 @@
 (interface_declaration
   name: (identifier) @interface_name) @interface_node @definition
 
+; Annotation declarations are Java interface types, distinct from annotation uses.
+(annotation_type_declaration
+  name: (identifier) @interface_name) @interface_node @definition
+
 ; Enums
 (enum_declaration
   name: (identifier) @enum_name) @enum_node @definition

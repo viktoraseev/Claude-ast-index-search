@@ -94,6 +94,105 @@ pub(crate) fn import_names(content: &str) -> Result<Vec<String>> {
     Ok(imports)
 }
 
+/// Java dependency anchors retain qualified type spelling and import ownership.
+#[derive(Default)]
+pub(crate) struct DependencySyntax {
+    pub package: String,
+    pub imports: Vec<(String, bool)>,
+    pub types: std::collections::BTreeSet<String>,
+    pub declarations: std::collections::HashSet<String>,
+}
+
+pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
+    fn spelling(node: tree_sitter::Node<'_>, content: &str) -> String {
+        let mut parts = Vec::new();
+        super::walk_tree_preorder(&node, |child| {
+            if child.kind() == "type_arguments" {
+                return super::WalkControl::SkipChildren;
+            }
+            if matches!(child.kind(), "identifier" | "type_identifier" | "asterisk") {
+                parts.push(node_text(content, &child));
+            }
+            super::WalkControl::Continue
+        });
+        parts.join(".")
+    }
+
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut result = DependencySyntax::default();
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        match node.kind() {
+            "package_declaration" => {
+                result.package = spelling(node, content);
+                return super::WalkControl::SkipChildren;
+            }
+            "import_declaration" => {
+                let mut cursor = node.walk();
+                let is_static = node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "static");
+                result.imports.push((spelling(node, content), is_static));
+                return super::WalkControl::SkipChildren;
+            }
+            "type_identifier" | "scoped_type_identifier" => {
+                // Keep generic arguments as separate types, but do not reduce
+                // a qualified name to each of its component identifiers.
+                if !node
+                    .parent()
+                    .is_some_and(|p| p.kind() == "scoped_type_identifier")
+                {
+                    let declaration = node.parent().is_some_and(|p| {
+                        p.child_by_field_name("name")
+                            .is_some_and(|name| name.id() == node.id())
+                            || (p.kind() == "type_parameter"
+                                && p.named_child(0).is_some_and(|name| name.id() == node.id()))
+                    });
+                    if !declaration {
+                        result.types.insert(spelling(node, content));
+                    }
+                }
+            }
+            "annotation" | "marker_annotation" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    result.types.insert(spelling(name, content));
+                }
+            }
+            "method_invocation" | "field_access" => {
+                if let Some(object) = node.child_by_field_name("object") {
+                    if matches!(
+                        object.kind(),
+                        "identifier" | "scoped_identifier" | "field_access"
+                    ) {
+                        result.types.insert(spelling(object, content));
+                    }
+                }
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "type_parameter" => {
+                if let Some(name) = node.child_by_field_name("name").or_else(|| {
+                    (node.kind() == "type_parameter")
+                        .then(|| node.named_child(0))
+                        .flatten()
+                }) {
+                    result
+                        .declarations
+                        .insert(node_text(content, &name).to_owned());
+                }
+            }
+            "line_comment" | "block_comment" | "string_literal" | "character_literal" => {
+                return super::WalkControl::SkipChildren;
+            }
+            _ => {}
+        }
+        super::WalkControl::Continue
+    });
+    Ok(result)
+}
+
 /// Source locations of externally public Java declarations, including implicit members.
 pub(crate) fn public_api_lines(content: &str) -> Result<Vec<usize>> {
     fn collect(
@@ -973,6 +1072,7 @@ pub fn collect_qualified_name_occurrences(content: &str) -> Result<QualifiedName
                 match parent.kind() {
                     "class_declaration"
                     | "interface_declaration"
+                    | "annotation_type_declaration"
                     | "enum_declaration"
                     | "record_declaration" => {
                         if let Some(owner) = parent.child_by_field_name("name") {
@@ -1230,6 +1330,57 @@ fn find_capture<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_annotation_declarations_have_type_identities() {
+        let source = r#"package fixture;
+public @interface Mark { class Nested {} }
+"#;
+        let symbols = JAVA_PARSER.parse_symbols(source).unwrap();
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Mark" && s.kind == SymbolKind::Interface));
+        let names = collect_qualified_names(source).unwrap();
+        assert_eq!(
+            names.get(&("interface".into(), 2, "Mark".into())),
+            Some(&"fixture.Mark".into())
+        );
+        assert_eq!(
+            names.get(&("class".into(), 2, "Nested".into())),
+            Some(&"fixture.Mark.Nested".into())
+        );
+    }
+
+    #[test]
+    fn dependency_syntax_keeps_imports_types_and_literal_boundaries() {
+        let source = r#"package fixture;
+import alpha.Outer;
+import static beta.Tools.*;
+@alpha.Mark class Use<T> {
+    Outer.Inner nested;
+    java.util.List<beta.Widget[]> values;
+    String text = "alpha.Noise"; // beta.Noise
+}
+"#;
+        let syntax = dependency_syntax(source).unwrap();
+        assert_eq!(syntax.package, "fixture");
+        assert_eq!(
+            syntax.imports,
+            vec![("alpha.Outer".into(), false), ("beta.Tools.*".into(), true)]
+        );
+        assert_eq!(
+            syntax.types.into_iter().collect::<Vec<_>>(),
+            vec![
+                "Outer.Inner",
+                "String",
+                "alpha.Mark",
+                "beta.Widget",
+                "java.util.List"
+            ]
+        );
+        assert!(syntax.declarations.contains("Use"));
+        assert!(syntax.declarations.contains("T"));
+    }
 
     #[test]
     fn test_parse_class() {
