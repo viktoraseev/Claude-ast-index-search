@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from audit import Fixture, InvocationOracle, SCHEMA
 from build_index import build_ast_index
-from common import ToolError, connect, source_snapshot
+from common import ToolError, connect, file_sha256, source_snapshot
 from oracle_store import Metrics
 from replay import replay
 from text_snapshot import TextSnapshot, copy_snapshot
@@ -141,14 +141,43 @@ class TextSnapshotTests(unittest.TestCase):
             fixture.evaluate(check)
         self.assertEqual([row[0] for row in self.state.execute('SELECT verdict FROM checks')], ['pass'] * 3)
         self.assertEqual(len(self.client.calls), 2)
-        # Force one archived case into the replay batch: this checks replay
+        # Force archived cases into the replay batch: this checks replay
         # plumbing, not a claim of a production regression being repaired.
         with self.state:
-            self.state.execute("UPDATE checks SET verdict='fail' WHERE id='unicode'")
-        with patch('replay.StreamableHttpMcpClient', side_effect=AssertionError('replay must be offline')):
+            self.state.execute("UPDATE checks SET verdict='fail'")
+        with patch('replay.StreamableHttpMcpClient', side_effect=AssertionError('replay must be offline')), \
+                patch('text_snapshot.file_sha256', wraps=file_sha256) as fingerprints:
             result = replay(self.directory / 'evidence.sqlite', self.root, binary, self.directory / 'replay')
         self.assertTrue(result['verified'], json.dumps(result))
-        self.assertEqual(result['counts'], {'pass': 1})
+        self.assertEqual(result['counts'], {'pass': 3})
+        # Two files: validate archived raw proof once, validate the shared
+        # snapshot once. Adding replay cases must not add project-wide hashes.
+        self.assertEqual(fingerprints.call_count, 4)
+
+    def test_shared_replay_session_still_rejects_sources_changed_mid_batch(self):
+        binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+        fingerprint = source_snapshot(self.root)[0]
+        for identity, query in (('type', 'Example'), ('unicode', '\u03a9')):
+            self.snapshot.search(identity, query)
+        with self.state:
+            self.state.executemany('INSERT OR REPLACE INTO metadata VALUES (?,?)',
+                                   [('project_root', str(self.root)), ('snapshot_sha256', fingerprint)])
+            self.state.execute("UPDATE checks SET verdict='fail' WHERE id IN ('type','unicode')")
+        original = Fixture.text_search_check
+        evaluated = []
+
+        def mutate_after_first(fixture, check):
+            result = original(fixture, check)
+            evaluated.append(check['id'])
+            if len(evaluated) == 1:
+                with (self.root / 'Other.java').open('a') as target:
+                    target.write('// changed during replay\n')
+            return result
+
+        with patch.object(Fixture, 'text_search_check', mutate_after_first):
+            with self.assertRaisesRegex(ToolError, 'changed during replay'):
+                replay(self.directory / 'evidence.sqlite', self.root, binary, self.directory / 'mutated-replay')
+        self.assertEqual(len(evaluated), 2)
 
 
 if __name__ == '__main__':

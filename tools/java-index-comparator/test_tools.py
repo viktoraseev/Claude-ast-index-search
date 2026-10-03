@@ -150,8 +150,8 @@ class ToolTests(unittest.TestCase):
             def __exit__(self, *_args):
                 return False
 
-            def read(self):
-                return self.body
+            def read(self, size=-1):
+                return self.body if size < 0 else self.body[:size]
 
         def urlopen(http_request, timeout):
             message = json.loads(http_request.data)

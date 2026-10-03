@@ -7,6 +7,28 @@ from common import adapter_digest
 
 
 class AdapterDigestTests(unittest.TestCase):
+    def test_annotation_contract_changes_invalidate_evidence(self):
+        previous = adapter_digest()
+        read = Path.read_bytes
+
+        def changed(path):
+            content = read(path)
+            return content + b'\n# changed contract\n' if path.name == 'annotation_contracts.py' else content
+
+        with patch.object(Path, 'read_bytes', changed):
+            self.assertNotEqual(adapter_digest(), previous)
+
+    def test_lifecycle_contract_changes_invalidate_evidence(self):
+        previous = adapter_digest()
+        read = Path.read_bytes
+
+        def changed(path):
+            content = read(path)
+            return content + b'\n# changed contract\n' if path.name == 'lifecycle_contracts.py' else content
+
+        with patch.object(Path, 'read_bytes', changed):
+            self.assertNotEqual(adapter_digest(), previous)
+
     def test_perl_contract_changes_invalidate_evidence(self):
         previous = adapter_digest()
         read = Path.read_bytes

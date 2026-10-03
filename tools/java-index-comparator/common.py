@@ -18,6 +18,7 @@ from urllib.error import HTTPError, URLError
 
 
 SCHEMA_VERSION = 1
+MCP_RESPONSE_MAX_BYTES = 64 * 1024 * 1024
 
 
 class ToolError(RuntimeError):
@@ -52,7 +53,7 @@ def adapter_digest() -> str:
     """Invalidate checkpoints when execution or normalization code changes."""
     directory = Path(__file__).parent
     return stable_id({name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-                      for name in ("audit.py", "common.py", "oracle_store.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java", "mobile_contracts.py", "perl_contracts.py", "text_snapshot.py")})
+                      for name in ("audit.py", "common.py", "oracle_store.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java", "mobile_contracts.py", "perl_contracts.py", "annotation_contracts.py", "text_snapshot.py", "lifecycle_contracts.py")})
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
@@ -72,11 +73,26 @@ def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
 
 def java_files(project_root: Path) -> Iterator[Path]:
     ignored = {".arc", ".git", ".gradle", ".idea", "build", "target"}
-    for directory, names, files in os.walk(project_root, followlinks=False):
+
+    def fail(error):
+        # Missing directories are not evidence that their declarations are
+        # absent. Let the caller keep the traversal explicitly incomplete.
+        raise error
+
+    boundary = project_root.resolve()
+    for directory, names, files in os.walk(project_root, followlinks=False, onerror=fail):
         names[:] = sorted(name for name in names if name not in ignored)
         for name in sorted(files):
             if name.endswith(".java"):
-                yield Path(directory, name)
+                path = Path(directory, name)
+                if path.is_symlink():
+                    try:
+                        resolved = path.resolve()
+                    except (OSError, RuntimeError) as error:
+                        raise ToolError('Java source link cannot be resolved within target') from error
+                    if not resolved.is_relative_to(boundary):
+                        raise ToolError('Java source link points outside target; source scope unresolved')
+                yield path
 
 
 def source_snapshot(project_root: Path) -> tuple[str, list[dict[str, Any]]]:
@@ -227,15 +243,22 @@ class StreamableHttpMcpClient:
                         if self.session_id and self.session_id != session_id:
                             raise ToolError('MCP session changed during an active invocation')
                         self.session_id = session_id
-                body = response.read()
+                body = response.read(MCP_RESPONSE_MAX_BYTES + 1)
+                if len(body) > MCP_RESPONSE_MAX_BYTES:
+                    raise ToolError(f'MCP response exceeds bounded memory budget for {method}')
                 if self.metrics is not None:
                     self.metrics.record('mcp.http', time.perf_counter() - started, len(body))
                 started = time.perf_counter()
-                decoded = self._decode(body, response.headers.get("Content-Type", ""))
+                try:
+                    decoded = self._decode(body, response.headers.get("Content-Type", ""))
+                except (UnicodeError, json.JSONDecodeError):
+                    raise ToolError(f'MCP returned malformed JSON/UTF-8 for {method}') from None
                 if self.metrics is not None:
                     self.metrics.record('mcp.envelope_decode', time.perf_counter() - started)
         except (HTTPError, URLError, TimeoutError) as error:
-            raise ToolError(f"MCP HTTP request failed for {method}: {error}") from error
+            status = getattr(error, 'code', None)
+            detail = f', status={status}' if type(status) is int else ''
+            raise ToolError(f"MCP HTTP request failed for {method}: {type(error).__name__}{detail}") from None
         if notification:
             return None
         if not isinstance(decoded, dict):
@@ -243,7 +266,9 @@ class StreamableHttpMcpClient:
         if decoded.get("id") != request_id:
             raise ToolError(f"MCP response id mismatch for {method}")
         if "error" in decoded:
-            raise ToolError(f"MCP error for {method}: {decoded['error']}")
+            # JSON-RPC diagnostics may contain source fragments, not merely
+            # protocol metadata. Never promote the server payload to stdout.
+            raise ToolError(f"MCP error for {method}")
         return decoded.get("result")
 
     def initialize(self) -> dict[str, Any]:
@@ -255,19 +280,35 @@ class StreamableHttpMcpClient:
                 "clientInfo": {"name": "java-index-collector", "version": "1"},
             },
         )
+        if not isinstance(result, dict):
+            raise ToolError('MCP returned an invalid initialize result')
         self.send("notifications/initialized", notification=True)
         return result
 
     def tools(self) -> dict[str, dict[str, Any]]:
         result = self.send("tools/list")
-        return {tool["name"]: tool for tool in result.get("tools", [])}
+        if not isinstance(result, dict) or not isinstance(result.get('tools'), list):
+            raise ToolError('MCP returned an invalid tools/list result')
+        tools = result['tools']
+        if any(not isinstance(tool, dict) or not isinstance(tool.get('name'), str) for tool in tools):
+            raise ToolError('MCP returned an invalid tool definition')
+        names = [tool['name'] for tool in tools]
+        if len(set(names)) != len(names):
+            raise ToolError('MCP returned duplicate tool definitions')
+        return {tool["name"]: tool for tool in tools}
 
     def call(self, name: str, arguments: dict[str, Any]) -> Any:
         result = self.send("tools/call", {"name": name, "arguments": arguments})
+        if not isinstance(result, dict) or not isinstance(result.get('content'), list):
+            raise ToolError(f'MCP tool {name} returned an invalid result envelope')
         if result.get("isError"):
             # Error content can contain project source; never send it to logs.
             raise ToolError(f"MCP tool {name} reported an error")
-        texts = [part.get("text", "") for part in result.get("content", []) if part.get("type") == "text"]
+        if any(not isinstance(part, dict) for part in result['content']):
+            raise ToolError(f'MCP tool {name} returned invalid content blocks')
+        texts = [part.get("text", "") for part in result["content"] if part.get("type") == "text"]
+        if any(not isinstance(part, str) for part in texts):
+            raise ToolError(f'MCP tool {name} returned invalid text content')
         if not texts:
             raise ToolError(f"MCP tool {name} returned no text")
         text = "\n".join(texts)

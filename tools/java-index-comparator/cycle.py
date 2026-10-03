@@ -85,6 +85,7 @@ def scan(arguments: argparse.Namespace) -> dict:
                "--project-root", arguments.project_root, "--output-dir", arguments.output_dir,
                "--ast-index", arguments.ast_index, "--mcp-name", arguments.mcp_name,
                "--timeout", str(arguments.timeout), "--problem-limit", str(arguments.problem_limit)]
+    command.extend(['--text-mode', getattr(arguments, 'text_mode', 'batch')])
     if arguments.mcp_url:
         command.extend(["--mcp-url", arguments.mcp_url])
     if arguments.case_limit is not None:
@@ -329,7 +330,8 @@ def run(arguments: argparse.Namespace) -> int:
                             text_mode=getattr(arguments, 'text_mode', 'batch'),
                         )
                         summary = scan(scan_arguments)
-                        print(canonical_json({key: summary[key] for key in ("counts", "remaining_checks", "unimplemented_features", "complete")}), flush=True)
+                        print(canonical_json({**{key: summary[key] for key in ("counts", "remaining_checks", "unimplemented_features", "complete")},
+                                              'deferred_outline_checks': summary.get('deferred_outline_checks', 0)}), flush=True)
                         verify_equivalence(state, summary, directory)
                         if summary["complete"]:
                             set_phase(state, round_id, "pr", summary_json=canonical_json(summary))

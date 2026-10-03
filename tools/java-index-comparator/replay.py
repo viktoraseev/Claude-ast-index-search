@@ -116,6 +116,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     state.execute("INSERT OR REPLACE INTO metadata VALUES ('supplemental_oracle_evidence',?)", (str(oracle_evidence.resolve()),))
             refreshed = 0
             snapshot_copied = False
+            fixture = None
             has_text_snapshot = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='text_snapshot_dependencies'").fetchone()
             for check in problem_batch(source, limit):
                 existing = state.execute("SELECT status FROM checks WHERE id=?", (check["id"],)).fetchone()
@@ -128,7 +129,17 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 if batch_text and not snapshot_copied:
                     text_snapshot.copy_snapshot(source, state, root)
                     snapshot_copied = True
-                fixture = Fixture(root, binary, database, state, oracle, schedule_followups=False, batch_text=batch_text)
+                if fixture is None:
+                    fixture = Fixture(root, binary, database, state, oracle, schedule_followups=False,
+                                      batch_text=batch_text)
+                else:
+                    # One immutable source/index session, not one full-project
+                    # fingerprint validation per case. Keep each recorded
+                    # request stream separate; final source guards remain below.
+                    fixture.client = oracle
+                    fixture.batch_text = batch_text
+                    if fixture._text_snapshot is not None:
+                        fixture._text_snapshot.client = oracle
                 fixture.evaluate(check)
                 try:
                     oracle.assert_consumed()

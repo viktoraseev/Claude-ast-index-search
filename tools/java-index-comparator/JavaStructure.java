@@ -228,6 +228,21 @@ public class JavaStructure {
                         }
                         extra = ",\"injection_targets\":[" + String.join(",", targets) + "]";
                     }
+                    if (List.of("Provides", "Binds").contains(simple)
+                        && parent != null && parent.getLeaf() instanceof ModifiersTree
+                        && parent.getParentPath().getLeaf() instanceof MethodTree method
+                        && method.getReturnType() != null) {
+                        Tree type = method.getReturnType();
+                        while (true) {
+                            if (type instanceof ParameterizedTypeTree parameterized) type = parameterized.getType();
+                            else if (type instanceof AnnotatedTypeTree annotated) type = annotated.getUnderlyingType();
+                            else if (type instanceof ArrayTypeTree array) type = array.getType();
+                            else break;
+                        }
+                        extra += ",\"method_name\":" + quote(method.getName().toString())
+                            + ",\"method_position\":" + start(method)
+                            + ",\"return_type\":" + quote(type.toString());
+                    }
                     emit("annotation", "@" + simple, start(tree), start(tree), extra);
                     return super.visitAnnotation(tree, unused);
                 }

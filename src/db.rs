@@ -1386,14 +1386,14 @@ fn ensure_regular_or_missing(path: &Path) -> Result<()> {
 
 fn ensure_safe_live_db_artifacts(db_path: &Path) -> Result<()> {
     for suffix in LIVE_DB_SUFFIXES {
-        ensure_regular_or_missing(&db_path.with_extension(format!("db{suffix}")))?;
+        ensure_regular_or_missing(&live_artifact_path(db_path, suffix))?;
     }
     Ok(())
 }
 
 fn ensure_safe_swap_db_artifacts(db_path: &Path) -> Result<()> {
     for suffix in SWAP_SUFFIXES {
-        ensure_regular_or_missing(&db_path.with_extension(format!("db.swap{suffix}")))?;
+        ensure_regular_or_missing(&swap_artifact_path(db_path, suffix))?;
     }
     Ok(())
 }
@@ -3089,8 +3089,8 @@ pub fn gc_stale_caches(current_root: &Path) -> Result<usize> {
 }
 
 const PUBLICATION_STATE_VERSION: u8 = 1;
-const PUBLICATION_STATE_EXTENSION: &str = "db.publish-state-v1";
-const PUBLICATION_COMMIT_EXTENSION: &str = "db.publish-commit-v1";
+const PUBLICATION_STATE_SUFFIX: &str = ".publish-state-v1";
+const PUBLICATION_COMMIT_SUFFIX: &str = ".publish-commit-v1";
 const STAGING_OWNER_VERSION: u8 = 1;
 const STAGING_OWNER_NAME: &str = ".ast-index-staging-owner-v1.json";
 
@@ -3131,15 +3131,15 @@ struct StagingOwner {
 }
 
 fn publication_state_path(db_path: &Path) -> PathBuf {
-    db_path.with_extension(PUBLICATION_STATE_EXTENSION)
+    sqlite_sidecar_path(db_path, PUBLICATION_STATE_SUFFIX)
 }
 
 fn publication_commit_path(db_path: &Path) -> PathBuf {
-    db_path.with_extension(PUBLICATION_COMMIT_EXTENSION)
+    sqlite_sidecar_path(db_path, PUBLICATION_COMMIT_SUFFIX)
 }
 
 fn publication_pending_swap_path(db_path: &Path) -> PathBuf {
-    db_path.with_extension("db.swap-pending")
+    sqlite_sidecar_path(db_path, ".swap-pending")
 }
 
 fn publication_has_interrupted_state(db_path: &Path) -> Result<bool> {
@@ -3169,7 +3169,7 @@ fn publication_has_interrupted_state(db_path: &Path) -> Result<bool> {
         }
     }
     for suffix in SWAP_SUFFIXES {
-        let swap = db_path.with_extension(swap_extension(suffix));
+        let swap = swap_artifact_path(db_path, suffix);
         match std::fs::symlink_metadata(&swap) {
             Ok(metadata) => {
                 anyhow::ensure!(
@@ -3262,7 +3262,7 @@ fn new_publication_token() -> String {
 fn publication_artifact_bitmap(db_path: &Path) -> Result<[bool; 4]> {
     let mut present = [false; 4];
     for (index, suffix) in LIVE_DB_SUFFIXES.iter().enumerate() {
-        let path = db_path.with_extension(live_extension(suffix));
+        let path = live_artifact_path(db_path, suffix);
         present[index] = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 anyhow::ensure!(
@@ -3613,7 +3613,7 @@ fn checkpoint_and_consolidate_live_db(db_path: &Path) -> Result<[bool; 4]> {
     // connections, checkpointed WAL bookkeeping files carry no generation
     // data and may be removed before the durable initial bitmap is written.
     for suffix in ["-wal", "-shm", "-journal"] {
-        remove_regular_file_if_present(&db_path.with_extension(live_extension(suffix)))?;
+        remove_regular_file_if_present(&live_artifact_path(db_path, suffix))?;
     }
     sync_regular_file(db_path)?;
     let bitmap = publication_artifact_bitmap(db_path)?;
@@ -3692,7 +3692,7 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
         anyhow::ensure!(
             !SWAP_SUFFIXES
                 .iter()
-                .any(|suffix| db_path.with_extension(swap_extension(suffix)).exists()),
+                .any(|suffix| swap_artifact_path(db_path, suffix).exists()),
             "untracked index swap exists at {}; refusing to delete it",
             db_path.display()
         );
@@ -3746,7 +3746,7 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
         }
         Some(PublicationOperation::Clear) => {
             for suffix in LIVE_DB_SUFFIXES {
-                remove_regular_file_if_present(&db_path.with_extension(live_extension(suffix)))?;
+                remove_regular_file_if_present(&live_artifact_path(db_path, suffix))?;
             }
             cleanup_recorded_committed_swaps(db_path, state.as_ref())?;
         }
@@ -3755,7 +3755,7 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
                 .as_ref()
                 .context("index publication commit exists without a recoverable state")?;
             if state.artifacts[0] {
-                let swap = db_path.with_extension(swap_extension(""));
+                let swap = swap_artifact_path(db_path, "");
                 if swap.exists() {
                     remove_regular_file_if_present(db_path)?;
                     std::fs::rename(&swap, db_path).with_context(|| {
@@ -3775,8 +3775,8 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
                 remove_regular_file_if_present(db_path)?;
             }
             for suffix in ["-wal", "-shm", "-journal"] {
-                remove_regular_file_if_present(&db_path.with_extension(live_extension(suffix)))?;
-                let swap = db_path.with_extension(swap_extension(suffix));
+                remove_regular_file_if_present(&live_artifact_path(db_path, suffix))?;
+                let swap = swap_artifact_path(db_path, suffix);
                 anyhow::ensure!(
                     !swap.exists(),
                     "unexpected sidecar swap in consolidated publication: {}",
@@ -3809,7 +3809,7 @@ fn cleanup_recorded_committed_swaps(
         db_path.display()
     );
     for (index, suffix) in SWAP_SUFFIXES.iter().enumerate() {
-        let swap = db_path.with_extension(swap_extension(suffix));
+        let swap = swap_artifact_path(db_path, suffix);
         let recorded = state.map(|state| state.artifacts[index]).unwrap_or(false);
         if swap.exists() {
             anyhow::ensure!(
@@ -3853,7 +3853,7 @@ where
 
     let publish_result = (|| -> Result<()> {
         if artifacts[0] {
-            snapshot_live_main(db_path, &db_path.with_extension(swap_extension("")))?;
+            snapshot_live_main(db_path, &swap_artifact_path(db_path, ""))?;
             sync_cache_directory(db_path.parent().context("index database has no parent")?)?;
         }
 
@@ -3976,7 +3976,7 @@ impl IndexPublicationGuard {
             if artifacts[0] {
                 snapshot_live_main(
                     &self.db_path,
-                    &self.db_path.with_extension(swap_extension("")),
+                    &swap_artifact_path(&self.db_path, ""),
                 )?;
                 sync_cache_directory(
                     self.db_path
@@ -4099,7 +4099,7 @@ pub fn delete_db(project_root: &Path) -> Result<()> {
 fn delete_db_at_path(db_path: &Path) -> Result<()> {
     ensure_safe_live_db_artifacts(db_path)?;
     for suffix in ["", "-wal", "-shm", "-journal"] {
-        let p = db_path.with_extension(format!("db{}", suffix));
+        let p = live_artifact_path(db_path, suffix);
         if p.exists() {
             std::fs::remove_file(&p)?;
         }
@@ -4107,12 +4107,14 @@ fn delete_db_at_path(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn swap_extension(suffix: &str) -> String {
-    format!("db.swap{}", suffix)
+fn swap_artifact_path(db_path: &Path, suffix: &str) -> PathBuf {
+    sqlite_sidecar_path(db_path, &format!(".swap{suffix}"))
 }
 
-fn live_extension(suffix: &str) -> String {
-    format!("db{}", suffix)
+fn live_artifact_path(db_path: &Path, suffix: &str) -> PathBuf {
+    // SQLite appends sidecar suffixes to the full filename; the database
+    // override may be extensionless or end in .sqlite, not necessarily .db.
+    sqlite_sidecar_path(db_path, suffix)
 }
 
 /// Atomically move the current DB aside (rename to `index.db.swap*`).
@@ -4141,8 +4143,8 @@ where
     let mut moved_suffixes = Vec::new();
     let move_result = (|| -> Result<()> {
         for suffix in SWAP_SUFFIXES {
-            let live = db_path.with_extension(live_extension(suffix));
-            let swap = db_path.with_extension(swap_extension(suffix));
+            let live = live_artifact_path(db_path, suffix);
+            let swap = swap_artifact_path(db_path, suffix);
             anyhow::ensure!(
                 !swap.exists(),
                 "untracked index swap already exists at {}; refusing to overwrite it",
@@ -4165,8 +4167,8 @@ where
     if let Err(move_error) = move_result {
         let rollback_result = (|| -> Result<()> {
             for suffix in moved_suffixes.iter().rev() {
-                let live = db_path.with_extension(live_extension(suffix));
-                let swap = db_path.with_extension(swap_extension(suffix));
+                let live = live_artifact_path(db_path, suffix);
+                let swap = swap_artifact_path(db_path, suffix);
                 anyhow::ensure!(
                     !live.exists(),
                     "cannot roll back partial database swap because {} exists",
@@ -4205,8 +4207,8 @@ fn restore_db_from_swap_at_path(db_path: &Path) -> Result<()> {
     ensure_safe_live_db_artifacts(db_path)?;
     ensure_safe_swap_db_artifacts(db_path)?;
     for suffix in SWAP_SUFFIXES {
-        let live = db_path.with_extension(live_extension(suffix));
-        let swap = db_path.with_extension(swap_extension(suffix));
+        let live = live_artifact_path(db_path, suffix);
+        let swap = swap_artifact_path(db_path, suffix);
         if swap.exists() {
             if live.exists() {
                 let _ = std::fs::remove_file(&live);
@@ -4227,7 +4229,7 @@ pub fn remove_swap(project_root: &Path) -> Result<()> {
 fn remove_swap_at_path(db_path: &Path) -> Result<()> {
     ensure_safe_swap_db_artifacts(db_path)?;
     for suffix in SWAP_SUFFIXES {
-        let swap = db_path.with_extension(swap_extension(suffix));
+        let swap = swap_artifact_path(db_path, suffix);
         if swap.exists() {
             let _ = std::fs::remove_file(&swap);
         }

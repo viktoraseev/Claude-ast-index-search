@@ -201,8 +201,9 @@ class OracleStorageTests(unittest.TestCase):
                 self.request = json.loads(request.data)
                 with lock:
                     ids.append(self.request['id'])
-            def read(self):
-                return canonical_json({'id': self.request['id'], 'result': {}}).encode()
+            def read(self, size=-1):
+                body = canonical_json({'id': self.request['id'], 'result': {}}).encode()
+                return body if size < 0 else body[:size]
             def __enter__(self):
                 return self
             def __exit__(self, *args):

@@ -1182,3 +1182,4 @@ fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
     }
     Ok(wb.build_parallel())
 }
+mod annotation_functions;

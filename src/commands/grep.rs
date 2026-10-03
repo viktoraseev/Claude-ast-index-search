@@ -834,79 +834,25 @@ fn find_containing_function(
 
 /// Find Dagger @Provides/@Binds for a type
 pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
-    let mut results: Vec<(String, usize, String)> = vec![];
-
-    // Parallel grep narrows the scan to files that declare providers at all;
-    // reading every .kt/.java file sequentially is prohibitively slow on large
-    // or network-backed checkouts.
-    let mut candidate_files: std::collections::BTreeSet<PathBuf> = Default::default();
-    search_files_limited(
+    let results = super::annotation_functions::find(
         root,
-        r"@Provides|@Binds",
-        &["kt", "java"],
-        100_000,
-        |path, _line_num, _line| {
-            candidate_files.insert(path.to_path_buf());
-        },
+        &["Provides", "Binds"],
+        &["kt", "kts", "java"],
+        Some(type_name),
+        true,
+        limit,
     )?;
-
-    let kotlin_re = Regex::new(&format!(r":\s*\w*{}\b", regex::escape(type_name)))?;
-    let java_re = Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name)))?;
-
-    for path in &candidate_files {
-        if results.len() >= limit {
-            break;
-        }
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        if !content.contains(type_name) {
-            continue;
-        }
-        let lines: Vec<&str> = content.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if results.len() >= limit {
-                break;
-            }
-            if !(line.contains("@Provides") || line.contains("@Binds")) {
-                continue;
-            }
-            // Look at this line and the next few for the return type.
-            // Kotlin: `: ReturnType`; Java: `ReturnType methodName(`.
-            // A prefix is allowed so AppIconInteractor matches Interactor.
-            let context: String = lines[i..std::cmp::min(i + 5, lines.len())].join(" ");
-            if !(kotlin_re.is_match(&context) || java_re.is_match(&context)) {
-                continue;
-            }
-            let rel_path = relative_path(root, path);
-            // Kotlin: `fun name()` on the next line; Java: annotation -> modifiers -> method
-            let func_line = if i + 1 < lines.len() {
-                let next_line = lines[i + 1].trim();
-                if next_line.contains("fun ") || next_line.contains("(") {
-                    next_line.to_string()
-                } else if i + 2 < lines.len() && lines[i + 2].trim().contains("(") {
-                    lines[i + 2].trim().to_string()
-                } else {
-                    line.trim().to_string()
-                }
-            } else {
-                line.trim().to_string()
-            };
-            results.push((rel_path, i + 1, func_line));
-        }
-    }
-
     println!(
         "{}",
         format!("Providers for '{}' ({}):", type_name, results.len()).bold()
     );
-
-    for (path, line_num, content) in &results {
-        println!("  {}:{}", path, line_num);
-        let truncated: String = content.chars().take(100).collect();
-        println!("    {}", truncated);
+    for item in results {
+        println!("  {}:{}", item.path, item.line);
+        println!(
+            "    {}",
+            item.signature.chars().take(100).collect::<String>()
+        );
     }
-
     Ok(())
 }
 
@@ -955,73 +901,30 @@ pub fn cmd_suspend(root: &Path, query: Option<&str>, limit: usize) -> Result<()>
 
 /// Find @Composable functions
 pub fn cmd_composables(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let func_regex = Regex::new(r"fun\s+(\w+)\s*\(")?;
+    print_annotated_functions(root, "Composable", query, limit)
+}
 
-    // Phase 1: find all .kt files containing @Composable
-    let mut file_set: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    search_files_limited(
+fn print_annotated_functions(
+    root: &Path,
+    annotation: &str,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<()> {
+    let items = super::annotation_functions::find(
         root,
-        r"@Composable",
-        &["kt"],
-        100_000,
-        |path, _line_num, _line| {
-            file_set.insert(path.to_path_buf());
-        },
+        &[annotation],
+        &["kt", "kts"],
+        query,
+        false,
+        limit,
     )?;
-
-    // Phase 2: read each file and find @Composable + fun pairs (multi-line aware)
-    let mut composables: Vec<(String, String, usize)> = vec![];
-    let mut sorted_files: Vec<_> = file_set.into_iter().collect();
-    sorted_files.sort();
-
-    for file_path in &sorted_files {
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let lines: Vec<&str> = content.lines().collect();
-        let mut i = 0;
-        while i < lines.len() {
-            if lines[i].contains("@Composable") {
-                // Look at current and next few lines for fun definition
-                for j in i..=(i + 5).min(lines.len() - 1) {
-                    if let Some(caps) = func_regex.captures(lines[j]) {
-                        let func_name = caps.get(1).unwrap().as_str().to_string();
-
-                        if let Some(q) = query {
-                            if !func_name.to_lowercase().contains(&q.to_lowercase()) {
-                                break;
-                            }
-                        }
-
-                        let rel_path = relative_path(root, file_path);
-                        composables.push((func_name, rel_path, j + 1));
-                        i = j;
-                        break;
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        if composables.len() >= limit {
-            composables.truncate(limit);
-            break;
-        }
-    }
-
-    composables.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-
     println!(
         "{}",
-        format!("@Composable functions ({}):", composables.len()).bold()
+        format!("@{} functions ({}):", annotation, items.len()).bold()
     );
-
-    for (func_name, path, line_num) in &composables {
-        println!("  {}: {}:{}", func_name.cyan(), path, line_num);
+    for item in items {
+        println!("  {}: {}:{}", item.name.cyan(), item.path, item.line);
     }
-
     Ok(())
 }
 
@@ -1411,74 +1314,7 @@ pub fn cmd_flows(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
 
 /// Find @Preview functions
 pub fn cmd_previews(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    let func_regex = Regex::new(r"fun\s+(\w+)\s*\(")?;
-
-    // Phase 1: find all .kt files containing @Preview
-    let mut file_set: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    search_files_limited(
-        root,
-        r"@Preview",
-        &["kt"],
-        100_000,
-        |path, _line_num, _line| {
-            file_set.insert(path.to_path_buf());
-        },
-    )?;
-
-    // Phase 2: read each file and find @Preview + fun pairs (multi-line aware)
-    let mut items: Vec<(String, String, usize)> = vec![];
-    let mut sorted_files: Vec<_> = file_set.into_iter().collect();
-    sorted_files.sort();
-
-    for file_path in &sorted_files {
-        let content = match std::fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let lines: Vec<&str> = content.lines().collect();
-        let mut i = 0;
-        while i < lines.len() {
-            if lines[i].contains("@Preview") {
-                // Look at current and next few lines for fun definition
-                for j in i..=(i + 5).min(lines.len() - 1) {
-                    if let Some(caps) = func_regex.captures(lines[j]) {
-                        let func_name = caps.get(1).unwrap().as_str().to_string();
-
-                        if let Some(q) = query {
-                            if !func_name.to_lowercase().contains(&q.to_lowercase()) {
-                                break;
-                            }
-                        }
-
-                        let rel_path = relative_path(root, file_path);
-                        items.push((func_name, rel_path, j + 1));
-                        i = j;
-                        break;
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        if items.len() >= limit {
-            items.truncate(limit);
-            break;
-        }
-    }
-
-    items.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-
-    println!(
-        "{}",
-        format!("@Preview functions ({}):", items.len()).bold()
-    );
-
-    for (func_name, path, line_num) in &items {
-        println!("  {}: {}:{}", func_name.cyan(), path, line_num);
-    }
-
-    Ok(())
+    print_annotated_functions(root, "Preview", query, limit)
 }
 
 /// Structural code search via ast-grep (requires `sg` or `ast-grep` installed)

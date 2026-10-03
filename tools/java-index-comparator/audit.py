@@ -38,7 +38,9 @@ from java_structure import structure_server
 from oracle_store import Metrics, OracleStore, Reply, ReplyCache, SCHEMA as ORACLE_SCHEMA
 import mobile_contracts
 import perl_contracts
+import annotation_contracts
 import text_snapshot
+import lifecycle_contracts
 
 
 SCHEMA = """
@@ -55,6 +57,12 @@ CREATE TABLE IF NOT EXISTS checks(
 );
 CREATE INDEX IF NOT EXISTS checks_status ON checks(status, feature, subject);
 CREATE INDEX IF NOT EXISTS checks_verdict ON checks(verdict);
+CREATE INDEX IF NOT EXISTS checks_schedule ON checks(
+    status,(feature='outline' OR feature GLOB 'outline:*'),feature,subject
+);
+CREATE INDEX IF NOT EXISTS checks_outline_blockers ON checks(id)
+    WHERE NOT (feature='outline' OR feature GLOB 'outline:*')
+      AND (status!='complete' OR verdict IS NOT 'pass');
 CREATE TABLE IF NOT EXISTS source_structures(
     path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL, entries_json TEXT NOT NULL
 );
@@ -71,6 +79,26 @@ class Unsupported(ToolError):
 
 class SearchCollectionCap(Unsupported):
     pass
+
+
+def next_check(state: sqlite3.Connection):
+    """Defer outline until all other applicable contracts actually pass.
+
+    The expression/partial indexes keep this O(log N), rather than repeatedly
+    scanning all deferred files or all completed checks on large projects.
+    """
+    check = state.execute("""SELECT * FROM checks WHERE status='pending'
+        ORDER BY (feature='outline' OR feature GLOB 'outline:*'),feature,subject LIMIT 1""").fetchone()
+    if check is None:
+        return None
+    if check['feature'] == 'outline' or check['feature'].startswith('outline:'):
+        if state.execute("SELECT 1 FROM coverage WHERE status='pending' LIMIT 1").fetchone():
+            return None
+        if state.execute("""SELECT 1 FROM checks
+            WHERE NOT (feature='outline' OR feature GLOB 'outline:*')
+              AND (status!='complete' OR verdict IS NOT 'pass') LIMIT 1""").fetchone():
+            return None
+    return check
 
 
 class InvocationOracle:
@@ -157,7 +185,7 @@ class InvocationOracle:
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = INTERNAL_FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -179,8 +207,8 @@ def grep_locations(output: str, root: Path, header_pattern: str, limit: int):
 
 def coverage_sources(state: sqlite3.Connection) -> dict[str, int]:
     """Keep independent and hybrid checks out of pure MCP coverage totals."""
-    prefixes = ('live MCP', 'hybrid MCP/JDK', 'independent JDK',
-                'live CLI against database state', 'internal CLI')
+    prefixes = ('live MCP', 'hybrid MCP/JDK', 'hybrid MCP/source', 'independent JDK',
+                'live CLI against database state', 'internal CLI', 'independent source/state')
     return {prefix: state.execute(
         "SELECT count(*) FROM coverage WHERE status='implemented' AND reason LIKE ?",
         (prefix + '%',),
@@ -366,7 +394,8 @@ def declaration_keys(items: list[dict[str, Any]], root: Path, name: str) -> Coun
 
 class Fixture:
     def __init__(self, root: Path, binary: Path, database: Path, state: sqlite3.Connection, client: Any,
-                 *, schedule_followups: bool = True, batch_text: bool = False):
+                 *, schedule_followups: bool = True, batch_text: bool = False,
+                 symbol_initials: set[str] | None = None):
         self.root, self.binary, self.state, self.client = root, binary, state, client
         client_metrics = getattr(client, 'metrics', None)
         self.metrics = client_metrics if isinstance(client_metrics, Metrics) else Metrics(state)
@@ -384,6 +413,10 @@ class Fixture:
         self.batch_text = batch_text
         self._text_batch_unavailable = False
         self._text_snapshot = None
+        self.symbol_initials = symbol_initials
+        self._symbol_prefetch_ready = False
+        self._lifecycle_results = None
+        self._lifecycle_error = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
@@ -569,6 +602,15 @@ class Fixture:
             arguments["matchMode"] = "exact"
             items = self.paginated(check["id"], "ide_find_class", arguments, "classes")
         else:
+            # Outline used to prime this shared cache first. Delaying outline
+            # must not serialize the same expensive searches in search/refs.
+            # Prime only when another check actually needs symbol navigation.
+            if (not self._symbol_prefetch_ready and self.symbol_initials and
+                    isinstance(self.client, InvocationOracle) and
+                    getattr(self.client.client, 'parallel_safe', False) is True):
+                self.client.prefetch('ide_find_symbol', ({**arguments, 'query': initial}
+                                                       for initial in sorted(self.symbol_initials)))
+                self._symbol_prefetch_ready = True
             # Complete broad symbol searches contain the exact-name subset.
             # Reuse short queries across checks; refine only the collection cap,
             # never stale pages, invalid responses, or real transport errors.
@@ -972,6 +1014,76 @@ class Fixture:
             actual_keys.update((limit, index, *location) for index, location in enumerate(actual))
         return {'source': reason, 'locations': ordered}, outputs, expected_keys, actual_keys
 
+    def annotation_function_check(self, check: sqlite3.Row):
+        if not self._inventory_ready:
+            mobile_contracts.inventory(self.state, self.root)
+            self._inventory_ready = True
+        feature = check['feature']
+        query = json.loads(check['subject'])['query']
+        status, reason = annotation_contracts.applicability(self.state, feature, self.root)
+        if status == 'pending':
+            raise Unsupported(reason)
+        expected = {}
+        pattern = annotation_contracts.pattern(feature)
+        for row in annotation_contracts.applicable_paths(self.state, feature):
+            if row['size'] > annotation_contracts.MAX_SOURCE_BYTES:
+                raise Unsupported('annotation source exceeds bounded parser size')
+            path = self.root / row['path']
+            fingerprint = file_sha256(path)
+            stat = path.stat()
+            if stat.st_size != row['size'] or stat.st_mtime_ns != row['modified'] or (row['sha256'] and fingerprint != row['sha256']):
+                raise ToolError('annotation source changed after inventory')
+            matches = self.paginated(check['id'], 'ide_search_text', {
+                'project_path': str(self.root), 'query': pattern, 'regex': True,
+                'caseSensitive': True, 'context': 'all',
+                'filePattern': '*' + row['extension'], 'paths': [row['path']], 'pageSize': 500,
+            }, 'matches')
+            anchors = set()
+            for match in matches:
+                line = match.get('line')
+                if relative_path(match.get('file', match.get('path')), self.root) != row['path'] or type(line) is not int or line < 1:
+                    raise Unsupported('annotation oracle returned an invalid scope/location')
+                anchors.add(line)
+            remaining = anchors.copy()
+            with path.open(encoding='utf-8') as source:
+                for number, line in enumerate(source, 1):
+                    if number in remaining:
+                        if not re.search(pattern, line):
+                            raise Unsupported('annotation oracle anchor differs from source')
+                        remaining.remove(number)
+            if remaining:
+                raise Unsupported('annotation oracle line exceeds source')
+            try:
+                for entry in annotation_contracts.declarations(self, row):
+                    if entry['annotation'] not in annotation_contracts.ANNOTATIONS[feature]:
+                        continue
+                    if entry['anchor'] not in anchors:
+                        raise Unsupported('independent declaration has no MCP annotation anchor')
+                    accepts = ((entry['return_type'] is not None and entry['return_type'].endswith(query))
+                               if feature == 'provides' else
+                               (not query or query.lower() in entry['name'].lower()))
+                    if accepts:
+                        line = entry['anchor'] if feature == 'provides' else entry['line']
+                        identity = (row['path'], line, entry['declaration'])
+                        expected[identity] = ((row['path'], line) if feature == 'provides' else
+                                              (row['path'], line, entry['name']))
+                        if len(expected) >= 1000000:
+                            raise Unsupported('annotation functions exceed bounded CLI limit')
+            except annotation_contracts.UnresolvedSyntax as error:
+                raise Unsupported(str(error)) from error
+            if file_sha256(path) != fingerprint:
+                raise ToolError('annotation source changed during comparison')
+        ordered = [expected[identity] for identity in sorted(expected)]
+        arguments = [] if query is None else [query]
+        outputs, expected_keys, actual_keys = {}, set(), set()
+        for limit in (0, 1, 3, 1000000):
+            output = self.text_cli(feature, *arguments, '--limit', str(limit))
+            outputs[str(limit)] = output
+            actual = annotation_contracts.output_locations(feature, output, self.root, limit)
+            expected_keys.update((limit, index, *location) for index, location in enumerate(ordered[:limit]))
+            actual_keys.update((limit, index, *location) for index, location in enumerate(actual))
+        return {'source': reason, 'locations': ordered}, outputs, expected_keys, actual_keys
+
     def injection_check(self, check: sqlite3.Row):
         name = check['subject']
         if not self._injection_ready:
@@ -1318,6 +1430,20 @@ class Fixture:
         finally:
             source.close()
 
+    def lifecycle_check(self, check: sqlite3.Row):
+        if self._lifecycle_error is not None:
+            raise self._lifecycle_error
+        if self._lifecycle_results is None:
+            try:
+                self._lifecycle_results = lifecycle_contracts.exercise(self.binary, self.database.parent / 'lifecycle-fixtures')
+            except (ToolError, OSError, subprocess.TimeoutExpired) as error:
+                self._lifecycle_error = error
+                raise
+        expected, actual = (section[check['feature']] for section in self._lifecycle_results)
+        return {'source': lifecycle_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1337,8 +1463,12 @@ class Fixture:
                 handler = self.introspection_check
             if check['feature'] in INTERNAL_FEATURES:
                 handler = self.map_check if check['feature'] == 'map' else self.analysis_management_check
+            if check['feature'] in lifecycle_contracts.FEATURES:
+                handler = self.lifecycle_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
+            if check['feature'] in annotation_contracts.EXTENSIONS:
+                handler = self.annotation_function_check
             if handler is None:
                 raise Unsupported(f"no live handler for {check['feature']}")
             expected, actual, expected_keys, actual_keys = handler(check)
@@ -1418,7 +1548,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                ("internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
+                (lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
+                 "internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
                  "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
                  "live MCP text locations (Java scope only; other language scopes remain pending)" if feature == "deeplinks" else
                  "live MCP text locations (Java suppression scope; Kotlin contract remains pending)" if feature == "suppress" else
@@ -1479,8 +1610,13 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
+        for feature in sorted(lifecycle_contracts.FEATURES):
+            subject = 'disposable-fixture'
+            state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
+                          (stable_id({'feature': feature, 'subject': subject}), feature, subject))
     mobile_contracts.plan_mobile(state, root)
     perl_contracts.plan_perl(state, root)
+    annotation_contracts.plan_annotations(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -1548,14 +1684,16 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             state.execute("INSERT OR REPLACE INTO metadata VALUES ('mcp_server',?)", (canonical_json(server),))
         database = directory / "index.sqlite"
         build_ast_index(str(binary), root, database, snapshot, 4, False)
-        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state, metrics=metrics), batch_text=text_mode == 'batch')
+        candidates = java_identifier_candidates(root)
+        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state, metrics=metrics),
+                          batch_text=text_mode == 'batch', symbol_initials={name[0] for name in candidates})
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
-        plan(state, source_files, help_text, java_identifier_candidates(root), root)
+        plan(state, source_files, help_text, candidates, root)
         limit = arguments.case_limit
         processed = 0
         problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
         while problems < arguments.problem_limit and (limit is None or processed < limit):
-            check = state.execute("SELECT * FROM checks WHERE status='pending' ORDER BY feature,subject LIMIT 1").fetchone()
+            check = next_check(state)
             if check is None:
                 break
             fixture.evaluate(check)
@@ -1574,6 +1712,8 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         summary = {
             "java_files": len(source_files), "processed_this_run": processed,
             "counts": counts, "remaining_checks": remaining,
+            "deferred_outline_checks": state.execute("""SELECT count(*) FROM checks
+                WHERE status!='complete' AND (feature='outline' OR feature GLOB 'outline:*')""").fetchone()[0],
             "unimplemented_features": pending_features,
             "coverage_sources": coverage_sources(state),
             "inapplicable_features": state.execute("SELECT count(*) FROM coverage WHERE status='inapplicable'").fetchone()[0],
