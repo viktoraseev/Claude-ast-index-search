@@ -26,7 +26,8 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS file_inventory(
 
 # Auxiliary Java descriptors are not in the Java navigation snapshot either.
 # Content hashes prevent reusing evidence after a same-size/mtime edit.
-LEXICAL_EXTENSIONS = {'.kt', '.kts', '.swift', '.pm', '.pl', '.pod', '.t', '.xml'}
+LEXICAL_EXTENSIONS = {'.kt', '.kts', '.swift', '.pm', '.pl', '.pod', '.t', '.xml',
+                      '.java', '.gradle', '.properties', '.toml'}
 JAVA_BUILD_DESCRIPTORS = {'pom.xml', 'build.gradle', 'build.gradle.kts',
                           'settings.gradle', 'settings.gradle.kts', 'ya.make'}
 

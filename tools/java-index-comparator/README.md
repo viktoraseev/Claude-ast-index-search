@@ -31,8 +31,13 @@ normalization accounts for that narrower scope; separate structure checks detect
 missing constructors or accessors. Anonymous-class methods have no Java qualified
 name, so their navigation identity uses name, file and line. Hierarchy compares
 explicit source parent edges, including external parents, and MCP project children.
-Search reference aggregation, ranking, command options, and other command contracts
-remain explicitly pending. A passing subset never establishes a complete audit.
+Search reference aggregation, base ranking and navigation options have executable
+checks. Advanced ranking and other unresolved command contracts remain explicitly
+pending. A passing subset never establishes a complete audit.
+
+Commands without an equivalent Index MCP operation use separately labelled
+independent source/state or internal CLI checks. Synthetic Java fixtures complement
+live project checks; they do not replace unresolved target or syntax contracts.
 
 Replay streams the first 100 failures in capture order plus every unsupported
 or error contract. Each check executes the current CLI against a rebuilt index;
@@ -48,6 +53,15 @@ evidence and failure logs, without committing. After a complete audit it reruns 
 verifies an upstream PR at the tested commit. Missing contracts prevent that
 final step.
 
+For several folders, use `cycle_projects.py` with one `--project-root` per folder
+in the desired repair order. All folders must pass at the same commit before one
+PR is opened. A fix for a later folder makes earlier results obsolete and requires
+fresh verification. An already-running per-folder cycle is allowed to finish
+without launching a duplicate. `--target-output` reuses existing per-folder
+artifacts, and `--defer-pr` verifies the whole set without opening a PR.
+The entry point's `--help` lists invocation options. Coordinator artifacts belong
+inside this repository's `.artifacts/`, outside every read-only target folder.
+
 A saved green summary is insufficient for a PR. The final gate rechecks the
 actual evidence, coverage, source inventory, binary and fixture fingerprints,
 plus the audited commit and clean worktree. An obsolete audit requires a fresh
@@ -60,7 +74,7 @@ or committed. Source or binary changes invalidate evidence.
 
 MCP configuration is discovered through Codex MCP. An explicit MCP URL is
 available when the server is running but is absent from that configuration.
-The target must be open in Index MCP Server.
+Every target must be open in Index MCP Server.
 
 Legacy collect.py, compare.py and case_fixture.py remain available locally.
 They are not the live repair process; the legacy fixture validates stored

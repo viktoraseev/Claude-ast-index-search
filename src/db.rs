@@ -6534,6 +6534,15 @@ pub fn count_files_with_roots_terms_scoped(
     terms: &[&str],
     scope: &SearchScope,
 ) -> Result<usize> {
+    count_files_with_roots_terms_filtered(conn, terms, scope, false)
+}
+
+pub fn count_files_with_roots_terms_filtered(
+    conn: &Connection,
+    terms: &[&str],
+    scope: &SearchScope,
+    exclude_tests: bool,
+) -> Result<usize> {
     if terms.is_empty() {
         return Ok(0);
     }
@@ -6542,7 +6551,9 @@ pub fn count_files_with_roots_terms_scoped(
         .collect::<Vec<_>>()
         .join(" OR ");
     let (scope_clause, scope_params) = scope.path_condition();
-    let sql = format!("SELECT COUNT(*) FROM files f WHERE ({predicates}){scope_clause}");
+    let test_clause = test_path_condition(conn, exclude_tests)?;
+    let sql =
+        format!("SELECT COUNT(*) FROM files f WHERE ({predicates}){scope_clause}{test_clause}");
     let mut values: Vec<String> = terms.iter().map(|term| format!("%{term}%")).collect();
     values.extend(scope_params);
     let params: Vec<&dyn rusqlite::types::ToSql> = values
@@ -6572,6 +6583,25 @@ pub fn find_files_with_roots_terms_filtered(
     scope: &SearchScope,
     vendor: Option<bool>,
 ) -> Result<Vec<FileResult>> {
+    find_files_with_roots_terms_candidates(
+        conn,
+        terms,
+        limit,
+        scope,
+        SearchCandidateFilter {
+            vendor,
+            exclude_tests: false,
+        },
+    )
+}
+
+pub fn find_files_with_roots_terms_candidates(
+    conn: &Connection,
+    terms: &[&str],
+    limit: usize,
+    scope: &SearchScope,
+    filter: SearchCandidateFilter,
+) -> Result<Vec<FileResult>> {
     if terms.is_empty() {
         return Ok(Vec::new());
     }
@@ -6580,9 +6610,10 @@ pub fn find_files_with_roots_terms_filtered(
         .collect::<Vec<_>>()
         .join(" OR ");
     let (scope_clause, scope_params) = scope.path_condition();
-    let vendor_clause = vendor_condition(vendor);
+    let vendor_clause = vendor_condition(filter.vendor);
+    let test_clause = test_path_condition(conn, filter.exclude_tests)?;
     let sql = format!(
-        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause}{vendor_clause} ORDER BY f.path LIMIT ?"
+        "SELECT f.path, f.root_path FROM files f WHERE ({predicates}){scope_clause}{vendor_clause}{test_clause} ORDER BY f.path LIMIT ?"
     );
     let mut values: Vec<String> = terms.iter().map(|term| format!("%{term}%")).collect();
     values.extend(scope_params);
@@ -8473,6 +8504,17 @@ pub fn count_search_symbol_terms_scoped(
     scope: &SearchScope,
     fuzzy: bool,
 ) -> Result<usize> {
+    count_search_symbol_terms_filtered(conn, terms, kind, scope, fuzzy, false)
+}
+
+pub fn count_search_symbol_terms_filtered(
+    conn: &Connection,
+    terms: &[&str],
+    kind: Option<&str>,
+    scope: &SearchScope,
+    fuzzy: bool,
+    exclude_tests: bool,
+) -> Result<usize> {
     if terms.is_empty() {
         return Ok(0);
     }
@@ -8514,6 +8556,7 @@ pub fn count_search_symbol_terms_scoped(
         });
         values.push(kind.to_string());
     }
+    sql.push_str(&test_path_condition(conn, exclude_tests)?);
     let params: Vec<&dyn rusqlite::types::ToSql> = values
         .iter()
         .map(|value| value as &dyn rusqlite::types::ToSql)
@@ -8536,6 +8579,22 @@ pub fn search_symbol_terms_scoped(
             .map(|(_, result)| result)
             .collect(),
     )
+}
+
+/// Path filters applied before a search candidate pool's LIMIT and COUNT.
+#[derive(Clone, Copy, Default)]
+pub struct SearchCandidateFilter {
+    pub vendor: Option<bool>,
+    pub exclude_tests: bool,
+}
+
+fn test_path_condition(conn: &Connection, exclude_tests: bool) -> Result<String> {
+    if exclude_tests {
+        ensure_test_functions(conn)?;
+        Ok(format!(" AND NOT {IS_TEST_PATH_FN}(f.path)"))
+    } else {
+        Ok(String::new())
+    }
 }
 
 /// `AND` clause keeping only third-party paths, only project paths, or
@@ -8561,12 +8620,36 @@ pub fn search_symbol_terms_scoped_with_ids(
     fuzzy: bool,
     vendor: Option<bool>,
 ) -> Result<Vec<(i64, SearchResult)>> {
+    search_symbol_terms_candidates_with_ids(
+        conn,
+        terms,
+        kind,
+        limit,
+        scope,
+        fuzzy,
+        SearchCandidateFilter {
+            vendor,
+            exclude_tests: false,
+        },
+    )
+}
+
+pub fn search_symbol_terms_candidates_with_ids(
+    conn: &Connection,
+    terms: &[&str],
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+    fuzzy: bool,
+    filter: SearchCandidateFilter,
+) -> Result<Vec<(i64, SearchResult)>> {
     if terms.is_empty() {
         return Ok(Vec::new());
     }
     ensure_test_functions(conn)?;
     let (scope_clause, scope_params) = scope.path_condition();
-    let vendor_clause = vendor_condition(vendor);
+    let vendor_clause = vendor_condition(filter.vendor);
+    let test_clause = test_path_condition(conn, filter.exclude_tests)?;
     let mut values = Vec::new();
     let mut sql = if fuzzy {
         let predicates = terms
@@ -8582,7 +8665,7 @@ pub fn search_symbol_terms_scoped_with_ids(
             .collect::<Vec<_>>()
             .join(" OR ");
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line, s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}{vendor_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line, s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE ({predicates}){scope_clause}{vendor_clause}{test_clause}"
         )
     } else {
         values.push(
@@ -8593,7 +8676,7 @@ pub fn search_symbol_terms_scoped_with_ids(
                 .join(" OR "),
         );
         format!(
-            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line, s.id FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}{vendor_clause}"
+            "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line, s.id FROM symbols_fts fts JOIN symbols s ON fts.rowid = s.id JOIN files f ON s.file_id = f.id WHERE symbols_fts MATCH ?{scope_clause}{vendor_clause}{test_clause}"
         )
     };
     values.extend(scope_params);

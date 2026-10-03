@@ -47,6 +47,7 @@ import profile_contracts
 import delegate_contracts
 import route_contracts
 import android_contracts
+import vcs_contracts
 
 
 SCHEMA = """
@@ -238,7 +239,7 @@ class InvocationOracle:
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | delegate_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = vcs_contracts.FEATURES | INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | delegate_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -475,6 +476,8 @@ class Fixture:
         self._install_results = None
         self._install_error = None
         self._android_results = None
+        self._vcs_results = None
+        self._vcs_budget_results = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_ROOT": str(root),
@@ -1636,6 +1639,19 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def vcs_check(self, check: sqlite3.Row):
+        if self._vcs_results is None:
+            self._vcs_results = vcs_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (dict(section[check['feature']]) for section in self._vcs_results)
+        if check['feature'] == 'search:rank-history':
+            if self._vcs_budget_results is None:
+                self._vcs_budget_results = vcs_contracts.exclusion_budget(self.binary, self.database.parent)
+            for output, section in zip((expected, actual), self._vcs_budget_results):
+                output.update({'budget:' + key: value for key, value in section.items()})
+        return {'source': vcs_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1669,6 +1685,8 @@ class Fixture:
                 handler = self.profile_check
             if check['feature'] in route_contracts.FEATURES:
                 handler = self.route_check
+            if check['feature'] in vcs_contracts.FEATURES:
+                handler = self.vcs_check
             if check['feature'] in android_contracts.FEATURES:
                 handler = self.android_check
             if check['feature'] == 'api':
@@ -1736,7 +1754,8 @@ def required_features(help_text: str = '') -> set[str]:
         raise Unsupported("cannot enumerate required CLI commands")
     features.update({"global:format", "global:walk-up", "global:subtree", "global:local",
                      "global:scope-command-matrix", "search:rank-presets",
-                     "module-route:budgets", "detect-stacks:composition-budgets"})
+                     "module-route:budgets", "detect-stacks:composition-budgets",
+                     "android:syntax-resolution", "xml-usages:target", "resource-usages:target"})
     features.update(LIVE_FEATURES)
     features.update(route_contracts.FEATURES)
     return features
@@ -1748,7 +1767,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
     pending_contracts = {
         "global:scope-command-matrix": "Combined path filters and Java API/module/map/analysis/graph/conventions/explore scope contracts remain unresolved; root fixture covers navigation and text searches",
-        "search:rank-presets": "history/graph ranking presets and test exclusion contracts not implemented yet",
+        "search:rank-presets": vcs_contracts.PENDING_REASON,
         "deeplinks:non-java": "non-Java deeplink scopes require separate text/applicability contracts",
         "suppress:non-java": "Kotlin suppression scope requires a separate text/applicability contract",
         "inject:non-java": "Kotlin injection scope requires a separate syntax/applicability contract",
@@ -1773,7 +1792,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                (delegate_contracts.REASON if feature in delegate_contracts.FEATURES else
+                (vcs_contracts.REASON if feature in vcs_contracts.FEATURES else
+                 delegate_contracts.REASON if feature in delegate_contracts.FEATURES else
                  install_contracts.REASON if feature in install_contracts.FEATURES else
                  root_contracts.REASON if feature in root_contracts.FEATURES else
                  lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
@@ -1862,6 +1882,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     profile_contracts.plan_profiles(state, root)
     route_contracts.plan_routes(state, root)
     android_contracts.plan_android(state, root)
+    vcs_contracts.plan_vcs(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

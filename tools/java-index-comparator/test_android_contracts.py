@@ -107,6 +107,30 @@ class AndroidContractsTests(unittest.TestCase):
             self.assertEqual(self.state.execute('SELECT verdict FROM checks WHERE id=?', (check['id'],)).fetchone()[0], 'fail')
         self.assertEqual(self.state.execute("SELECT status FROM coverage WHERE feature='android:syntax-resolution'").fetchone()[0], 'pending')
 
+    def test_preserved_stat_marker_edits_invalidate_absence_before_native_checks(self):
+        for name in ('gradle.properties', 'libs.versions.toml', 'plugins/android.gradle',
+                     'build/Generated.java'):
+            with self.subTest(input=name):
+                path = self.root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                before, after = (('class Generated { /* desktop.feature */ }\n',
+                                  'class Generated { /* android.feature */ }\n') if path.suffix == '.java'
+                                 else ('desktop.feature = true\n', 'android.feature = true\n'))
+                path.write_text(before)
+                mobile_contracts.inventory(self.state, self.root)
+                self.assertEqual(android_contracts.applicability(self.state, self.root)[0], 'inapplicable')
+                stamp = path.stat()
+                path.write_text(after)
+                os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                self.assertEqual(path.stat().st_size, stamp.st_size)
+                self.assertEqual(path.stat().st_mtime_ns, stamp.st_mtime_ns)
+                with self.assertRaisesRegex(ToolError, 'fingerprint changed'):
+                    android_contracts.applicability(self.state, self.root)
+                self.assertIsNone(self.state.execute("SELECT value FROM metadata WHERE key='android_applicability_sha256'").fetchone())
+                mobile_contracts.inventory(self.state, self.root)
+                self.assertEqual(android_contracts.applicability(self.state, self.root)[0], 'pending')
+                path.unlink()
+
 
 if __name__ == '__main__':
     unittest.main()

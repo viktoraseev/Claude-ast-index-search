@@ -15,9 +15,12 @@ class InventoryFingerprintTests(unittest.TestCase):
         artifacts.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=artifacts) as temporary:
             root = Path(temporary)
-            for name in ('pom.xml', 'build.gradle', 'settings.gradle', 'ya.make'):
+            for name in ('pom.xml', 'build.gradle', 'settings.gradle', 'ya.make',
+                         'gradle.properties', 'libs.versions.toml', 'plugins/android.gradle',
+                         'build/Generated.java'):
                 with self.subTest(descriptor=name):
                     path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(b'public-synthetic-one\n')
                     stamp = path.stat()
                     before = inventory_snapshot(root)
