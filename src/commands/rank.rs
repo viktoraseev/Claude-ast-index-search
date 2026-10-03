@@ -389,6 +389,7 @@ impl ProvenDossier {
 fn substance(
     history: Option<&FileHistory>,
     extent: Option<&(String, i64, Option<i64>)>,
+    java_empty: Option<bool>,
 ) -> ProvenDossier {
     let file_lines = history.and_then(|history| history.hotspot.current_lines);
     if let Some(file_lines) = file_lines.filter(|&lines| lines < STUB_LINES) {
@@ -398,14 +399,60 @@ fn substance(
             lineage: None,
         };
     }
-    let empty_class = matches!(
-        extent,
-        Some((kind, line, Some(end_line)))
-            if CLASS_KINDS.contains(&kind.as_str()) && end_line - line <= 1
-    );
+    let empty_class = java_empty.unwrap_or_else(|| {
+        matches!(
+            extent,
+            Some((kind, line, Some(end_line)))
+                if CLASS_KINDS.contains(&kind.as_str()) && end_line - line <= 1
+        )
+    });
     ProvenDossier {
         stub: empty_class.then_some("empty_class_body"),
         ..ProvenDossier::default()
+    }
+}
+
+/// Cache compact body facts, not source buffers or trees, for one ranked pool.
+#[derive(Default)]
+struct JavaBodies {
+    files: HashMap<std::path::PathBuf, HashMap<(String, i64, i64), bool>>,
+}
+
+impl JavaBodies {
+    fn empty(
+        &mut self,
+        resolver: &PathResolver,
+        path: &str,
+        root: Option<&str>,
+        name: Option<&str>,
+        extent: Option<&(String, i64, Option<i64>)>,
+    ) -> Result<Option<bool>> {
+        if !path.ends_with(".java") {
+            return Ok(None);
+        }
+        let Some((kind, line, Some(end_line))) = extent else {
+            return Ok(Some(false));
+        };
+        let Some(name) = name.filter(|_| CLASS_KINDS.contains(&kind.as_str())) else {
+            return Ok(Some(false));
+        };
+        let absolute = if resolver.is_primary_root(root) {
+            resolver.primary.join(path)
+        } else {
+            std::path::Path::new(root.unwrap_or_default()).join(path)
+        };
+        if !self.files.contains_key(&absolute) {
+            let content = std::fs::read_to_string(&absolute)?;
+            let bodies = crate::parsers::treesitter::java::type_body_emptiness(&content)?;
+            self.files.insert(absolute.clone(), bodies);
+        }
+        // Stale or incomplete ranges provide no evidence of an empty body.
+        Ok(Some(
+            self.files[&absolute]
+                .get(&(name.to_string(), *line, *end_line))
+                .copied()
+                .unwrap_or(false),
+        ))
     }
 }
 
@@ -1175,6 +1222,7 @@ pub fn rank_symbols(
         HashMap::new()
     };
     let mut lineages = Lineages::new(conn, ctx, resolver);
+    let mut java_bodies = JavaBodies::default();
     let mut candidates: Vec<Candidate<SearchResult>> = Vec::with_capacity(pool.len());
     for (position, (id, result)) in pool.into_iter().enumerate() {
         let tier = symbol_tier(&result, terms, fuzzy);
@@ -1192,6 +1240,17 @@ pub fn rank_symbols(
                 graph,
                 extent: extents.get(&id),
                 class: Some((id, result.name.as_str())),
+                java_empty: if ctx.preset == Preset::Proven {
+                    java_bodies.empty(
+                        resolver,
+                        &result.path,
+                        result.root_path.as_deref(),
+                        Some(&result.name),
+                        extents.get(&id),
+                    )?
+                } else {
+                    None
+                },
             };
             fill(ctx, &mut lineages, &mut dossier, evidence)?;
         }
@@ -1249,6 +1308,7 @@ pub fn rank_files(
         HashMap::new()
     };
     let mut lineages = Lineages::new(conn, ctx, resolver);
+    let mut java_bodies = JavaBodies::default();
     let mut candidates: Vec<Candidate<FileResult>> = Vec::with_capacity(pool.len());
     for (position, file) in pool.into_iter().enumerate() {
         let tier = file_tier(&file.path, terms);
@@ -1279,6 +1339,17 @@ pub fn rank_files(
                 graph,
                 extent: strongest_row.and_then(|row| extents.get(&row.metrics.symbol_id)),
                 class: strongest_row.map(|row| (row.metrics.symbol_id, row.name.as_str())),
+                java_empty: if ctx.preset == Preset::Proven {
+                    java_bodies.empty(
+                        resolver,
+                        &file.path,
+                        file.root_path.as_deref(),
+                        strongest_row.map(|row| row.name.as_str()),
+                        strongest_row.and_then(|row| extents.get(&row.metrics.symbol_id)),
+                    )?
+                } else {
+                    None
+                },
             };
             fill(ctx, &mut lineages, &mut dossier, evidence)?;
         }
@@ -1312,6 +1383,7 @@ struct Evidence<'a> {
     extent: Option<&'a (String, i64, Option<i64>)>,
     /// The symbol whose lineage `proven` weighs, with its name.
     class: Option<(i64, &'a str)>,
+    java_empty: Option<bool>,
 }
 
 fn fill(
@@ -1331,7 +1403,7 @@ fn fill(
         dossier.history = Some(history.map(HistoryDossier::from));
     }
     if ctx.preset == Preset::Proven && dossier.unscored.is_none() {
-        let mut proven = substance(history, evidence.extent);
+        let mut proven = substance(history, evidence.extent, evidence.java_empty);
         if let (Some(lineages), Some((id, name))) = (lineages.as_mut(), evidence.class) {
             proven.lineage = lineages.weakest(id, name)?;
         }

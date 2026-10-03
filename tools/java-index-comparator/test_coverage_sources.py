@@ -25,7 +25,7 @@ class CoverageSourcesTests(unittest.TestCase):
                 self.assertEqual(sum(counts.values()), implemented)
                 self.assertEqual(counts['hybrid MCP/JDK'], 4)
                 independent_features = {
-                    'changed', 'hotspots', 'search:rank-history',
+                    'changed', 'hotspots', 'search:rank-history', 'search:rank-presets',
                     'rebuild', 'update', 'restore', 'clear', 'watch', 'watch-status',
                     'add-root', 'remove-root', 'subtree', 'global:local', 'global:subtree', 'global:walk-up', 'global:explicit-root',
                     'install-claude-plugin', 'install-codex-mcp', 'install-git-hooks',

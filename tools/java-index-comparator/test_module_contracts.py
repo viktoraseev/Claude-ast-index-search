@@ -106,6 +106,55 @@ class ModuleContracts(unittest.TestCase):
                 expected = (1, 0, 0, 1) if variant == 'scope' else (0, 0, 1, 1)
                 self.assertEqual(tuple(map(int, summary.groups())), expected)
 
+    def test_unused_dependency_android_checks_do_not_drop_tail_entries_or_include_siblings(self):
+        for variant in ('xml-cap', 'resource-cap', 'resource-scope'):
+            with self.subTest(variant=variant):
+                library, consumer = variant + '-lib', variant + '-consumer'
+                dependency = ('<dependencies><dependency><groupId>fixture</groupId>'
+                              f'<artifactId>{library}</artifactId></dependency></dependencies>')
+                for path, name, deps in (('lib', library, ''), ('consumer', consumer, dependency)):
+                    self.write(f'{variant}/{path}/pom.xml', '<project><groupId>fixture</groupId>'
+                               f'<artifactId>{name}</artifactId>{deps}</project>')
+                padding = ''.join(f'class Padding{i:03d} {{}}\n' for i in range(75)) if variant == 'xml-cap' else ''
+                self.write(f'{variant}/lib/Widget.java', 'package fixture;\n' + padding + 'public class Widget {}\n')
+                self.write(f'{variant}/consumer/Work.java', 'package app; public class Work {}\n')
+                if variant == 'xml-cap':
+                    self.write(f'{variant}/consumer/res/layout/main.xml', '<fixture.Widget/>')
+                else:
+                    count = 150 if variant == 'resource-cap' else 1
+                    resource_prefix = 'title_' + variant.replace('-', '_') + '_'
+                    self.write(f'{variant}/lib/res/values/strings.xml', '<resources>' + ''.join(
+                        f'<string name="{resource_prefix}{i:03d}">text</string>' for i in range(count)) + '</resources>')
+                    usage_path = 'consumer' if variant == 'resource-cap' else 'consumer-shadow'
+                    if variant == 'resource-scope':
+                        self.write(f'{variant}/consumer-shadow/pom.xml', '<project><groupId>fixture</groupId>'
+                                   f'<artifactId>{variant}-shadow</artifactId>{dependency}</project>')
+                    self.write(f'{variant}/{usage_path}/Work.java',
+                               f'package app; public class Work {{ int value = R.string.{resource_prefix}{count - 1:03d}; }}\n')
+                self.prepare()
+                # Nested Maven module names follow directory paths, while
+                # artifact IDs resolve dependency coordinates only. Establish
+                # the edge before testing its Java/XML resource usage.
+                module_name = variant + '.consumer'
+                self.assertEqual(
+                    module_contracts.edge_rows(self.fixture.text_cli('deps', module_name), 'deps'),
+                    [(variant + '.lib', variant + '/lib', 'compile')])
+                self.assertEqual(self.fixture.text_cli('unused-deps', consumer),
+                                 f"Module '{consumer}' not found in index.\n")
+                output = self.fixture.text_cli('unused-deps', module_name)
+                summary = re.search(r'^Total: (\d+) unused, (\d+) exported, (\d+) used of (\d+) dependencies$',
+                                    output, re.MULTILINE)
+                self.assertIsNotNone(summary)
+                expected = (1, 0, 0, 1) if variant == 'resource-scope' else (0, 0, 1, 1)
+                self.assertEqual(tuple(map(int, summary.groups())), expected)
+                # A used dependency must be attributed to the branch under
+                # test, and disabling that branch must make it unused.
+                branch = 'XML' if variant == 'xml-cap' else 'Resources'
+                self.assertIn(f'  - {branch}: {expected[2]}\n', output)
+                flag = '--no-xml' if variant == 'xml-cap' else '--no-resources'
+                disabled = self.fixture.text_cli('unused-deps', module_name, flag)
+                self.assertIn('Total: 1 unused, 0 exported, 0 used of 1 dependencies\n', disabled)
+
     def test_reactor_coordinates_direct_dependencies_and_scope_drive_all_navigation(self):
         # Root artifact comes after the parent/comment; directory and artifact
         # names differ, and identical artifact names belong to different groups.

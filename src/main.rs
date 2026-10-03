@@ -112,7 +112,12 @@ struct Cli {
     command: Commands,
 
     /// Output format: text, json (all commands); mermaid, dot (module-route only)
-    #[arg(long, global = true, default_value = "text")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "text",
+        value_parser = ["text", "json", "mermaid", "dot"]
+    )]
     format: String,
 
     /// Prefer any existing parent-directory index over nested project/VCS

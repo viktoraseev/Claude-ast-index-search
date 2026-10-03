@@ -351,34 +351,32 @@ pub fn cmd_unused_deps(
         // 3. Check XML usages
         if check_xml && usage.direct_count == 0 && usage.transitive_count == 0 {
             // Get classes from the dependency module
-            let mut class_stmt = conn.prepare(
+            let mut class_stmt = conn.prepare(&format!(
                 "SELECT DISTINCT s.name FROM symbols s
                  JOIN files f ON s.file_id = f.id
-                 WHERE f.path LIKE ?1 AND s.kind IN ('class', 'object')
-                 LIMIT 50",
-            )?;
-            let dep_pattern = format!("{}%", dep_path);
-            let classes: Vec<String> = class_stmt
-                .query_map(params![dep_pattern], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+                 WHERE {MODULE_FILE_SCOPE} AND s.kind IN ('class', 'object')
+                 ORDER BY s.name"
+            ))?;
+            let classes = class_stmt.query_map(params![dep_path], |row| row.get::<_, String>(0))?;
 
             // Check if any class is used in XML layouts of the target module
-            for class_name in &classes {
+            for class_name in classes {
+                let class_name = class_name?;
                 let mut xml_stmt = conn.prepare(
                     "SELECT x.file_path, x.line FROM xml_usages x
                      JOIN modules m ON x.module_id = m.id
-                     WHERE m.id = ?1 AND x.class_name LIKE ?2",
+                     WHERE m.id = ?1 AND (
+                         x.class_name = ?2
+                         OR substr(x.class_name,-length(?2)-1)='.'||?2
+                         OR substr(x.class_name,-length(?2)-1)='$'||?2
+                     )",
                 )?;
-                let class_pattern = format!("%{}", class_name);
-                let xml_results: Vec<(String, i64)> = xml_stmt
-                    .query_map(params![module_id, class_pattern], |row| {
-                        Ok((row.get(0)?, row.get(1)?))
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let xml_results = xml_stmt.query_map(params![module_id, &class_name], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
 
-                for (_file_path, line) in xml_results {
+                for result in xml_results {
+                    let (_file_path, line) = result?;
                     usage.xml_count += 1;
                     if usage.xml_usages.len() < 3 {
                         usage.xml_usages.push((class_name.clone(), line));
@@ -398,35 +396,41 @@ pub fn cmd_unused_deps(
                 "SELECT r.type, r.name FROM resources r
                  JOIN modules m ON r.module_id = m.id
                  WHERE m.name = ?1
-                 LIMIT 100",
+                 ORDER BY r.type,r.name,r.id",
             )?;
-            let resources: Vec<(String, String)> = res_stmt
-                .query_map(params![dep_name], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
+            let resources = res_stmt.query_map(params![dep_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
 
             // Check if these resources are used in the target module
-            for (res_type, res_name) in &resources {
-                let mut usage_stmt = conn.prepare(
+            for resource in resources {
+                let (res_type, res_name) = resource?;
+                let usage_scope = MODULE_FILE_SCOPE.replace("f.path", "ru.usage_file");
+                let mut usage_stmt = conn.prepare(&format!(
                     "SELECT ru.usage_type FROM resource_usages ru
                      JOIN resources r ON ru.resource_id = r.id
-                     WHERE r.type = ?1 AND r.name = ?2
-                     AND ru.usage_file LIKE ?3",
-                )?;
-                let module_pattern = format!("{}%", module_path);
-                let usages: Vec<String> = usage_stmt
-                    .query_map(params![res_type, res_name, module_pattern], |row| {
-                        row.get(0)
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                     JOIN modules owner ON owner.id=r.module_id
+                     WHERE {usage_scope} AND owner.name=?2 AND r.type=?3 AND r.name=?4"
+                ))?;
+                let usages = usage_stmt.query_map(params![module_path, dep_name, res_type, res_name], |row| {
+                    row.get::<_, String>(0)
+                })?;
 
-                if !usages.is_empty() {
-                    usage.resource_count += usages.len();
+                let mut count = 0;
+                let mut first = None;
+                for usage_type in usages {
+                    let usage_type = usage_type?;
+                    count += 1;
+                    if first.is_none() {
+                        first = Some(usage_type);
+                    }
+                }
+                if count > 0 {
+                    usage.resource_count += count;
                     if usage.resource_usages.len() < 3 {
                         usage.resource_usages.push((
                             format!("@{}/{}", res_type, res_name),
-                            usages.first().cloned().unwrap_or_default(),
+                            first.unwrap_or_default(),
                         ));
                     }
                 }

@@ -64,7 +64,7 @@ class VcsContractsTests(unittest.TestCase):
             with patch('vcs_contracts.exercise', side_effect=ToolError('synthetic interrupted source fixture')):
                 self.assertEqual(self.evaluate(feature)['verdict'], 'error')
         status = self.state.execute("SELECT status FROM coverage WHERE feature='search:rank-presets'").fetchone()[0]
-        self.assertEqual(status, 'pending')
+        self.assertEqual(status, 'implemented')
         for exercise in (vcs_contracts.exercise, vcs_contracts.exclusion_budget):
             with self.assertRaisesRegex(ToolError, 'inside repository'):
                 exercise(self.binary, self.root.parent.parent.parent.parent.parent)

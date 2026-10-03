@@ -49,6 +49,7 @@ import route_contracts
 import android_contracts
 import android_syntax_contracts
 import vcs_contracts
+import rank_contracts
 import stack_contracts
 import context_contracts
 import graph_contracts
@@ -244,7 +245,7 @@ class InvocationOracle:
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = vcs_contracts.FEATURES | INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | delegate_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = rank_contracts.FEATURES | vcs_contracts.FEATURES | INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | delegate_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -487,6 +488,7 @@ class Fixture:
         self._graph_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
+        self._rank_results = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_ROOT": str(root),
@@ -1701,6 +1703,17 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def rank_check(self, check: sqlite3.Row):
+        if self._rank_results is None:
+            expected, actual = rank_contracts.exercise(self.binary, self.database.parent)
+            for output, section in zip((expected, actual), rank_contracts.budget(self.binary, self.database.parent)):
+                output.update({'budget:' + key: value for key, value in section.items()})
+            self._rank_results = expected, actual
+        expected, actual = self._rank_results
+        return {'source': rank_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1736,6 +1749,8 @@ class Fixture:
                 handler = self.route_check
             if check['feature'] in vcs_contracts.FEATURES:
                 handler = self.vcs_check
+            if check['feature'] in rank_contracts.FEATURES:
+                handler = self.rank_check
             if check['feature'] in context_contracts.FEATURES:
                 handler = self.context_check
             if check['feature'] in unused_dep_contracts.FEATURES | {'unused-deps:target'}:
@@ -1830,7 +1845,6 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
     pending_contracts = {
         "global:scope-command-matrix": "Combined path filters and Java API/module/map/analysis/graph/conventions/explore scope contracts remain unresolved; root fixture covers navigation and text searches",
-        "search:rank-presets": vcs_contracts.PENDING_REASON,
         "deeplinks:non-java": "non-Java deeplink scopes require separate text/applicability contracts",
         "suppress:non-java": "Kotlin suppression scope requires a separate text/applicability contract",
         "inject:non-java": "Kotlin injection scope requires a separate syntax/applicability contract",
@@ -1855,7 +1869,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                (vcs_contracts.REASON if feature in vcs_contracts.FEATURES else
+                (rank_contracts.REASON if feature in rank_contracts.FEATURES else
+                 vcs_contracts.REASON if feature in vcs_contracts.FEATURES else
                  delegate_contracts.REASON if feature in delegate_contracts.FEATURES else
                  install_contracts.REASON if feature in install_contracts.FEATURES else
                  root_contracts.REASON if feature in root_contracts.FEATURES else
@@ -1947,6 +1962,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     android_contracts.plan_android(state, root)
     android_syntax_contracts.plan_syntax(state, root)
     vcs_contracts.plan_vcs(state, root)
+    rank_contracts.plan_rank(state, root)
     stack_contracts.plan_stacks(state, root)
     context_contracts.plan_context(state, root)
     graph_contracts.plan_graph(state, root)

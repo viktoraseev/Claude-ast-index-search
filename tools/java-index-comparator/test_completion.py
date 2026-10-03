@@ -185,7 +185,7 @@ class CompletionTests(unittest.TestCase):
                         'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle',
                         'graph:java-metrics', 'graph:java-top', 'graph:metrics-rendering',
                         'unused-deps:java-ownership', 'unused-deps:java-types', 'unused-deps:transitive',
-                        'unused-deps:semantic-resolution', 'unused-deps:target'):
+                        'unused-deps:semantic-resolution', 'unused-deps:android-ownership', 'unused-deps:target'):
             with self.subTest(feature=feature):
                 self.assertIn(feature, required_features())
                 self.mutate('DELETE FROM coverage WHERE feature=?', (feature,))

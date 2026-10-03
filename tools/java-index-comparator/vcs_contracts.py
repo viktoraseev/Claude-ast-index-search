@@ -18,9 +18,6 @@ FEATURES = {'changed', 'hotspots', 'search:rank-history'}
 REASON = ('independent source/state: disposable Java/Git committed diffs, authored history '
           'ledger, percentile/filter/page checks and internal CLI ranking fallback; not MCP equivalence')
 SORTS = ('score', 'commits', 'churn', 'relative-churn', 'fixes', 'authors', 'recent')
-PENDING_REASON = ('Graph-dependent ranking formulas, lineage/substance and bounded candidate '
-                  'pool ranking remain unresolved; search:rank-history covers history scoring, '
-                  'missing-signal fallback, test exclusion and page prefixes on disposable Java source')
 
 
 def plan_vcs(state, root):
@@ -32,8 +29,6 @@ def plan_vcs(state, root):
             subject = 'disposable-java-git'
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
-        state.execute("INSERT OR REPLACE INTO coverage VALUES (?,'pending',?)",
-                      ('search:rank-presets', PENDING_REASON))
 
 
 def source(package, name, value=0):
@@ -68,9 +63,9 @@ class History:
             raise ToolError('disposable Git command failed; no project payload emitted')
         return result.stdout.decode().strip()
 
-    def commit(self, changes, *, fix=False, author='One', rename=None):
+    def commit(self, changes, *, fix=False, author='One', rename=None, timestamp=None):
         self.commits += 1
-        timestamp = 1577836800 + 86400 * self.commits
+        timestamp = timestamp if timestamp is not None else 1577836800 + 86400 * self.commits
         self.runner.environment.update(GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL=author.lower() + '@example.invalid',
                                        GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL=author.lower() + '@example.invalid',
                                        GIT_AUTHOR_DATE=f'{timestamp} +0000', GIT_COMMITTER_DATE=f'{timestamp} +0000')

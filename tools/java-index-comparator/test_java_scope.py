@@ -25,7 +25,7 @@ class JavaScopeTests(unittest.TestCase):
             coverage = {row['feature']: row['status'] for row in states[1].execute('SELECT * FROM coverage')}
             self.assertTrue(all(coverage[feature] == 'out-of-scope' for feature in JAVA_EXCLUDED_FEATURES))
             self.assertEqual(coverage['module'], 'pending')
-            self.assertEqual(coverage['search:rank-presets'], 'pending')
+            self.assertEqual(coverage['search:rank-presets'], 'implemented')
             self.assertEqual(states[1].execute("SELECT count(*) FROM checks WHERE verdict='pass'").fetchone()[0], 0)
 
     def test_foreign_sources_do_not_become_absent_or_java_work(self):

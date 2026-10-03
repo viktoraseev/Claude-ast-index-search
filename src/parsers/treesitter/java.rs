@@ -20,6 +20,57 @@ pub static JAVA_PARSER: JavaParser = JavaParser;
 
 pub struct JavaParser;
 
+/// Read Java type substance from syntax, independently of body line span.
+pub(crate) fn type_body_emptiness(content: &str) -> Result<HashMap<(String, i64, i64), bool>> {
+    fn has_members(body: tree_sitter::Node<'_>) -> bool {
+        let mut cursor = body.walk();
+        let members = body
+            .named_children(&mut cursor)
+            .any(|child| match child.kind() {
+                "line_comment" | "block_comment" | "empty_declaration" => false,
+                "enum_body_declarations" => has_members(child),
+                _ => true,
+            });
+        members
+    }
+
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut bodies = HashMap::new();
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        if !matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) || node.has_error()
+        {
+            return super::WalkControl::Continue;
+        }
+        if let (Some(name), Some(body)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("body"),
+        ) {
+            // Record components create state/accessors even with an empty body.
+            let components = node.kind() == "record_declaration"
+                && node
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| has_members(parameters));
+            bodies.insert(
+                (
+                    node_text(content, &name).to_string(),
+                    node_line(&name) as i64,
+                    text_end_line(content, &node) as i64,
+                ),
+                !components && !has_members(body),
+            );
+        }
+        super::WalkControl::Continue
+    });
+    Ok(bodies)
+}
+
 /// Qualified import declarations, including static and wildcard imports.
 pub(crate) fn import_names(content: &str) -> Result<Vec<String>> {
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;

@@ -90,3 +90,24 @@ fn explicit_root_pins_markerless_java_source_and_rejects_invalid_boundaries() {
         "class TargetOnly {}\n"
     );
 }
+
+#[test]
+fn unknown_output_format_is_rejected_before_root_access_or_mutation() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let directory = tempfile::tempdir_in(artifacts).unwrap();
+    let missing = directory.path().join("missing-root");
+    for arguments in [
+        vec!["--format", "not-a-format", "version"],
+        vec!["rebuild", "--force", "--format", "not-a-format"],
+    ] {
+        let output = invoke(directory.path(), directory.path(), &missing, &arguments);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8(output.stderr).unwrap();
+        assert!(diagnostic.contains("invalid value") && diagnostic.contains("--format"));
+        assert!(!directory.path().join("cache").exists());
+        assert!(!directory.path().join("index.sqlite").exists());
+        assert!(!missing.exists());
+    }
+}

@@ -31,6 +31,7 @@ class ProbeBase {{}}
 
 
 class Runner:
+    output_budget = 1024 * 1024
     def __init__(self, binary, directory):
         self.binary, self.directory = Path(binary).resolve(), directory
         self.root = directory / 'project'
@@ -54,8 +55,8 @@ class Runner:
         if result.returncode not in acceptable:
             raise ToolError('disposable root command failed; see private fixture logs')
         with prefix.with_suffix('.stdout.log').open('rb') as stream:
-            output = stream.read(1024 * 1024 + 1)
-        if len(output) > 1024 * 1024:
+            output = stream.read(self.output_budget + 1)
+        if len(output) > self.output_budget:
             raise ToolError('root fixture output exceeded its budget')
         return result.returncode, output.decode('utf-8')
 
