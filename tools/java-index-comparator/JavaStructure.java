@@ -169,10 +169,14 @@ public class JavaStructure {
                     if (getCurrentPath().getParentPath().getLeaf() instanceof ClassTree owner
                         && (owner.getKind() != Tree.Kind.RECORD || tree.getModifiers().getFlags().contains(javax.lang.model.element.Modifier.STATIC))) {
                         String name = tree.getName().toString();
+                        // javac gives enum constants a synthetic type without
+                        // an end position, anchored at the identifier. With
+                        // arguments, NewClassTree starts at '(', not the name;
+                        // annotations may start VariableTree earlier still.
                         boolean constant = owner.getKind() == Tree.Kind.ENUM && tree.getInitializer() instanceof NewClassTree
-                            && source.substring(start(tree), end(tree)).stripLeading().startsWith(name);
+                            && end(tree.getType()) < 0;
                         emit(constant ? "constant" : "property", name,
-                            constant ? start(tree) : namePosition(tree, name, ""), end(tree));
+                            constant ? start(tree.getType()) : namePosition(tree, name, ""), end(tree));
                     }
                     return super.visitVariable(tree, unused);
                 }

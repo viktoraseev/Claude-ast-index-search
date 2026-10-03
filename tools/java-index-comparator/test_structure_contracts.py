@@ -9,9 +9,31 @@ from unittest.mock import Mock
 from audit import Fixture, SCHEMA
 from build_index import build_ast_index
 from common import connect
+from java_structure import structure_server
 
 
 class StructureContracts(unittest.TestCase):
+    def test_annotated_enum_constants_keep_identifier_anchors_and_ordinary_fields(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / 'Probe.java'
+            source.write_text('''enum Probe {
+    @Deprecated
+    FIRST(1),
+    @SuppressWarnings("unused") SECOND(2) { @Override int code() { return 2; } };
+    final int value;
+    static final Object helper = new Object();
+    Probe(int value) { this.value = value; }
+    int code() { return value; }
+}
+''')
+            entries = structure_server(directory).read(source)
+            constants = [(entry['name'], entry['line'], entry.get('qualified_name'))
+                         for entry in entries if entry['kind'] == 'constant']
+            self.assertEqual(constants, [('FIRST', 3, 'Probe.FIRST'), ('SECOND', 4, 'Probe.SECOND')])
+            fields = [(entry['name'], entry['line']) for entry in entries if entry['kind'] == 'property']
+            self.assertEqual(fields, [('value', 5), ('helper', 6)])
+
     def test_records_constructors_annotations_and_mutation_detection(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
