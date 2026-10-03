@@ -252,8 +252,28 @@ fn build_def_skip_pattern(function_name: &str) -> DefinitionPattern {
     DefinitionPattern { full, candidate }
 }
 
+/// Emit a bounded result page. Count describes returned matches, not an
+/// unbounded total that these early-terminating searches have not collected.
+fn print_search_json<T: serde::Serialize>(items: &[T]) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"items": items, "count": items.len()}))?
+    );
+    Ok(())
+}
+
+fn print_line_search_json(items: &[(String, usize, String)]) -> Result<()> {
+    let items: Vec<_> = items
+        .iter()
+        .map(|(path, line, content)| {
+            serde_json::json!({"path": path, "line": line, "content": content})
+        })
+        .collect();
+    print_search_json(&items)
+}
+
 /// Find TODO/FIXME/HACK comments
-pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
+pub fn cmd_todo(root: &Path, pattern: &str, limit: usize, format: &str) -> Result<()> {
     let search_pattern = format!(r"//.*({pattern})|#.*({pattern})");
 
     let mut todos: HashMap<String, Vec<(String, usize, String)>> = HashMap::new();
@@ -291,6 +311,25 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
             count += 1;
         },
     )?;
+
+    if format == "json" {
+        let mut items: Vec<_> = todos
+            .iter()
+            .flat_map(|(category, rows)| {
+                rows.iter().map(move |(path, line, content)| {
+                    serde_json::json!({"path": path, "line": line,
+                        "content": content, "category": category})
+                })
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            a["path"]
+                .as_str()
+                .cmp(&b["path"].as_str())
+                .then_with(|| a["line"].as_u64().cmp(&b["line"].as_u64()))
+        });
+        return print_search_json(&items);
+    }
 
     let total: usize = todos.values().map(|v| v.len()).sum();
     println!("{}", format!("Found {} comments:", total).bold());
@@ -900,7 +939,7 @@ fn find_containing_function(
 }
 
 /// Find Dagger @Provides/@Binds for a type
-pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
+pub fn cmd_provides(root: &Path, type_name: &str, limit: usize, format: &str) -> Result<()> {
     let results = super::annotation_functions::find(
         root,
         &["Provides", "Binds"],
@@ -909,6 +948,16 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
         true,
         limit,
     )?;
+    if format == "json" {
+        let items: Vec<_> = results
+            .iter()
+            .map(|item| {
+                serde_json::json!({"path": item.path, "line": item.line, "name": item.name,
+                    "content": item.signature.chars().take(100).collect::<String>()})
+            })
+            .collect();
+        return print_search_json(&items);
+    }
     println!(
         "{}",
         format!("Providers for '{}' ({}):", type_name, results.len()).bold()
@@ -996,7 +1045,7 @@ fn print_annotated_functions(
 }
 
 /// Find @Deprecated annotations
-pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize, format: &str) -> Result<()> {
     // Kotlin/Java/C#: @Deprecated/@Obsolete, Swift: @available(*, deprecated)
     // Python: @deprecated, Perl: DEPRECATED, Rust: #[deprecated], Go: // Deprecated:
     // JS/TS: @deprecated (JSDoc), PHP: @deprecated (PHPDoc), C++: [[deprecated]]
@@ -1025,6 +1074,9 @@ pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<
         },
     )?;
 
+    if format == "json" {
+        return print_line_search_json(&items);
+    }
     println!("{}", format!("@Deprecated items ({}):", items.len()).bold());
 
     for (path, line_num, content) in &items {
@@ -1036,7 +1088,7 @@ pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<
 }
 
 /// Find @Suppress annotations
-pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize, format: &str) -> Result<()> {
     let pattern =
         pattern_with_line_filter(r"@(?:[\w$]+:)?(?:[\w$]+\.)*Suppress(?:Warnings)?\b", query);
 
@@ -1060,6 +1112,9 @@ pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()
         },
     )?;
 
+    if format == "json" {
+        return print_line_search_json(&items);
+    }
     println!(
         "{}",
         format!("@Suppress annotations ({}):", items.len()).bold()
@@ -1076,7 +1131,7 @@ pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()
 /// Find @Inject/@Autowired points for a type: field/setter injection and
 /// constructor parameters (`class Foo @Inject constructor(bar: Bar)`), where
 /// the type usually sits several lines below the annotation.
-pub fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
+pub fn cmd_inject(root: &Path, type_name: &str, limit: usize, format: &str) -> Result<()> {
     let type_pattern = format!(r"\b{}\b", regex::escape(type_name));
     let type_re = Regex::new(&type_pattern)?;
 
@@ -1129,6 +1184,9 @@ pub fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
         }
     }
 
+    if format == "json" {
+        return print_line_search_json(&items);
+    }
     println!(
         "{}",
         format!("Injection points for '{}' ({}):", type_name, items.len()).bold()
@@ -1211,7 +1269,7 @@ fn matching_paren(content: &str, open: usize) -> Option<usize> {
 }
 
 /// Find uses of specific annotation
-pub fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()> {
+pub fn cmd_annotations(root: &Path, annotation: &str, limit: usize, format: &str) -> Result<()> {
     // Normalize annotation (add @ if missing for Java/Kotlin/Swift/ObjC)
     // For Perl, attributes are like :lvalue, :method
     let search_annotation = if annotation.starts_with('@') || annotation.starts_with(':') {
@@ -1235,6 +1293,9 @@ pub fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()
         },
     )?;
 
+    if format == "json" {
+        return print_line_search_json(&items);
+    }
     println!(
         "{}",
         format!("Classes with {} ({}):", search_annotation, items.len()).bold()
@@ -1249,7 +1310,7 @@ pub fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()
 }
 
 /// Find deeplink definitions
-pub fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+pub fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize, format: &str) -> Result<()> {
     // Search for specific deeplink patterns (NOT generic :// URLs)
     // Android: @DeepLink, DeepLinkHandler, @AppLink, NavDeepLink, intent-filter with android:scheme
     // iOS: openURL, application(_:open:, handleOpen, CFBundleURLSchemes, UniversalLink
@@ -1278,6 +1339,9 @@ pub fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<(
         },
     )?;
 
+    if format == "json" {
+        return print_line_search_json(&items);
+    }
     println!("{}", format!("Deeplinks ({}):", items.len()).bold());
 
     for (path, line_num, content) in &items {

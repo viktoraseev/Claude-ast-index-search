@@ -57,6 +57,7 @@ import explore_contracts
 import graph_contracts
 import unused_dep_contracts
 import java_dependency_contracts
+import format_contracts
 
 
 SCHEMA = """
@@ -499,6 +500,7 @@ class Fixture:
         self._explore_results = None
         self._unused_dep_results = None
         self._graph_results = None
+        self._format_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
         self._rank_results = None
@@ -1725,6 +1727,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def format_check(self, check: sqlite3.Row):
+        if self._format_results is None:
+            self._format_results = format_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._format_results)
+        return {'source': format_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def stack_check(self, check: sqlite3.Row):
         expected, actual = stack_contracts.exercise(self.binary, self.database.parent)
         return {'source': stack_contracts.REASON, 'samples': expected}, actual, \
@@ -1802,6 +1812,8 @@ class Fixture:
                 handler = self.java_dependency_check
             if check['feature'] in graph_contracts.FEATURES:
                 handler = self.graph_check
+            if check['feature'] in format_contracts.FEATURES:
+                handler = self.format_check
             if check['feature'] in stack_contracts.FEATURES:
                 handler = self.stack_check
             if check['feature'] in android_contracts.FEATURES:
@@ -1886,6 +1898,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(graph_contracts.FEATURES)
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
     features.update(java_dependency_contracts.FEATURES)
+    features.update(format_contracts.FEATURES)
     return features
 
 
@@ -2020,6 +2033,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     graph_contracts.plan_graph(state, root)
     unused_dep_contracts.plan_unused(state, root)
     java_dependency_contracts.plan_dependencies(state, root)
+    format_contracts.plan_formats(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

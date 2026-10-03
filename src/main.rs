@@ -1208,7 +1208,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         // Grep commands
-        Commands::Todo { pattern, limit } => commands::grep::cmd_todo(&root, &pattern, limit),
+        Commands::Todo { pattern, limit } => {
+            commands::grep::cmd_todo(&root, &pattern, limit, format)
+        }
         Commands::Callers {
             function_name,
             limit,
@@ -1221,7 +1223,7 @@ fn main() -> Result<()> {
             in_file,
         } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit, in_file.as_deref()),
         Commands::Provides { type_name, limit } => {
-            commands::grep::cmd_provides(&root, &type_name, limit)
+            commands::grep::cmd_provides(&root, &type_name, limit, format)
         }
         Commands::Suspend { query, limit } => {
             commands::grep::cmd_suspend(&root, query.as_deref(), limit)
@@ -1230,19 +1232,19 @@ fn main() -> Result<()> {
             commands::grep::cmd_composables(&root, query.as_deref(), limit)
         }
         Commands::Deprecated { query, limit } => {
-            commands::grep::cmd_deprecated(&root, query.as_deref(), limit)
+            commands::grep::cmd_deprecated(&root, query.as_deref(), limit, format)
         }
         Commands::Suppress { query, limit } => {
-            commands::grep::cmd_suppress(&root, query.as_deref(), limit)
+            commands::grep::cmd_suppress(&root, query.as_deref(), limit, format)
         }
         Commands::Inject { type_name, limit } => {
-            commands::grep::cmd_inject(&root, &type_name, limit)
+            commands::grep::cmd_inject(&root, &type_name, limit, format)
         }
         Commands::Annotations { annotation, limit } => {
-            commands::grep::cmd_annotations(&root, &annotation, limit)
+            commands::grep::cmd_annotations(&root, &annotation, limit, format)
         }
         Commands::Deeplinks { query, limit } => {
-            commands::grep::cmd_deeplinks(&root, query.as_deref(), limit)
+            commands::grep::cmd_deeplinks(&root, query.as_deref(), limit, format)
         }
         Commands::Extensions {
             receiver_type,

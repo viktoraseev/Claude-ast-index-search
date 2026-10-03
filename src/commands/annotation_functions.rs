@@ -28,15 +28,14 @@ pub(super) fn find(
     let mut files = BTreeSet::new();
     // No candidate limit: a matching declaration can follow arbitrarily many
     // unrelated annotations, and limiting the anchors loses valid results.
-    super::search_files_in(
-        root,
-        &[root.to_path_buf()],
-        &pattern[1..],
-        extensions,
-        |path, _, _| {
-            files.insert(path.to_path_buf());
-        },
-    )?;
+    let roots = if providers {
+        super::project_search_roots(root)?
+    } else {
+        vec![root.to_path_buf()]
+    };
+    super::search_files_in(root, &roots, &pattern[1..], extensions, |path, _, _| {
+        files.insert(path.to_path_buf());
+    })?;
     let mut results = BTreeMap::new();
     for path in files {
         let source = std::fs::read_to_string(&path)?;

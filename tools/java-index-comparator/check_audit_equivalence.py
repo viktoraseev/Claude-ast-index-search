@@ -50,12 +50,28 @@ def compare(reference_path, evidence_path, output_path):
             report.execute('INSERT OR REPLACE INTO equivalence_issues VALUES (?,?,?)',
                            (category, identity, canonical_json(detail or {})))
 
-        originals, present = 0, 0
+        # The Java driver deliberately leaves outline unobserved while another
+        # coverage family is pending. Such a baseline still defines case IDs,
+        # but has no outline verdict/truth to preserve. Never generalize this
+        # exception to partial execution, recorded failures or other features.
+        deferred_outline_baseline = (before.get('audit_scope') == 'java'
+            and reference.execute("SELECT 1 FROM coverage WHERE status='pending' LIMIT 1").fetchone() is not None
+            and reference.execute("""SELECT 1 FROM checks
+                WHERE NOT (feature='outline' OR feature GLOB 'outline:*')
+                  AND (status!='complete' OR verdict IS NOT 'pass') LIMIT 1""").fetchone() is None)
+        implemented_outline = {row[0] for row in reference.execute("""SELECT feature FROM coverage
+            WHERE status='implemented' AND (feature='outline' OR feature GLOB 'outline:*')""")}
+        originals, present, deferred_outlines = 0, 0, 0
         for row in current.execute('''SELECT r.id,r.feature,r.subject,r.status AS prior_status,r.verdict AS prior_verdict,
+            r.expected_json IS NULL AS unobserved_expected,r.actual_json IS NULL AS unobserved_actual,
             c.id AS current_id,c.feature AS current_feature,c.subject AS current_subject,c.status,c.verdict
             FROM reference.checks r LEFT JOIN main.checks c ON c.id=r.id ORDER BY r.id'''):
             originals += 1
-            if row['prior_status'] != 'complete':
+            deferred = (deferred_outline_baseline and row['feature'] in implemented_outline
+                        and row['prior_status'] == 'pending' and row['prior_verdict'] is None
+                        and row['unobserved_expected'] and row['unobserved_actual'])
+            deferred_outlines += int(deferred)
+            if row['prior_status'] != 'complete' and not deferred:
                 issue('incomplete_reference', row['id'])
             if row['current_id'] is None:
                 issue('missing_case', row['id'])
@@ -69,6 +85,8 @@ def compare(reference_path, evidence_path, output_path):
                 issue('unsupported_case', row['id'], {'verdict': row['verdict']})
             elif row['prior_verdict'] == 'pass' and row['verdict'] != 'pass':
                 issue('regressed_verdict', row['id'], {'verdict': row['verdict']})
+            elif deferred and row['verdict'] != 'pass':
+                issue('unresolved_deferred_outline', row['id'], {'verdict': row['verdict']})
             if originals % 250 == 0:
                 report.commit()
         for row in current.execute('''SELECT r.feature,c.status FROM reference.coverage r
@@ -98,6 +116,7 @@ def compare(reference_path, evidence_path, output_path):
         problems = dict(report.execute('SELECT category,count(*) FROM equivalence_issues GROUP BY category'))
         remaining = current.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0]
         result = {'original_cases': originals, 'present_cases': present,
+                  'deferred_reference_outline_cases': deferred_outlines,
                   'additional_cases': current.execute('''SELECT count(*) FROM main.checks c
                     LEFT JOIN reference.checks r ON r.id=c.id WHERE r.id IS NULL''').fetchone()[0],
                   'text_truth_cases': text_cases, 'issues': problems, 'remaining_checks': remaining,
