@@ -66,7 +66,7 @@ class AdapterDigestTests(unittest.TestCase):
     def test_owned_mutation_contract_changes_invalidate_evidence(self):
         previous = adapter_digest()
         read = Path.read_bytes
-        for name in ('install_contracts.py', 'root_contracts.py'):
+        for name in ('install_contracts.py', 'root_contracts.py', 'profile_contracts.py'):
             with self.subTest(contract=name):
                 def changed(path):
                     content = read(path)

@@ -2360,6 +2360,7 @@ fn has_project_root_marker(path: &Path) -> bool {
         || path.join(".arc").join("HEAD").exists()
         || path.join("settings.gradle").exists()
         || path.join("settings.gradle.kts").exists()
+        || path.join("pom.xml").is_file()
         || path.join("Package.swift").exists()
         || path.join("pubspec.yaml").exists()
         || path.join("Cargo.toml").exists()

@@ -1356,7 +1356,7 @@ fn find_ast_grep_binary() -> Option<String> {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok()
+            .is_ok_and(|status| status.success())
         {
             return Some(name.to_string());
         }

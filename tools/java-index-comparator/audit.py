@@ -43,6 +43,8 @@ import lifecycle_contracts
 import root_contracts
 import module_contracts
 import install_contracts
+import profile_contracts
+import delegate_contracts
 
 
 SCHEMA = """
@@ -234,7 +236,7 @@ class InvocationOracle:
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | delegate_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -1600,6 +1602,19 @@ class Fixture:
             self._inventory_ready = True
         return module_contracts.verify(self, check['feature'])
 
+    def profile_check(self, check: sqlite3.Row):
+        if not self._inventory_ready:
+            mobile_contracts.inventory(self.state, self.root)
+            self._inventory_ready = True
+        return profile_contracts.verify(self, check['feature'])
+
+    def delegate_check(self, check: sqlite3.Row):
+        expected, actual = (section[check['feature']] for section in
+                            delegate_contracts.exercise(self.binary, self.database.parent))
+        return {'source': delegate_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1625,8 +1640,12 @@ class Fixture:
                 handler = self.root_check
             if check['feature'] in install_contracts.FEATURES:
                 handler = self.install_check
+            if check['feature'] in delegate_contracts.FEATURES:
+                handler = self.delegate_check
             if check['feature'] in module_contracts.FEATURES:
                 handler = self.module_check
+            if check['feature'] in profile_contracts.FEATURES:
+                handler = self.profile_check
             if check['feature'] == 'api':
                 handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
@@ -1691,7 +1710,8 @@ def required_features(help_text: str = '') -> set[str]:
     if not {"class", "symbol", "file"}.issubset(features):
         raise Unsupported("cannot enumerate required CLI commands")
     features.update({"global:format", "global:walk-up", "global:subtree", "global:local",
-                     "global:scope-command-matrix"})
+                     "global:scope-command-matrix", "search:rank-presets",
+                     "module-route:budgets", "detect-stacks:composition-budgets"})
     features.update(LIVE_FEATURES)
     return features
 
@@ -1727,7 +1747,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                (install_contracts.REASON if feature in install_contracts.FEATURES else
+                (delegate_contracts.REASON if feature in delegate_contracts.FEATURES else
+                 install_contracts.REASON if feature in install_contracts.FEATURES else
                  root_contracts.REASON if feature in root_contracts.FEATURES else
                  lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
                  "internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
@@ -1796,7 +1817,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
-        for feature in sorted(lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES):
+        for feature in sorted(lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | delegate_contracts.FEATURES):
             subject = 'disposable-fixture'
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
@@ -1812,6 +1833,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         perl_contracts.plan_perl(state, root)
     annotation_contracts.plan_annotations(state, root)
     module_contracts.plan_modules(state, root)
+    profile_contracts.plan_profiles(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -126,6 +127,22 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(metadata["original_evidence"], str(self.evidence))
         finally:
             state.close()
+
+    def test_changed_descriptor_fails_before_build_even_with_preserved_stat(self):
+        from mobile_contracts import inventory_snapshot
+        path = self.root / 'pom.xml'
+        path.write_text('<project><artifactId>one</artifactId></project>\n')
+        with self.source:
+            self.source.execute("INSERT INTO metadata VALUES ('inventory_sha256',?)",
+                                (inventory_snapshot(self.root),))
+        stamp = path.stat()
+        path.write_text('<project><artifactId>two</artifactId></project>\n')
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.assertEqual(path.stat().st_size, stamp.st_size)
+        with patch('replay.build_ast_index') as build:
+            with self.assertRaisesRegex(ToolError, 'inventory differs'):
+                replay(self.evidence, self.root, self.binary, self.directory / 'replays')
+            build.assert_not_called()
 
 
 if __name__ == "__main__":

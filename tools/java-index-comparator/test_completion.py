@@ -1,4 +1,5 @@
 """Final readiness rejects stale, partial, scope-reduced and shape-only proof."""
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -66,6 +67,32 @@ class CompletionTests(unittest.TestCase):
         (self.root / 'Example.java').write_text('class Changed {}')
         with self.assertRaises(StaleEvidence):
             self.check()
+
+    def test_same_size_and_mtime_descriptor_edit_invalidates_actual_final_gate(self):
+        path = self.root / 'pom.xml'
+        path.write_text('<project><artifactId>one</artifactId></project>\n')
+        self.mutate('UPDATE metadata SET value=? WHERE key=?',
+                    (inventory_snapshot(self.root), 'inventory_sha256'))
+        self.assertTrue(self.check()['verified'])
+        stamp = path.stat()
+        path.write_text('<project><artifactId>two</artifactId></project>\n')
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        self.assertEqual(path.stat().st_size, stamp.st_size)
+        self.assertEqual(path.stat().st_mtime_ns, stamp.st_mtime_ns)
+        with self.assertRaises(StaleEvidence):
+            self.check()
+
+    def test_known_pending_subcontracts_cannot_disappear_from_final_proof(self):
+        for feature in ('module-route:budgets', 'detect-stacks:composition-budgets'):
+            with self.subTest(feature=feature):
+                self.assertIn(feature, required_features())
+                self.mutate('DELETE FROM coverage WHERE feature=?', (feature,))
+                self.mutate('DELETE FROM checks WHERE feature=?', (feature,))
+                with self.assertRaisesRegex(ToolError, 'omits required'):
+                    self.check()
+                self.mutate("INSERT INTO coverage VALUES (?,'implemented','synthetic gate input')", (feature,))
+                self.mutate("INSERT INTO checks(id,feature,subject,status,verdict) VALUES (?,?,?,'complete','pass')",
+                            (feature, feature, 'synthetic-input'))
 
     def test_unfinished_failure_error_unsupported_and_null_verdict_never_pass(self):
         for status, verdict in (('pending', None), ('running', None), ('complete', 'fail'),

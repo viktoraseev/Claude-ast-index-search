@@ -4293,6 +4293,21 @@ impl Drop for RebuildSwap {
     }
 }
 
+/// Indexed Java source scope for source-based project profiling.
+pub fn visit_java_profile_files(
+    conn: &Connection,
+    mut visit: impl FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT path, root_path FROM files WHERE substr(path,-5)='.java' ORDER BY root_path,path",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        visit(&row.get::<_, String>(0)?, &row.get::<_, String>(1)?)?;
+    }
+    Ok(())
+}
+
 fn create_base_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"

@@ -276,7 +276,11 @@ public class JavaStructure {
                     return super.visitAnnotation(tree, unused);
                 }
             }.scan(unit, null);
-            return "{\"entries\":[" + String.join(",", entries) + "]}";
+            List<String> imports = new ArrayList<>();
+            for (ImportTree declaration : unit.getImports())
+                imports.add(quote(declaration.getQualifiedIdentifier().toString()));
+            return "{\"entries\":[" + String.join(",", entries)
+                + "],\"imports\":[" + String.join(",", imports) + "]}";
         }
     }
 

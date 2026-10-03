@@ -31,7 +31,7 @@ class JavaStructure:
                                         stderr=subprocess.DEVNULL, text=True)
         atexit.register(self.close)
 
-    def read(self, path: Path):
+    def read(self, path: Path, *, document=False):
         if '\n' in str(path):
             raise ToolError('Java structure path contains a newline')
         self.process.stdin.write(str(path) + '\n')
@@ -47,7 +47,7 @@ class JavaStructure:
         value = json.loads(response)
         if 'error' in value:
             raise ToolError(value['error'])
-        return value['entries']
+        return value if document else value['entries']
 
     def close(self):
         atexit.unregister(self.close)

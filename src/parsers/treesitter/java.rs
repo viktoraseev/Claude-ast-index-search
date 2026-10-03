@@ -20,6 +20,29 @@ pub static JAVA_PARSER: JavaParser = JavaParser;
 
 pub struct JavaParser;
 
+/// Qualified import declarations, including static and wildcard imports.
+pub(crate) fn import_names(content: &str) -> Result<Vec<String>> {
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut imports = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for declaration in tree.root_node().named_children(&mut cursor) {
+        if declaration.kind() != "import_declaration" {
+            continue;
+        }
+        let mut parts = Vec::new();
+        super::walk_tree_preorder(&declaration, |node| {
+            if node.kind() == "identifier" || node.kind() == "asterisk" {
+                parts.push(node_text(content, &node));
+            }
+            super::WalkControl::Continue
+        });
+        if !parts.is_empty() {
+            imports.push(parts.join("."));
+        }
+    }
+    Ok(imports)
+}
+
 /// Source locations of externally public Java declarations, including implicit members.
 pub(crate) fn public_api_lines(content: &str) -> Result<Vec<usize>> {
     fn collect(

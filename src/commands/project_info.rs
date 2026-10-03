@@ -707,14 +707,15 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
     {
         let mut stmt = conn.prepare(
             r#"
-            SELECT COUNT(*) FROM symbols
+            SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id
             WHERE kind IN ('class','interface','struct','enum','object','protocol','trait','actor')
-              AND name LIKE ?1
+              AND ((substr(f.path,-5)='.java' AND substr(s.name,-length(?2))=?2)
+                OR (substr(f.path,-5)!='.java' AND s.name LIKE ?1))
             "#,
         )?;
         for &suffix in NAMING_SUFFIXES {
             let pattern = format!("%{}", suffix);
-            let count: i64 = stmt.query_row(params![pattern], |row| row.get(0))?;
+            let count: i64 = stmt.query_row(params![pattern, suffix], |row| row.get(0))?;
             if count >= 3 {
                 naming.push(NamingPattern {
                     suffix: suffix.to_string(),
@@ -723,7 +724,7 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
             }
         }
     }
-    naming.sort_by(|a, b| b.count.cmp(&a.count));
+    naming.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.suffix.cmp(&b.suffix)));
 
     // B. Frameworks — from refs WHERE context LIKE 'import%'
     let mut fw_map: HashMap<String, HashMap<String, i64>> = HashMap::new();
@@ -731,9 +732,11 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
         let mut stmt = conn.prepare(
             r#"
             SELECT name, COUNT(*) as cnt FROM (
-                SELECT name FROM refs WHERE context LIKE 'import%'
+                SELECT r.name FROM refs r JOIN files f ON f.id=r.file_id
+                WHERE r.context LIKE 'import%' AND substr(f.path,-5)!='.java'
                 UNION ALL
-                SELECT name FROM symbols WHERE kind = 'import'
+                SELECT s.name FROM symbols s JOIN files f ON f.id=s.file_id
+                WHERE s.kind = 'import' AND substr(f.path,-5)!='.java'
             )
             GROUP BY name
             "#,
@@ -755,6 +758,35 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
         }
     }
 
+    // Navigation imports use short names and omit wildcards. Framework
+    // detection needs the actual package, once per import declaration.
+    let resolver = super::PathResolver::try_from_conn(root, &conn)?;
+    db::visit_java_profile_files(&conn, |path, root_path| {
+        let source_path = root.join(resolver.resolve_with_root_raw(path, Some(root_path)));
+        use std::io::Read;
+        let mut source = String::new();
+        std::fs::File::open(source_path)?
+            .take(4 * 1024 * 1024 + 1)
+            .read_to_string(&mut source)?;
+        anyhow::ensure!(
+            source.len() <= 4 * 1024 * 1024,
+            "Java profiling source exceeds size limit"
+        );
+        for import_name in crate::parsers::treesitter::java::import_names(&source)? {
+            for &(prefix, category, display) in FRAMEWORK_RULES {
+                if import_matches_rule(&import_name, prefix) {
+                    *fw_map
+                        .entry(category.to_string())
+                        .or_default()
+                        .entry(display.to_string())
+                        .or_insert(0) += 1;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })?;
+
     // Convert to sorted output
     let mut frameworks: HashMap<String, Vec<FrameworkHit>> = HashMap::new();
     for (cat, hits) in &fw_map {
@@ -765,31 +797,31 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
                 count,
             })
             .collect();
-        sorted.sort_by(|a, b| b.count.cmp(&a.count));
+        sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
         frameworks.insert(cat.clone(), sorted);
     }
 
     // C. Architecture detection from file paths
     let mut arch: Vec<String> = Vec::new();
     {
-        let mut path_stmt = conn.prepare("SELECT path FROM files LIMIT 50000")?;
-        let paths: Vec<String> = path_stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        let lower_paths: Vec<String> = paths
-            .iter()
-            .map(|p| format!("/{}/", p.to_lowercase()))
-            .collect();
+        let mut path_stmt = conn.prepare("SELECT path FROM files")?;
+        let mut found = std::collections::HashSet::new();
+        for path in path_stmt.query_map([], |row| row.get::<_, String>(0))? {
+            let path = format!("/{}/", path?.to_lowercase());
+            for &(markers, _) in ARCH_PATTERNS {
+                for marker in markers {
+                    if path.contains(marker) {
+                        found.insert(*marker);
+                    }
+                }
+            }
+        }
 
         for &(markers, label) in ARCH_PATTERNS {
             if arch.contains(&label.to_string()) {
                 continue;
             }
-            let all_found = markers
-                .iter()
-                .all(|marker| lower_paths.iter().any(|p| p.contains(marker)));
+            let all_found = markers.iter().all(|marker| found.contains(marker));
             if all_found {
                 arch.push(label.to_string());
             }

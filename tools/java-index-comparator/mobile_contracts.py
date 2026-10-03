@@ -24,9 +24,11 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS file_inventory(
     size INTEGER NOT NULL, modified INTEGER NOT NULL, sha256 TEXT NOT NULL
 );'''
 
-# Fingerprint every source type used by a lexical contract, including Perl
-# files that are not in the Java navigation snapshot.
-LEXICAL_EXTENSIONS = {'.kt', '.kts', '.swift', '.pm', '.pl', '.pod', '.t'}
+# Auxiliary Java descriptors are not in the Java navigation snapshot either.
+# Content hashes prevent reusing evidence after a same-size/mtime edit.
+LEXICAL_EXTENSIONS = {'.kt', '.kts', '.swift', '.pm', '.pl', '.pod', '.t', '.xml'}
+JAVA_BUILD_DESCRIPTORS = {'pom.xml', 'build.gradle', 'build.gradle.kts',
+                          'settings.gradle', 'settings.gradle.kts', 'ya.make'}
 
 
 def inventory_rows(root):
@@ -42,7 +44,7 @@ def inventory_rows(root):
             kind = 'link-directory' if name in names else 'link-file' if path.is_symlink() else 'file'
             extension = path.suffix.lower()
             fingerprint = (os.readlink(path) if path.is_symlink() else
-                           file_sha256(path) if extension in LEXICAL_EXTENSIONS else '')
+                           file_sha256(path) if extension in LEXICAL_EXTENSIONS or name in JAVA_BUILD_DESCRIPTORS else '')
             yield (path.relative_to(root).as_posix(), extension, kind,
                    stat.st_size, stat.st_mtime_ns, fingerprint)
 
