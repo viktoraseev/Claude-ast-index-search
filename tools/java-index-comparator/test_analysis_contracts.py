@@ -12,7 +12,9 @@ from common import connect
 
 class AnalysisContracts(unittest.TestCase):
     def test_missing_contracts_execute_cli_and_reject_wrong_results(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts' / 'tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=artifacts) as temporary:
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()
@@ -42,6 +44,9 @@ class AnalysisContracts(unittest.TestCase):
                 with patch.object(fixture, 'cli', return_value=[]):
                     fixture.evaluate(check)
                 self.assertEqual(state.execute('SELECT verdict FROM checks WHERE id=?', (check['id'],)).fetchone()[0], 'fail')
+                # The Maven family now has source contracts; unsupported Java
+                # Gradle models must still remain pending.
+                (root / 'build.gradle').write_text("plugins { id 'java' }\n")
                 plan(state, [{'path': 'Example.java'}], '  class  Classes\n  symbol  Symbols\n  file  Files', [], root)
                 reasons = dict(state.execute('SELECT feature,reason FROM coverage'))
                 for feature in ('unused-symbols', 'version', 'list-roots', 'subtree:list'):

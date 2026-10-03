@@ -32,7 +32,9 @@ pub fn cmd_module(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
     let conn = db::open_db_leased(root)?;
 
-    let mut stmt = conn.prepare("SELECT name, path FROM modules WHERE name LIKE ?1 LIMIT ?2")?;
+    let mut stmt = conn.prepare(
+        "SELECT name, path FROM modules WHERE name LIKE ?1 ORDER BY name, path LIMIT ?2",
+    )?;
     let pattern = format!("%{}%", pattern);
     let modules: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![pattern, limit as i64], |row| {
@@ -66,7 +68,9 @@ pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     let conn = db::open_db_leased(root)?;
 
     // Check if module deps are indexed
-    if db::count_module_deps(&conn)? == 0 {
+    if db::count_module_deps(&conn)? == 0
+        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
+    {
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
@@ -133,7 +137,9 @@ pub fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     let conn = db::open_db_leased(root)?;
 
     // Check if module deps are indexed
-    if db::count_module_deps(&conn)? == 0 {
+    if db::count_module_deps(&conn)? == 0
+        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
+    {
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
@@ -207,7 +213,9 @@ pub fn cmd_unused_deps(
     let conn = db::open_db_leased(root)?;
 
     // Check if module deps are indexed
-    if db::count_module_deps(&conn)? == 0 {
+    if db::count_module_deps(&conn)? == 0
+        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
+    {
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' first.".yellow()
@@ -1411,7 +1419,9 @@ pub fn cmd_module_route(
     let conn = db::open_db_leased(root)?;
 
     // Check module_deps populated.
-    if db::count_module_deps(&conn)? == 0 {
+    if db::count_module_deps(&conn)? == 0
+        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
+    {
         let msg = "Module dependencies not indexed. Run 'ast-index rebuild'.";
         if format == "json" {
             let result = ModuleRouteResult {

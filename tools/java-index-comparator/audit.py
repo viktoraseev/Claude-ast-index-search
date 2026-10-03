@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import fcntl
 import fnmatch
 from functools import lru_cache
 import json
-from itertools import islice
 import os
 from pathlib import Path
 import re
@@ -42,6 +41,8 @@ import annotation_contracts
 import text_snapshot
 import lifecycle_contracts
 import root_contracts
+import module_contracts
+import install_contracts
 
 
 SCHEMA = """
@@ -167,37 +168,65 @@ class InvocationOracle:
             raise ToolError('prefetch requires a read-only tool and 1..4 workers')
         if getattr(self.client, 'parallel_safe', False) is not True:
             workers = 1
-        iterator = iter(requests)
         started = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            while chunk := list(islice(iterator, workers)):
-                missing = {}
-                for arguments in chunk:
-                    if 'cursor' in arguments:
-                        raise ToolError('cursor pages cannot be prefetched or reused')
-                    key = stable_id({'tool': tool, 'arguments': arguments})
-                    if self.memory.get(key) is None and not self.state.execute('SELECT 1 FROM oracle_cache WHERE request_key=?', (key,)).fetchone():
-                        missing[key] = arguments
-                if workers == 1:
-                    for arguments in missing.values():
-                        response = self.call(tool, arguments)
-                        if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
-                            raise Unsupported('MCP prefetch snapshot is stale or truncated')
-                    continue
-                futures = {executor.submit(self._network_call, tool, arguments): (key, arguments)
-                           for key, arguments in missing.items()}
+
+        def uncached():
+            for arguments in requests:
+                if 'cursor' in arguments:
+                    raise ToolError('cursor pages cannot be prefetched or reused')
+                key = stable_id({'tool': tool, 'arguments': arguments})
+                if self.memory.get(key) is None and not self.state.execute('SELECT 1 FROM oracle_cache WHERE request_key=?', (key,)).fetchone():
+                    yield key, arguments
+
+        if workers == 1:
+            for _, arguments in uncached():
+                response = self.call(tool, arguments)
+                if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
+                    raise Unsupported('MCP prefetch snapshot is stale or truncated')
+        else:
+            iterator = iter(uncached())
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures, pending_keys = {}, set()
                 first_error = None
-                for future in as_completed(futures):
-                    key, arguments = futures[future]
-                    try:
-                        network_reply = future.result()
-                    except McpRemoteError as error:
-                        self._capture_failure(tool, arguments, error)
-                        first_error = first_error or error
-                        continue
-                    response = self._capture_reply(tool, arguments, network_reply, key)
-                    if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
-                        raise Unsupported('MCP prefetch snapshot is stale or truncated')
+
+                def refill():
+                    # Consume lazily, with at most `workers` requests retained.
+                    # A slow peer never prevents an idle worker taking work.
+                    nonlocal first_error
+                    while len(futures) < workers:
+                        try:
+                            key, arguments = next(iterator)
+                        except StopIteration:
+                            break
+                        except ToolError as error:
+                            first_error = first_error or error
+                            break
+                        if key not in pending_keys:
+                            futures[executor.submit(self._network_call, tool, arguments)] = key, arguments
+                            pending_keys.add(key)
+
+                refill()
+                while futures:
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        key, arguments = futures.pop(future)
+                        pending_keys.remove(key)
+                        try:
+                            network_reply = future.result()
+                        except McpRemoteError as error:
+                            self._capture_failure(tool, arguments, error)
+                            first_error = first_error or error
+                            continue
+                        except (ToolError, OSError, subprocess.TimeoutExpired) as error:
+                            first_error = first_error or error
+                            continue
+                        response = self._capture_reply(tool, arguments, network_reply, key)
+                        if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
+                            first_error = first_error or Unsupported('MCP prefetch snapshot is stale or truncated')
+                    # On an error, stop scheduling, but drain the bounded set
+                    # already in flight and durably capture all its outcomes.
+                    if first_error is None:
+                        refill()
                 if first_error is not None:
                     raise first_error
         self.metrics.record('oracle.prefetch_wall', time.perf_counter() - started)
@@ -205,7 +234,7 @@ class InvocationOracle:
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -439,6 +468,8 @@ class Fixture:
         self._lifecycle_error = None
         self._root_results = None
         self._root_error = None
+        self._install_results = None
+        self._install_error = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
@@ -1549,6 +1580,26 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def install_check(self, check: sqlite3.Row):
+        if self._install_error is not None:
+            raise self._install_error
+        if self._install_results is None:
+            try:
+                self._install_results = install_contracts.exercise(self.binary, self.database.parent)
+            except (ToolError, OSError, subprocess.TimeoutExpired) as error:
+                self._install_error = error
+                raise
+        expected, actual = (section[check['feature']] for section in self._install_results)
+        return {'source': install_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
+    def module_check(self, check: sqlite3.Row):
+        if not self._inventory_ready:
+            mobile_contracts.inventory(self.state, self.root)
+            self._inventory_ready = True
+        return module_contracts.verify(self, check['feature'])
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1572,6 +1623,10 @@ class Fixture:
                 handler = self.lifecycle_check
             if check['feature'] in root_contracts.FEATURES:
                 handler = self.root_check
+            if check['feature'] in install_contracts.FEATURES:
+                handler = self.install_check
+            if check['feature'] in module_contracts.FEATURES:
+                handler = self.module_check
             if check['feature'] == 'api':
                 handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
@@ -1672,7 +1727,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                (root_contracts.REASON if feature in root_contracts.FEATURES else
+                (install_contracts.REASON if feature in install_contracts.FEATURES else
+                 root_contracts.REASON if feature in root_contracts.FEATURES else
                  lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
                  "internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
                  "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
@@ -1740,7 +1796,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
-        for feature in sorted(lifecycle_contracts.FEATURES | root_contracts.FEATURES):
+        for feature in sorted(lifecycle_contracts.FEATURES | root_contracts.FEATURES | install_contracts.FEATURES):
             subject = 'disposable-fixture'
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
@@ -1755,6 +1811,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
         mobile_contracts.plan_mobile(state, root)
         perl_contracts.plan_perl(state, root)
     annotation_contracts.plan_annotations(state, root)
+    module_contracts.plan_modules(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

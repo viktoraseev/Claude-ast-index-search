@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -72,6 +73,34 @@ class OracleFailureTests(unittest.TestCase):
         self.assertEqual(row['verdict'], 'error')
         self.assertNotIn('SYNTHETIC_PRIVATE_DIAGNOSTIC', row['error'])
         self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_failures').fetchone()[0], 1)
+
+    def test_streamed_prefetch_stops_refilling_on_error_and_keeps_inflight_success(self):
+        captured = threading.Event()
+        client = Mock()
+        client.parallel_safe = True
+
+        def reply(tool, arguments):
+            if arguments['query'] == 'Failure':
+                raise self.error
+            self.assertTrue(captured.wait(timeout=2))
+            return {'classes': []}
+
+        client.call.side_effect = reply
+        oracle = InvocationOracle(client, self.state)
+        original_capture = oracle._capture_failure
+
+        def capture(*arguments):
+            original_capture(*arguments)
+            captured.set()
+
+        with patch.object(oracle, '_capture_failure', side_effect=capture):
+            with self.assertRaises(McpRemoteError):
+                oracle.prefetch('ide_find_class', ({'query': name} for name in
+                    ('Failure', 'InflightSuccess', 'MustNotStart')), workers=2)
+        self.assertEqual(client.call.call_count, 2)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_failures').fetchone()[0], 1)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0], 1)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_cache').fetchone()[0], 1)
 
 
 if __name__ == '__main__':

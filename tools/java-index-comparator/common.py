@@ -60,7 +60,7 @@ def adapter_digest() -> str:
     """Invalidate checkpoints when execution or normalization code changes."""
     directory = Path(__file__).parent
     return stable_id({name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-                      for name in ("audit.py", "common.py", "oracle_store.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java", "mobile_contracts.py", "perl_contracts.py", "annotation_contracts.py", "text_snapshot.py", "lifecycle_contracts.py", "root_contracts.py")})
+                      for name in ("audit.py", "common.py", "oracle_store.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java", "mobile_contracts.py", "perl_contracts.py", "annotation_contracts.py", "text_snapshot.py", "lifecycle_contracts.py", "root_contracts.py", "module_contracts.py", "install_contracts.py")})
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:

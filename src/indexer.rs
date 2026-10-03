@@ -14,6 +14,7 @@ use crate::db;
 use crate::minified;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
+mod maven_manifest;
 /// File-size cap for parsing. Larger files are recorded in the `files`
 /// table (so `update` still tracks their mtime) but never parsed — their
 /// symbol contribution is 0. This prevents pathological RAM peaks on
@@ -3076,24 +3077,17 @@ pub fn index_modules_from_files(
                         .to_string();
 
                     if let Ok(content) = fs::read_to_string(path) {
-                        static ARTIFACT_RE: LazyLock<Regex> = LazyLock::new(|| {
-                            Regex::new(r"<artifactId>\s*([^<]+?)\s*</artifactId>").unwrap()
-                        });
-                        let artifact_re = &*ARTIFACT_RE;
-                        if let Some(caps) = artifact_re.captures(&content) {
-                            let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            if !artifact_id.is_empty() {
-                                let module_name = if module_path.is_empty() {
-                                    artifact_id.to_string()
-                                } else {
-                                    module_path.replace('/', ".")
-                                };
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
-                                    rusqlite::params![module_name, module_path],
-                                )?;
-                                count += 1;
-                            }
+                        if let Some(manifest) = maven_manifest::parse(&content) {
+                            let module_name = if module_path.is_empty() {
+                                manifest.artifact
+                            } else {
+                                module_path.replace('/', ".")
+                            };
+                            conn.execute(
+                                "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                                rusqlite::params![module_name, module_path],
+                            )?;
+                            count += 1;
                         }
                     }
                 }
@@ -3593,14 +3587,37 @@ pub fn index_module_dependencies(
             "INSERT OR IGNORE INTO module_deps (module_id, dep_module_id, dep_kind) VALUES (?1, ?2, ?3)"
         )?;
 
-        // Maven dependency regex: <dependency>...<artifactId>name</artifactId>...</dependency>
-        static MAVEN_DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(
-                r"(?s)<dependency>.*?<artifactId>\s*([^<]+?)\s*</artifactId>.*?</dependency>",
-            )
-            .unwrap()
-        });
-        let maven_dep_re = &*MAVEN_DEP_RE;
+        // Reactor dependencies bind by Maven coordinates, not directory names.
+        let mut maven_coordinates: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        for path in gradle_files
+            .iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "pom.xml"))
+        {
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let Ok(content) = fs::read_to_string(path) else {
+                continue;
+            };
+            let Some(manifest) = maven_manifest::parse(&content) else {
+                continue;
+            };
+            let rel = parent
+                .strip_prefix(root)
+                .unwrap_or(parent)
+                .to_string_lossy();
+            let name = if rel.is_empty() {
+                manifest.artifact.clone()
+            } else {
+                rel.replace('/', ".")
+            };
+            if let Some(&id) = module_ids.get(&name) {
+                maven_coordinates
+                    .entry((manifest.group, manifest.artifact))
+                    .or_default()
+                    .push(id);
+            }
+        }
 
         let mut edges: Vec<(i64, i64, String)> = {
             let num_threads = effective_num_threads();
@@ -3634,6 +3651,23 @@ pub fn index_module_dependencies(
                         }
 
                         let source_module_name: String = match file_name {
+                            "pom.xml" => {
+                                let rel = parent
+                                    .strip_prefix(&root_buf)
+                                    .unwrap_or(parent)
+                                    .to_string_lossy();
+                                if rel.is_empty() {
+                                    let Some(manifest) = fs::read_to_string(path)
+                                        .ok()
+                                        .and_then(|content| maven_manifest::parse(&content))
+                                    else {
+                                        return Vec::new();
+                                    };
+                                    manifest.artifact
+                                } else {
+                                    rel.replace('/', ".")
+                                }
+                            }
                             "ya.make" => {
                                 let rel = if let Some(ref mono) = mono_root {
                                     parent.strip_prefix(mono).ok()
@@ -3695,13 +3729,13 @@ pub fn index_module_dependencies(
                         let mut edges = Vec::new();
                         match file_name {
                             "pom.xml" => {
-                                for caps in maven_dep_re.captures_iter(&content) {
-                                    let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                                    for (mod_name, &mod_id) in module_ids.iter() {
-                                        let last_segment =
-                                            mod_name.rsplit('.').next().unwrap_or(mod_name);
-                                        if last_segment == artifact_id {
-                                            edges.push((module_id, mod_id, "compile".to_string()));
+                                if let Some(manifest) = maven_manifest::parse(&content) {
+                                    for (group, artifact, scope) in manifest.dependencies {
+                                        if let Some(ids) = maven_coordinates.get(&(group, artifact))
+                                        {
+                                            if let [id] = ids.as_slice() {
+                                                edges.push((module_id, *id, scope));
+                                            }
                                         }
                                     }
                                 }

@@ -24,9 +24,17 @@ class CoverageSourcesTests(unittest.TestCase):
                 implemented = state.execute("SELECT count(*) FROM coverage WHERE status='implemented'").fetchone()[0]
                 self.assertEqual(sum(counts.values()), implemented)
                 self.assertEqual(counts['hybrid MCP/JDK'], 4)
-                self.assertEqual(counts['independent source/state'], 12)
-                for feature in ('rebuild', 'update', 'restore', 'clear', 'watch', 'watch-status',
-                                'add-root', 'remove-root', 'subtree', 'global:local', 'global:subtree', 'global:walk-up'):
+                independent_features = {
+                    'rebuild', 'update', 'restore', 'clear', 'watch', 'watch-status',
+                    'add-root', 'remove-root', 'subtree', 'global:local', 'global:subtree', 'global:walk-up',
+                    'install-claude-plugin', 'install-codex-mcp', 'install-git-hooks',
+                }
+                self.assertEqual(counts['independent source/state'], len(independent_features))
+                self.assertEqual({row[0] for row in state.execute(
+                    "SELECT feature FROM coverage WHERE status='implemented' "
+                    "AND reason LIKE 'independent source/state%'"
+                )}, independent_features)
+                for feature in independent_features:
                     self.assertTrue(reasons[feature].startswith('independent source/state'), reasons[feature])
                     self.assertIn('not MCP equivalence', reasons[feature])
             finally:

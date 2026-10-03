@@ -1860,7 +1860,7 @@ fn cmd_install_claude_plugin() -> Result<()> {
             println!("\nRestart Claude Code to activate the plugin.");
         }
         Ok(s) => {
-            eprintln!("Plugin install exited with {}", s);
+            return Err(anyhow::anyhow!("Plugin install exited with {}", s));
         }
         Err(e) => {
             return Err(anyhow::anyhow!(
@@ -2117,7 +2117,7 @@ mod git_hook_tests {
 fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
     let git_path = root.join(".git");
     if git_path.is_dir() {
-        return Ok(git_path.join("hooks"));
+        return hooks_from_git_directory(&git_path);
     }
     if git_path.is_file() {
         // Worktree / submodule: .git is a file containing `gitdir: <path>`.
@@ -2132,7 +2132,7 @@ fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
                 } else {
                     root.join(candidate)
                 };
-                return Ok(real.join("hooks"));
+                return hooks_from_git_directory(&real);
             }
         }
     }
@@ -2140,6 +2140,27 @@ fn resolve_git_hooks_dir(root: &Path) -> Result<PathBuf> {
         "{} is not a git repository — `.git` not found.",
         root.display()
     ))
+}
+
+fn hooks_from_git_directory(directory: &Path) -> Result<PathBuf> {
+    let commondir = directory.join("commondir");
+    if !commondir.is_file() {
+        return Ok(directory.join("hooks"));
+    }
+    let content = std::fs::read_to_string(&commondir)
+        .with_context(|| format!("could not read {}", commondir.display()))?;
+    let value = content.trim_end_matches(['\n', '\r']);
+    if value.is_empty() {
+        return Err(anyhow::anyhow!("git commondir is empty"));
+    }
+    let common = Path::new(value);
+    let common = if common.is_absolute() {
+        common.to_path_buf()
+    } else {
+        directory.join(common)
+    };
+    let common = std::fs::canonicalize(common).context("git common directory does not exist")?;
+    Ok(common.join("hooks"))
 }
 
 fn resolve_ast_index_bin_from(

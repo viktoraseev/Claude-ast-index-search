@@ -156,6 +156,55 @@ class OracleStorageTests(unittest.TestCase):
             self.assertEqual(stored.call('ide_find_class', arguments)['classes'][0]['name'], arguments['query'])
         stored.assert_consumed()
 
+    def test_prefetch_refills_an_idle_worker_before_a_slow_peer_finishes(self):
+        first_started = threading.Event()
+        next_started = threading.Event()
+
+        def reply(tool, arguments):
+            continued = True
+            if arguments['query'] == 'A':
+                first_started.set()
+                continued = next_started.wait(timeout=2)
+            elif arguments['query'] == 'B':
+                self.assertTrue(first_started.wait(timeout=2))
+            else:
+                next_started.set()
+            return {'classes': [{'name': arguments['query']}], 'continued': continued}
+
+        self.client.parallel_safe = True
+        self.client.call.side_effect = reply
+        oracle = InvocationOracle(self.client, self.state)
+        requests = [{'query': name} for name in ('A', 'B', 'C')]
+        oracle.prefetch('ide_find_class', iter(requests), workers=2)
+        self.assertTrue(oracle.call('ide_find_class', requests[0])['continued'])
+        self.assertEqual(self.client.call.call_count, 3)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0], 3)
+
+    def test_streamed_prefetch_retains_every_reply_with_bounded_lookahead(self):
+        self.client.parallel_safe = True
+        self.client.call.side_effect = lambda tool, arguments: {'classes': [{'name': arguments['query']}]}
+        oracle = InvocationOracle(self.client, self.state)
+        requests = [{'query': f'PublicProbe{index}'} for index in range(37)]
+
+        def streamed_requests():
+            for produced, arguments in enumerate(requests, 1):
+                captured = self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0]
+                self.assertLessEqual(produced - captured, 4)
+                yield arguments
+
+        oracle.prefetch('ide_find_class', streamed_requests())
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0], len(requests))
+        fixture = Fixture(self.root, self.root / 'binary', self.root / 'index', self.state, oracle)
+        for arguments in reversed(requests):
+            fixture.paginated('first', 'ide_find_class', arguments, 'classes')
+        stored = StoredOracle(self.state, 'first')
+        for arguments in reversed(requests):
+            self.assertEqual(stored.call('ide_find_class', arguments),
+                             {'classes': [{'name': arguments['query']}]})
+        stored.assert_consumed()
+        oracle.prefetch('ide_find_class', iter(requests))
+        self.assertEqual(self.client.call.call_count, len(requests))
+
     def test_prefetch_rejects_mutations_cursors_and_unbounded_worker_counts(self):
         oracle = InvocationOracle(self.client, self.state)
         from common import ToolError
