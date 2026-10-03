@@ -30,7 +30,8 @@ public class JavaStructure {
         DiagnosticCollector<JavaFileObject> diagnostics = new DiagnosticCollector<>();
         try (StandardJavaFileManager manager = compiler.getStandardFileManager(diagnostics, null, null)) {
             JavacTask task = (JavacTask) compiler.getTask(null, manager, diagnostics,
-                List.of("-proc:none"), null, manager.getJavaFileObjects(file));
+                List.of("-proc:none", "--enable-preview", "--source", Integer.toString(Runtime.version().feature())),
+                null, manager.getJavaFileObjects(file));
             CompilationUnitTree unit = task.parse().iterator().next();
             if (diagnostics.getDiagnostics().stream().anyMatch(d -> d.getKind() == Diagnostic.Kind.ERROR))
                 return "{\"error\":\"JDK cannot parse this source version\"}";

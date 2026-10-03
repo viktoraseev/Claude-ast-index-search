@@ -1,6 +1,8 @@
 """Source structure is independently parsed by javac, then checked against the CLI."""
 import json
 import os
+import re
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,6 +15,20 @@ from java_structure import structure_server
 
 
 class StructureContracts(unittest.TestCase):
+    def test_installed_runtime_preview_syntax_is_not_rejected_as_an_oracle_error(self):
+        version = subprocess.run(['java', '-version'], capture_output=True, text=True, check=True)
+        match = re.search(r'version "(\d+)', version.stderr + version.stdout)
+        self.assertIsNotNone(match)
+        major = int(match[1])
+        body = ('void use() { int _ = 1; }' if major >= 21 else
+                'String use(Object value) { return switch (value) { case String text -> text; default -> ""; }; }')
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / 'Probe.java'
+            source.write_text('class Probe { ' + body + ' }\n')
+            entries = structure_server(directory).read(source)
+            self.assertEqual([entry['name'] for entry in entries if entry['kind'] == 'method'], ['use'])
+
     def test_annotated_enum_constants_keep_identifier_anchors_and_ordinary_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
