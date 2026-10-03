@@ -39,6 +39,13 @@ Commands without an equivalent Index MCP operation use separately labelled
 independent source/state or internal CLI checks. Synthetic Java fixtures complement
 live project checks; they do not replace unresolved target or syntax contracts.
 
+The Java file-view format fixture executes `file`, `outline`, `imports` and
+`api` against small authored Java sources. It checks source identities, import
+syntax, snippets, limits, empty/missing inputs and text/JSON rendering without
+using native DB rows as expected declarations. This is independent source/state
+coverage, not MCP equivalence. Other command formats, diagram-format selection
+and attached-root API scope remain pending.
+
 Replay streams the first 100 failures in capture order plus every unsupported
 or error contract. Each check executes the current CLI against a rebuilt index;
 all recorded oracle operations and pagination requests are bound to their

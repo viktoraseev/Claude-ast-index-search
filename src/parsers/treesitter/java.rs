@@ -73,6 +73,14 @@ pub(crate) fn type_body_emptiness(content: &str) -> Result<HashMap<(String, i64,
 
 /// Qualified import declarations, including static and wildcard imports.
 pub(crate) fn import_names(content: &str) -> Result<Vec<String>> {
+    Ok(import_declarations(content)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+/// Java import identities and their static modifier, in source order.
+pub(crate) fn import_declarations(content: &str) -> Result<Vec<(String, bool)>> {
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let mut imports = Vec::new();
     let mut cursor = tree.root_node().walk();
@@ -88,7 +96,11 @@ pub(crate) fn import_names(content: &str) -> Result<Vec<String>> {
             super::WalkControl::Continue
         });
         if !parts.is_empty() {
-            imports.push(parts.join("."));
+            let mut cursor = declaration.walk();
+            let is_static = declaration
+                .children(&mut cursor)
+                .any(|node| node.kind() == "static");
+            imports.push((parts.join("."), is_static));
         }
     }
     Ok(imports)

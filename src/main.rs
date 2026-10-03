@@ -11,7 +11,9 @@ use ast_index::{commands, db};
 #[command(name = "ast-index")]
 #[command(about = "Fast code search for multi-language projects")]
 #[command(version)]
-#[command(after_help = "AST_INDEX_ROOT pins an exact project directory (absolute or relative to cwd), without ancestor discovery.")]
+#[command(
+    after_help = "AST_INDEX_ROOT pins an exact project directory (absolute or relative to cwd), without ancestor discovery."
+)]
 #[command(help_template = "\
 {before-help}{name} v{version}
 {about}
@@ -1548,9 +1550,11 @@ fn main() -> Result<()> {
         Commands::Outline { file, full } => {
             commands::files::cmd_outline(&root, &file, full, format)
         }
-        Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
+        Commands::Imports { file } => {
+            commands::files::cmd_imports_with_format(&root, &file, format)
+        }
         Commands::Api { module_path, limit } => {
-            commands::files::cmd_api(&root, &module_path, limit)
+            commands::files::cmd_api_with_format(&root, &module_path, limit, format)
         }
         Commands::Changed {
             base,

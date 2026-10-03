@@ -29,6 +29,9 @@ fn print_minified_notice() {
 /// Find files by pattern
 pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &str) -> Result<()> {
     if !db::db_exists(root) {
+        if format == "json" {
+            anyhow::bail!("Index not found. Run 'ast-index rebuild' first.");
+        }
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
@@ -280,6 +283,11 @@ fn table_columns(
 
 /// Show file imports
 pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
+    cmd_imports_with_format(root, file, "text")
+}
+
+/// Show imports as text or a structured file document.
+pub fn cmd_imports_with_format(root: &Path, file: &str, format: &str) -> Result<()> {
     let file_path = if file.starts_with('/') {
         PathBuf::from(file)
     } else {
@@ -287,12 +295,18 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
     };
 
     if !file_path.exists() {
+        if format == "json" {
+            return print_imports_json(file, &[], Some("not_found"));
+        }
         println!("{}", format!("File not found: {}", file).red());
         return Ok(());
     }
 
     let header = format!("Imports in {}:", file);
     if crate::minified::skip(&file_path, None) {
+        if format == "json" {
+            return print_imports_json(file, &[], Some("minified"));
+        }
         println!("{}", header.bold());
         print_minified_notice();
         return Ok(());
@@ -309,11 +323,20 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
     let is_typescript =
         crate::parsers::FileType::from_extension(ext) == Some(crate::parsers::FileType::TypeScript);
 
-    println!("{}", header.bold());
-
     let mut imports: Vec<String> = vec![];
 
-    if is_typescript {
+    if ext == "java" {
+        imports = crate::parsers::treesitter::java::import_declarations(&content)?
+            .into_iter()
+            .map(|(name, is_static)| {
+                if is_static {
+                    format!("static {name};")
+                } else {
+                    format!("{name};")
+                }
+            })
+            .collect();
+    } else if is_typescript {
         imports = crate::parsers::treesitter::typescript::import_declarations(&content)?;
     } else if is_perl {
         // Perl: use Module; or require Module;
@@ -391,6 +414,21 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
         }
     }
 
+    if format == "json" {
+        // Java import identities exclude punctuation, as navigation names do.
+        let imports: Vec<String> = imports
+            .into_iter()
+            .map(|name| {
+                if ext == "java" {
+                    name.trim_end_matches(';').to_owned()
+                } else {
+                    name
+                }
+            })
+            .collect();
+        return print_imports_json(file, &imports, None);
+    }
+    println!("{}", header.bold());
     if imports.is_empty() {
         println!("  No imports found.");
     } else {
@@ -403,8 +441,28 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
     Ok(())
 }
 
+fn print_imports_json(file: &str, imports: &[String], skipped: Option<&str>) -> Result<()> {
+    let mut document =
+        serde_json::json!({"file": file, "imports": imports, "count": imports.len()});
+    if let Some(reason) = skipped {
+        document["skipped"] = reason.into();
+    }
+    println!("{}", serde_json::to_string_pretty(&document)?);
+    Ok(())
+}
+
 /// Show module public API
 pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
+    cmd_api_with_format(root, module_path, limit, "text")
+}
+
+/// Show module public API as text or structured source locations.
+pub fn cmd_api_with_format(
+    root: &Path,
+    module_path: &str,
+    limit: usize,
+    format: &str,
+) -> Result<()> {
     let mut module_dir = root.join(module_path);
 
     // If path not found, try converting dots to slashes (module name → path)
@@ -437,6 +495,9 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
     }
 
     if !module_dir.exists() {
+        if format == "json" {
+            return print_api_json(module_path, &[], Some("not_found"));
+        }
         println!("{}", format!("Module not found: {}", module_path).red());
         return Ok(());
     }
@@ -488,6 +549,9 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
         items.extend(swift_public_api(root, &module_dir, limit - items.len())?);
     }
 
+    if format == "json" {
+        return print_api_json(module_path, &items, None);
+    }
     println!(
         "{}",
         format!("Public API of '{}' ({}):", module_path, items.len()).bold()
@@ -502,6 +566,23 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
         println!("  No public API found.");
     }
 
+    Ok(())
+}
+
+fn print_api_json(
+    module: &str,
+    items: &[(String, usize, String)],
+    skipped: Option<&str>,
+) -> Result<()> {
+    let rows: Vec<_> = items
+        .iter()
+        .map(|(path, line, content)| serde_json::json!({"path": path, "line": line, "content": content}))
+        .collect();
+    let mut document = serde_json::json!({"module": module, "items": rows, "count": rows.len()});
+    if let Some(reason) = skipped {
+        document["skipped"] = reason.into();
+    }
+    println!("{}", serde_json::to_string_pretty(&document)?);
     Ok(())
 }
 

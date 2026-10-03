@@ -308,6 +308,11 @@ ast-index todo [PATTERN]           # TODO/FIXME/HACK comments
 ast-index deprecated [QUERY]       # Deprecated items
 ```
 
+`imports --format json` returns imports in source order and distinguishes a
+missing file from a file with no imports. Java imports support multiline
+statements, comments, static imports and wildcards. `file --format json`
+reports a missing index as an error rather than an empty successful search.
+
 ### Paginated JSON schema v2
 
 Limited search commands now report completeness explicitly. `symbol`, `class`,
@@ -515,6 +520,11 @@ ast-index dependents <MODULE>      # Dependent modules
 ast-index unused-deps <MODULE>     # Find unused dependencies (v3.2: +transitive, XML, resources)
 ast-index api <MODULE>             # Public API of module
 ```
+
+`api --format json` returns public declaration locations and source snippets,
+honouring `--limit`. A missing module is explicitly distinguished from a
+module with no public declarations. Directory and dotted module paths work in
+both text and JSON output.
 
 #### module-route — dependency path between two modules
 
