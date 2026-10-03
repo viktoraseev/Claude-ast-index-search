@@ -741,20 +741,7 @@ pub fn invocation_lines(content: &str, name: &str) -> Result<std::collections::H
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let mut lines = std::collections::HashSet::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
-        let identifier = match node.kind() {
-            "method_invocation" => node.child_by_field_name("name"),
-            "object_creation_expression" => node.child_by_field_name("type").map(|mut ty| {
-                // Generic and qualified constructor names end in a type identifier.
-                if ty.kind() == "generic_type" {
-                    ty = ty.named_child(0).unwrap_or(ty);
-                }
-                if ty.kind() == "scoped_type_identifier" {
-                    ty = ty.child_by_field_name("name").unwrap_or(ty);
-                }
-                ty
-            }),
-            _ => None,
-        };
+        let identifier = invocation_identifier(node);
         if let Some(identifier) = identifier {
             if node_text(content, &identifier) == name {
                 lines.insert(node_line(&identifier));
@@ -763,6 +750,119 @@ pub fn invocation_lines(content: &str, name: &str) -> Result<std::collections::H
         super::WalkControl::Continue
     });
     Ok(lines)
+}
+
+fn invocation_identifier<'tree>(
+    node: tree_sitter::Node<'tree>,
+) -> Option<tree_sitter::Node<'tree>> {
+    match node.kind() {
+        "method_invocation" => node.child_by_field_name("name"),
+        "object_creation_expression" => node.child_by_field_name("type").map(|mut ty| {
+            if ty.kind() == "generic_type" {
+                ty = ty.named_child(0).unwrap_or(ty);
+            }
+            if ty.kind() == "scoped_type_identifier" {
+                ty = ty.child_by_field_name("name").unwrap_or(ty);
+            }
+            ty
+        }),
+        _ => None,
+    }
+}
+
+/// Attribute actual invocations to syntax owners, retaining distinct overloads.
+pub(crate) fn invocation_callers(
+    content: &str,
+    names: &[String],
+    limit: usize,
+) -> Result<Vec<Vec<(String, usize)>>> {
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let lookup: HashMap<&str, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    let mut callers = vec![Vec::new(); names.len()];
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        let Some(identifier) = invocation_identifier(node) else {
+            return super::WalkControl::Continue;
+        };
+        let bare = node_text(content, &identifier);
+        let qualified = match node.kind() {
+            "method_invocation" => node
+                .child_by_field_name("object")
+                .map(|object| format!("{}.{}", node_text(content, &object), bare)),
+            "object_creation_expression" => node
+                .child_by_field_name("type")
+                .map(|ty| node_text(content, &ty).to_string()),
+            _ => None,
+        };
+        let indices: Vec<usize> = [
+            lookup.get(bare),
+            qualified.as_deref().and_then(|name| lookup.get(name)),
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+        .collect();
+        if indices.is_empty() {
+            return super::WalkControl::Continue;
+        }
+        let mut parent = node.parent();
+        while let Some(owner) = parent {
+            if matches!(
+                owner.kind(),
+                "method_declaration"
+                    | "constructor_declaration"
+                    | "compact_constructor_declaration"
+                    | "variable_declarator"
+                    | "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) && (owner.kind() != "variable_declarator"
+                || owner
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "field_declaration"))
+            {
+                if let Some(name) = owner.child_by_field_name("name") {
+                    let site = (node_text(content, &name).to_string(), node_line(&name));
+                    for index in &indices {
+                        if callers[*index].len() < limit && !callers[*index].contains(&site) {
+                            callers[*index].push(site.clone());
+                        }
+                    }
+                    break;
+                }
+            }
+            parent = owner.parent();
+        }
+        super::WalkControl::Continue
+    });
+    Ok(callers)
+}
+
+#[cfg(test)]
+mod invocation_owner_tests {
+    #[test]
+    fn local_variables_are_not_java_callers() {
+        let source = "class Probe {\n\
+            int leaf() { return 1; }\n\
+            int localOwner() { int result = leaf(); return result; }\n\
+            void lambdaOwner() { Runnable action = () -> { int result = leaf(); }; }\n\
+            int field = leaf();\n\
+            }\n";
+        let callers = super::invocation_callers(source, &["leaf".into()], 10).unwrap();
+        assert_eq!(
+            callers,
+            vec![vec![
+                ("localOwner".into(), 3),
+                ("lambdaOwner".into(), 4),
+                ("field".into(), 5),
+            ]]
+        );
+    }
 }
 
 type QualifiedNameOccurrences = HashMap<(String, usize, String), VecDeque<Option<String>>>;

@@ -136,6 +136,9 @@ fn run_explore(
     let raw = query.join(" ");
     let query = Query::parse(&raw);
     if query.terms.is_empty() {
+        if format == "json" {
+            return emit_json(&raw, None, &[], &[], &[], &[], fallback_reason);
+        }
         println!("explore: query has no usable terms (need identifiers >= 3 chars)");
         return Ok(());
     }
@@ -188,6 +191,9 @@ fn run_explore(
         });
     }
     if cands.is_empty() {
+        if format == "json" {
+            return emit_json(&raw, None, &[], &[], &[], &[], fallback_reason);
+        }
         println!("explore: no symbols matched '{}'", raw);
         return Ok(());
     }
@@ -204,13 +210,16 @@ fn run_explore(
 
     // Stage B: re-rank by RWR over an in-memory call/inheritance graph.
     if use_rwr {
-        apply_rwr(&conn, &resolver, dom_lang.as_deref(), &mut cands)?;
+        apply_rwr(&conn, &resolver, scope, dom_lang.as_deref(), &mut cands)?;
     }
 
     // 4. Pick distinct source files from the top non-vendor candidates.
     let mut file_order: Vec<usize> = Vec::new();
     let mut chosen_paths: HashSet<String> = HashSet::new();
     for (i, c) in cands.iter().enumerate() {
+        if file_order.len() >= max_files {
+            break;
+        }
         if c.vendor {
             continue;
         }
@@ -219,16 +228,19 @@ fn run_explore(
         }
         chosen_paths.insert(c.sym.path.clone());
         file_order.push(i);
-        if file_order.len() >= max_files {
-            break;
-        }
     }
 
     // 5. Tests by path convention for the single top non-vendor symbol's file(s).
     let mut tests: Vec<(String, Vec<String>)> = Vec::new();
     for &i in file_order.iter().take(max_files) {
         let rel = &cands[i].sym.path;
-        let found = find_tests_by_convention(&conn, rel)?;
+        let found = find_tests_by_convention(
+            &conn,
+            rel,
+            scope,
+            &resolver,
+            cands[i].sym.root_path.as_deref(),
+        )?;
         tests.push((rel.clone(), found));
     }
 
@@ -467,7 +479,13 @@ fn dominant_lang(cands: &[Cand]) -> Option<String> {
 // Tests by path convention (language-agnostic registry)
 // ---------------------------------------------------------------------------
 
-fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>> {
+fn find_tests_by_convention(
+    conn: &Connection,
+    rel: &str,
+    scope: &SearchScope,
+    resolver: &PathResolver,
+    source_root: Option<&str>,
+) -> Result<Vec<String>> {
     let stem = path_stem(rel);
     let ext = ext_of(rel).unwrap_or_default();
     let mut patterns: Vec<String> = Vec::new();
@@ -535,16 +553,22 @@ fn find_tests_by_convention(conn: &Connection, rel: &str) -> Result<Vec<String>>
     }
     let mut found = Vec::new();
     for p in patterns {
-        for hit in db::find_files(conn, &p, TEST_CANDIDATES_PER_PATTERN)? {
+        for hit in db::find_files_with_roots_scoped(conn, &p, TEST_CANDIDATES_PER_PATTERN, scope)? {
+            let same_root = hit.root_path.as_deref() == source_root
+                || (resolver.is_primary_root(hit.root_path.as_deref())
+                    && resolver.is_primary_root(source_root));
+            if !same_root || !resolver.matches_filter(hit.root_path.as_deref()) {
+                continue;
+            }
             // find_files matches `%p%` (substring), so `JsonConverter.cs` would
             // falsely match `GenericJsonConverterTests.cs`. Keep only exact
             // basename matches.
-            let base = Path::new(&hit)
+            let base = Path::new(&hit.path)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
-            if base == p && !found.contains(&hit) {
-                found.push(hit);
+            if base == p && !found.contains(&hit.path) {
+                found.push(hit.path);
             }
         }
     }
@@ -1071,6 +1095,7 @@ impl Graph {
 fn apply_rwr(
     conn: &Connection,
     resolver: &PathResolver,
+    scope: &SearchScope,
     dom_lang: Option<&str>,
     cands: &mut Vec<Cand>,
 ) -> Result<()> {
@@ -1097,7 +1122,10 @@ fn apply_rwr(
     let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
     // Role a node plays relative to the seed — for the "Graph neighbours" section.
     let mut link_role: HashMap<(String, i64), &'static str> = HashMap::new();
-    let graph_dependents = super::graph::resolved_dependents_of(conn, &seeds, REF_LIMIT)?;
+    let graph_dependents =
+        super::graph::resolved_dependents_of_filtered(conn, &seeds, REF_LIMIT, |info| {
+            scope.matches_path(&info.path) && resolver.matches_filter(info.root_path.as_deref())
+        })?;
     for (i, sym) in seeds.iter().enumerate() {
         let sid = g.intern(sym);
         // A seed the graph resolves no edge to — calls through a receiver of
@@ -1110,7 +1138,7 @@ fn apply_rwr(
             Some(dependents) => dependents,
             None => {
                 let mut owners = Vec::new();
-                for r in db::find_references(conn, &sym.name, REF_LIMIT)? {
+                for r in db::find_references_scoped(conn, &sym.name, REF_LIMIT, scope)? {
                     if let Some(owner) =
                         db::find_owning_symbol(conn, r.root_path.as_deref(), &r.path, r.line)
                             .unwrap_or(None)
@@ -1121,13 +1149,15 @@ fn apply_rwr(
                 owners
             }
         };
-        let children = db::find_implementations(conn, &sym.name, REF_LIMIT)?;
+        let children = db::find_implementations_scoped(conn, &sym.name, REF_LIMIT, scope)?;
         // Inheritance is also a graph edge; name it `subclass` rather than
         // `caller` when both sources list the same definition.
         let subclass_keys: HashSet<(String, i64)> =
             children.iter().map(|c| (c.path.clone(), c.line)).collect();
         for caller in callers {
-            if !resolver.matches_filter(caller.root_path.as_deref()) {
+            if !resolver.matches_filter(caller.root_path.as_deref())
+                || !scope.matches_path(&caller.path)
+            {
                 continue;
             }
             let key = (caller.path.clone(), caller.line);
@@ -1141,7 +1171,9 @@ fn apply_rwr(
             g.edge(sid, oid);
         }
         for child in children {
-            if !resolver.matches_filter(child.root_path.as_deref()) {
+            if !resolver.matches_filter(child.root_path.as_deref())
+                || !scope.matches_path(&child.path)
+            {
                 continue;
             }
             link_role
@@ -1229,6 +1261,9 @@ fn apply_rwr(
 
     for c in cands.iter_mut() {
         let key = (c.sym.path.clone(), c.sym.line);
+        // A caller/subclass may already be a lexical seed through its
+        // signature. Its relationship still belongs in the neighbour list.
+        c.link = link_role.get(&key).copied().or(c.link);
         let lex = c.score.max(0.0) / max_lex;
         let rwr = rwr_by_key.get(&key).copied().unwrap_or(0.0) / max_rwr;
         let connected = rwr_by_key.contains_key(&key);

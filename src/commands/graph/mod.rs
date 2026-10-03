@@ -434,6 +434,16 @@ pub fn resolved_dependents_of(
     seeds: &[db::SearchResult],
     limit: usize,
 ) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
+    resolved_dependents_of_filtered(conn, seeds, limit, |_| true)
+}
+
+/// Filter neighbour scope before spending the per-seed result budget.
+pub(crate) fn resolved_dependents_of_filtered(
+    conn: &Connection,
+    seeds: &[db::SearchResult],
+    limit: usize,
+    keep: impl Fn(&GraphSymbolInfo) -> bool,
+) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
     let state = db::symbol_graph_state(conn)?;
     if !state.built || state.stale {
         return Ok(None);
@@ -472,6 +482,7 @@ pub fn resolved_dependents_of(
             sources
                 .iter()
                 .filter_map(|source| infos.get(source))
+                .filter(|info| keep(info))
                 .take(limit)
                 .map(|info| db::SearchResult {
                     name: info.name.clone(),

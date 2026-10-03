@@ -2,8 +2,8 @@
 
 The index supplies file scope only. javac supplies Java declarations/imports;
 foreign aggregate contributions are internal normalization, not parser coverage.
-Stack markers use the full private inventory. Composition flags and exhausted
-scanner budgets retain a separate pending contract.
+Stack markers use the full private inventory. Composition flags and scanner
+resource limits have a separate source/state fixture in stack_contracts.
 """
 from collections import Counter, defaultdict
 from pathlib import Path

@@ -48,6 +48,8 @@ import delegate_contracts
 import route_contracts
 import android_contracts
 import vcs_contracts
+import stack_contracts
+import context_contracts
 
 
 SCHEMA = """
@@ -476,6 +478,7 @@ class Fixture:
         self._install_results = None
         self._install_error = None
         self._android_results = None
+        self._context_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
         self.environment = {
@@ -1639,6 +1642,20 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def context_check(self, check: sqlite3.Row):
+        if self._context_results is None:
+            self._context_results = context_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._context_results)
+        return {'source': context_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
+    def stack_check(self, check: sqlite3.Row):
+        expected, actual = stack_contracts.exercise(self.binary, self.database.parent)
+        return {'source': stack_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def vcs_check(self, check: sqlite3.Row):
         if self._vcs_results is None:
             self._vcs_results = vcs_contracts.exercise(self.binary, self.database.parent)
@@ -1687,6 +1704,10 @@ class Fixture:
                 handler = self.route_check
             if check['feature'] in vcs_contracts.FEATURES:
                 handler = self.vcs_check
+            if check['feature'] in context_contracts.FEATURES:
+                handler = self.context_check
+            if check['feature'] in stack_contracts.FEATURES:
+                handler = self.stack_check
             if check['feature'] in android_contracts.FEATURES:
                 handler = self.android_check
             if check['feature'] == 'api':
@@ -1758,6 +1779,7 @@ def required_features(help_text: str = '') -> set[str]:
                      "android:syntax-resolution", "xml-usages:target", "resource-usages:target"})
     features.update(LIVE_FEATURES)
     features.update(route_contracts.FEATURES)
+    features.update(context_contracts.PENDING)
     return features
 
 
@@ -1883,6 +1905,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     route_contracts.plan_routes(state, root)
     android_contracts.plan_android(state, root)
     vcs_contracts.plan_vcs(state, root)
+    stack_contracts.plan_stacks(state, root)
+    context_contracts.plan_context(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

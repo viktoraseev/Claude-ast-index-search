@@ -668,6 +668,39 @@ fn find_caller_functions(
     in_file: Option<&str>,
     prefilter: Option<&super::WordPrefilter<'_>>,
 ) -> Result<Vec<CallerSites>> {
+    // Java syntax distinguishes calls from prose, declarations and method
+    // references, and attributes calls even when declarations share a line.
+    // Parse one file at a time; retain at most `limit` owners per requested name.
+    let mut java_callers: Vec<CallerSites> = vec![Vec::new(); function_names.len()];
+    let mut other_files = Vec::new();
+    for path in files {
+        if !path
+            .extension()
+            .is_some_and(|extension| extension == "java")
+        {
+            other_files.push(path.clone());
+            continue;
+        }
+        let rel = relative_path(root, path);
+        if in_file.is_some_and(|filter| !rel.contains(filter))
+            || prefilter.is_some_and(|filter| !filter.may_contain(path))
+            || java_callers.iter().all(|sites| sites.len() >= limit)
+        {
+            continue;
+        }
+        let content = std::fs::read_to_string(path)?;
+        let owners =
+            crate::parsers::treesitter::java::invocation_callers(&content, function_names, limit)?;
+        for (sites, owners) in java_callers.iter_mut().zip(owners) {
+            let remaining = limit.saturating_sub(sites.len());
+            sites.extend(
+                owners
+                    .into_iter()
+                    .take(remaining)
+                    .map(|(name, line)| (name, rel.clone(), line)),
+            );
+        }
+    }
     let patterns: Vec<(String, String)> = function_names
         .iter()
         .map(|name| (build_caller_pattern(name), name.clone()))
@@ -692,7 +725,7 @@ fn find_caller_functions(
 
     // First pass: find all files and line numbers with calls
     super::search_files_limited_each_prefiltered(
-        files,
+        &other_files,
         &build_any_caller_pattern(function_names),
         &patterns,
         limit * 3,
@@ -713,8 +746,20 @@ fn find_caller_functions(
     Ok(files_with_calls
         .into_iter()
         .zip(function_names)
-        .map(|(files, name)| {
-            attribute_call_lines(root, &root_key, conn, name, files, limit, &func_def_re)
+        .zip(java_callers)
+        .map(|((files, name), mut java_sites)| {
+            java_sites.extend(attribute_call_lines(
+                root,
+                &root_key,
+                conn,
+                name,
+                files,
+                limit,
+                &func_def_re,
+            ));
+            java_sites.sort_by(|a, b| (&a.1, a.2, &a.0).cmp(&(&b.1, b.2, &b.0)));
+            java_sites.truncate(limit);
+            java_sites
         })
         .collect())
 }

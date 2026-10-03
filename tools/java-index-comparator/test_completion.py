@@ -84,7 +84,8 @@ class CompletionTests(unittest.TestCase):
 
     def test_known_pending_subcontracts_cannot_disappear_from_final_proof(self):
         for feature in ('module-route:budgets', 'detect-stacks:composition-budgets',
-                        'android:syntax-resolution', 'xml-usages:target', 'resource-usages:target'):
+                        'android:syntax-resolution', 'xml-usages:target', 'resource-usages:target',
+                        'call-tree:semantic-resolution', 'explore:ranking-budgets'):
             with self.subTest(feature=feature):
                 self.assertIn(feature, required_features())
                 self.mutate('DELETE FROM coverage WHERE feature=?', (feature,))
