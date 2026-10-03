@@ -193,7 +193,10 @@ public class JavaStructure {
                 @Override public Void visitClass(ClassTree tree, Void unused) {
                     String typeName = tree.getSimpleName().toString();
                     if (!typeName.isEmpty()) {
-                        Matcher anchor = Pattern.compile("(?:class|interface|enum|record)\\s+(" + Pattern.quote(typeName) + ")(?![\\w$])")
+                        // Java comments are whitespace between declaration tokens.
+                        Matcher anchor = Pattern.compile("(?:class|interface|enum|record)"
+                            + "(?:\\s|/\\*.*?\\*/|//[^\\r\\n]*(?:\\r\\n|\\r|\\n))+("
+                            + Pattern.quote(typeName) + ")(?![\\w$])", Pattern.DOTALL)
                             .matcher(source.substring(start(tree), end(tree)));
                         if (!anchor.find()) throw new IllegalStateException("Missing type anchor");
                         String kind = switch (tree.getKind()) {

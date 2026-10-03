@@ -15,6 +15,19 @@ from java_structure import structure_server
 
 
 class StructureContracts(unittest.TestCase):
+    def test_type_name_anchors_allow_comments_between_keyword_and_identifier(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / 'Probe.java'
+            source.write_text('class /* documentation */ First {}\n'
+                              'class // explanation\n Second {}\n'
+                              'record /* documentation */ Third(int value) {}\n'
+                              '@interface /* documentation */ Option {}\n', encoding='utf-8')
+            entries = structure_server(directory).read(source)
+            types = [(entry['name'], entry['line']) for entry in entries
+                     if entry['kind'] in {'class', 'interface', 'enum'}]
+            self.assertEqual(types, [('First', 1), ('Second', 3), ('Third', 4), ('Option', 5)])
+
     def test_unicode_import_names_use_identifiers_not_javac_pretty_printing(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
