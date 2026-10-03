@@ -1,4 +1,5 @@
 """Final readiness rejects stale, partial, scope-reduced and shape-only proof."""
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -8,7 +9,8 @@ from unittest.mock import patch
 from audit import JAVA_EXCLUDED_FEATURES, SCHEMA, required_features
 from common import ToolError, adapter_digest, connect, file_sha256, source_snapshot
 from completion import StaleEvidence, verify
-from mobile_contracts import inventory_snapshot
+import android_contracts
+from mobile_contracts import inventory, inventory_snapshot
 
 
 class CompletionTests(unittest.TestCase):
@@ -54,6 +56,63 @@ class CompletionTests(unittest.TestCase):
         self.assertEqual(result['scope'], 'java')
         self.assertEqual(result['out_of_scope_features'], len(JAVA_EXCLUDED_FEATURES))
         self.assertEqual(self.state.total_changes, changes)
+
+    def test_required_java_contract_cannot_be_dismissed_as_absent(self):
+        self.mutate("UPDATE coverage SET status='inapplicable' WHERE feature='class'")
+        self.mutate("DELETE FROM checks WHERE feature='class'")
+        with self.assertRaises(ToolError):
+            self.check()
+
+    def test_android_target_requires_an_executed_absence_contract(self):
+        self.mutate("UPDATE coverage SET status='inapplicable' WHERE feature='xml-usages:target'")
+        self.mutate("DELETE FROM checks WHERE feature='xml-usages:target'")
+        with self.assertRaises(ToolError):
+            self.check()
+
+    def prepare_android_absence(self):
+        inventory(self.state, self.root)
+        status, reason = android_contracts.applicability(self.state, self.root)
+        self.assertEqual(status, 'inapplicable')
+        for parent in ('xml-usages', 'resource-usages'):
+            target = parent + ':target'
+            self.mutate('UPDATE coverage SET status=?,reason=? WHERE feature=?', (status, reason, target))
+            self.mutate('DELETE FROM checks WHERE feature=?', (target,))
+            self.mutate("""INSERT OR REPLACE INTO checks(id,feature,subject,status,verdict,expected_json,actual_json)
+                VALUES (?,?,'target-absence','complete','pass',?,?)""",
+                        ('absence:' + parent, parent,
+                         json.dumps({'source': android_contracts.REASON, 'samples': {'absence': True}}),
+                         json.dumps({'absence': True})))
+
+    def test_proven_android_absence_passes_the_read_only_final_gate(self):
+        # Root files precede child files in the recorded inventory, unlike a
+        # global path sort. Verify the actual inventory digest, not a new order.
+        (self.root / 'z.txt').write_text('ordinary auxiliary file')
+        (self.root / 'a').mkdir()
+        (self.root / 'a/Helper.xml').write_text('<root/>')
+        self.prepare_android_absence()
+        changes = self.state.total_changes
+        self.assertTrue(self.check()['verified'])
+        self.assertEqual(self.state.total_changes, changes)
+
+    def test_incomplete_or_shape_only_android_absence_proof_never_passes(self):
+        mutations = (
+            "DELETE FROM metadata WHERE key='android_applicability_sha256'",
+            'DELETE FROM android_applicability',
+            'UPDATE android_applicability SET marker=1',
+            "UPDATE android_applicability SET sha256='changed'",
+            'DELETE FROM file_inventory',
+            "UPDATE checks SET subject='not-absence' WHERE id='absence:xml-usages'",
+            "UPDATE checks SET expected_json=NULL WHERE id='absence:xml-usages'",
+            "UPDATE checks SET actual_json='{}' WHERE id='absence:xml-usages'",
+            "UPDATE checks SET actual_json='{\"absence\":1}' WHERE id='absence:xml-usages'",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.prepare_android_absence()
+                self.assertTrue(self.check()['verified'])
+                self.mutate(mutation)
+                with self.assertRaises(ToolError):
+                    self.check()
 
     def test_every_stale_fingerprint_requires_a_fresh_audit(self):
         for key in ('project_root', 'snapshot_sha256', 'inventory_sha256', 'binary_sha256', 'fixture_sha256'):
@@ -122,7 +181,11 @@ class CompletionTests(unittest.TestCase):
     def test_known_pending_subcontracts_cannot_disappear_from_final_proof(self):
         for feature in ('module-route:budgets', 'detect-stacks:composition-budgets',
                         'android:syntax-resolution', 'xml-usages:target', 'resource-usages:target',
-                        'call-tree:semantic-resolution', 'explore:ranking-budgets'):
+                        'call-tree:semantic-resolution', 'explore:ranking-budgets',
+                        'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle',
+                        'graph:java-metrics', 'graph:java-top', 'graph:metrics-rendering',
+                        'unused-deps:java-ownership', 'unused-deps:java-types', 'unused-deps:transitive',
+                        'unused-deps:semantic-resolution', 'unused-deps:target'):
             with self.subTest(feature=feature):
                 self.assertIn(feature, required_features())
                 self.mutate('DELETE FROM coverage WHERE feature=?', (feature,))

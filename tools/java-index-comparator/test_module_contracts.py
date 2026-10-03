@@ -1,6 +1,7 @@
 """Small Maven/Java production regressions, with independent XML expectations."""
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 import tempfile
@@ -68,6 +69,42 @@ class ModuleContracts(unittest.TestCase):
             self.fixture.evaluate(check)
         self.assertEqual(self.state.execute('SELECT verdict FROM checks WHERE id=?', (check['id'],)).fetchone()[0], 'fail')
         self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_pages').fetchone()[0], 0)
+
+    def test_unused_dependencies_keep_java_enums_large_type_sets_and_exact_module_scope(self):
+        # One authored fixture family, not one test per project database row.
+        for variant in ('enum', 'crowded', 'scope'):
+            with self.subTest(variant=variant):
+                library, consumer = variant + '-lib', variant + '-consumer'
+                dependency = ('<dependencies><dependency><groupId>fixture</groupId>'
+                              f'<artifactId>{library}</artifactId></dependency></dependencies>')
+                for path, name, deps in (('lib', library, ''), ('consumer', consumer, dependency)):
+                    self.write(f'{variant}/{path}/pom.xml', '<project><groupId>fixture</groupId>'
+                               f'<artifactId>{name}</artifactId>{deps}</project>')
+                if variant == 'enum':
+                    declaration = 'public enum Value { ONE }'
+                    usage = 'import dep.Value; public class Use { Value value; }'
+                elif variant == 'crowded':
+                    padding = ''.join(f'public static class Padding{i:03d} {{}}' for i in range(120))
+                    declaration = 'public class Value {' + padding + 'public static class Wanted {}}'
+                    usage = 'import dep.Value.Wanted; public class Use { Wanted value; }'
+                else:
+                    declaration = 'public class Value {}'
+                    usage = 'public class Use {}'
+                    self.write(f'{variant}/consumer-shadow/pom.xml', '<project><groupId>fixture</groupId>'
+                               f'<artifactId>{variant}-shadow</artifactId>{dependency}</project>')
+                    self.write(f'{variant}/consumer-shadow/Other.java',
+                               'package sibling; import dep.Value; public class Other { Value value; }')
+                self.write(f'{variant}/lib/Value.java', 'package dep; ' + declaration)
+                self.write(f'{variant}/consumer/Use.java', 'package app; ' + usage)
+                self.prepare()
+                # Nested Maven module identities use their directory path;
+                # artifactId supplies dependency coordinates, not CLI names.
+                output = self.fixture.text_cli('unused-deps', variant + '.consumer', '--strict')
+                summary = re.search(r'^Total: (\d+) unused, (\d+) exported, (\d+) used of (\d+) dependencies$',
+                                    output, re.MULTILINE)
+                self.assertIsNotNone(summary)
+                expected = (1, 0, 0, 1) if variant == 'scope' else (0, 0, 1, 1)
+                self.assertEqual(tuple(map(int, summary.groups())), expected)
 
     def test_reactor_coordinates_direct_dependencies_and_scope_drive_all_navigation(self):
         # Root artifact comes after the parent/comment; directory and artifact

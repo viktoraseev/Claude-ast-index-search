@@ -13,9 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use colored::Colorize;
-use regex::Regex;
 use rusqlite::{params, Connection};
-use walkdir::WalkDir;
 
 use crate::db;
 use crate::indexer;
@@ -316,43 +314,36 @@ pub fn cmd_unused_deps(
             usage.direct_count = 1;
             usage.direct_symbols = vec![format!("import {}", dep_module_name)];
         } else {
-            let dep_symbols = get_module_public_symbols(&conn, root, dep_path)?;
             let (direct_count, direct_names) =
-                count_symbols_used_in_module(&conn, &dep_symbols, &module_path)?;
+                count_symbols_used_in_module(&conn, dep_path, &module_path)?;
             usage.direct_count = direct_count;
             usage.direct_symbols = direct_names;
         }
 
-        // 2. Check transitive usage (via api dependency chain in transitive_deps table)
+        // 2. A dependency is used transitively when the consumer references a
+        // type it re-exports. Reachability alone is not evidence of usage.
         if check_transitive && usage.direct_count == 0 {
-            let trans_count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM transitive_deps td
-                 JOIN modules m ON td.dependency_id = m.id
-                 WHERE td.module_id = ?1 AND m.name = ?2 AND td.depth > 1",
-                    params![module_id, dep_name],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-
-            if trans_count > 0 {
-                let path: String = conn
-                    .query_row(
-                        "SELECT td.path FROM transitive_deps td
-                     JOIN modules m ON td.dependency_id = m.id
-                     WHERE td.module_id = ?1 AND m.name = ?2 AND td.depth > 1
-                     ORDER BY td.depth LIMIT 1",
-                        params![module_id, dep_name],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or_default();
-
-                usage.transitive_count = 1;
-                let parts: Vec<&str> = path.split(" -> ").collect();
-                if parts.len() >= 2 {
-                    usage
-                        .transitive_via
-                        .push((parts[1].to_string(), vec!["(api chain)".to_string()]));
+            let mut stmt = conn.prepare(
+                "WITH RECURSIVE exported(id) AS (
+                     SELECT md.dep_module_id FROM module_deps md
+                     JOIN modules m ON m.id=md.module_id
+                     WHERE m.name=?1 AND md.dep_kind='api'
+                     UNION
+                     SELECT md.dep_module_id FROM module_deps md
+                     JOIN exported e ON e.id=md.module_id WHERE md.dep_kind='api'
+                 )
+                 SELECT m.name,m.path FROM modules m JOIN exported e ON e.id=m.id
+                 WHERE m.name!=?1 ORDER BY m.name,m.path",
+            )?;
+            let exports = stmt.query_map(params![dep_name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for export in exports {
+                let (name, path) = export?;
+                let (count, names) = count_symbols_used_in_module(&conn, &path, &module_path)?;
+                if count > 0 {
+                    usage.transitive_count += count;
+                    usage.transitive_via.push((name, names));
                 }
             }
         }
@@ -628,65 +619,16 @@ pub fn cmd_unused_deps(
     Ok(())
 }
 
-/// Get public symbols (classes, interfaces) from a module
-fn get_module_public_symbols(
-    conn: &Connection,
-    root: &Path,
-    module_path: &str,
-) -> Result<Vec<String>> {
-    let mut symbols = vec![];
-
-    // First try to get from index
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT s.name FROM symbols s
-         JOIN files f ON s.file_id = f.id
-         WHERE f.path LIKE ?1 AND s.kind IN ('class', 'interface', 'object')
-         LIMIT 100",
-    )?;
-
-    let pattern = format!("{}%", module_path);
-    let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
-
-    for row in rows {
-        if let Ok(name) = row {
-            symbols.push(name);
-        }
-    }
-
-    // If no symbols in index, try to find by scanning files
-    if symbols.is_empty() {
-        let module_dir = root.join(module_path);
-        if module_dir.exists() {
-            let class_re = Regex::new(
-                r"(?m)^\s*(?:public\s+)?(?:abstract\s+)?(?:data\s+)?(?:class|interface|object)\s+(\w+)",
-            )?;
-
-            for entry in WalkDir::new(&module_dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "kt" || ext == "java")
-                        .unwrap_or(false)
-                })
-            {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    for caps in class_re.captures_iter(&content) {
-                        if let Some(name) = caps.get(1) {
-                            symbols.push(name.as_str().to_string());
-                        }
-                    }
-                }
-                if symbols.len() >= 100 {
-                    break;
-                }
-            }
-        }
-    }
-
-    Ok(symbols)
-}
+/// Files belong to their deepest indexed module directory. Literal prefix
+/// comparisons avoid both sibling matches and SQL wildcard interpretation.
+const MODULE_FILE_SCOPE: &str = "
+    (?1='' OR substr(f.path,1,length(?1)+1)=?1||'/')
+    AND NOT EXISTS (
+        SELECT 1 FROM modules child
+        WHERE length(child.path)>length(?1)
+          AND (?1='' OR substr(child.path,1,length(?1)+1)=?1||'/')
+          AND substr(f.path,1,length(child.path)+1)=child.path||'/'
+    )";
 
 // ── module-route ─────────────────────────────────────────────────────────────
 
@@ -1754,27 +1696,33 @@ fn dispatch_render(format: &str, result: &ModuleRouteResult) -> Result<()> {
 /// Uses the refs table for fast lookups instead of scanning files on disk.
 fn count_symbols_used_in_module(
     conn: &Connection,
-    dep_symbols: &[String],
+    dependency_path: &str,
     module_path: &str,
 ) -> Result<(usize, Vec<String>)> {
-    let module_pattern = format!("{}%", module_path);
     let mut used_count = 0;
     let mut used_names = Vec::new();
 
-    let mut stmt = conn.prepare_cached(
-        "SELECT COUNT(*) FROM refs r
-         JOIN files f ON r.file_id = f.id
-         WHERE r.name = ?1 AND f.path LIKE ?2",
-    )?;
+    // Stream every indexed type instead of either truncating the dependency
+    // at 100 types or retaining its whole type population in a Rust Vec.
+    let mut candidates = conn.prepare(&format!(
+        "SELECT DISTINCT s.name FROM symbols s JOIN files f ON s.file_id=f.id
+         WHERE {MODULE_FILE_SCOPE} AND s.kind IN ('class','interface','enum','object')
+         ORDER BY s.name"
+    ))?;
+    let symbols = candidates.query_map(params![dependency_path], |row| row.get::<_, String>(0))?;
 
-    for symbol in dep_symbols {
-        let count: i64 = stmt
-            .query_row(params![symbol, &module_pattern], |row| row.get(0))
-            .unwrap_or(0);
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT EXISTS(SELECT 1 FROM refs r JOIN files f ON r.file_id=f.id
+         WHERE {MODULE_FILE_SCOPE} AND r.name=?2)"
+    ))?;
+
+    for symbol in symbols {
+        let symbol = symbol?;
+        let count: i64 = stmt.query_row(params![module_path, &symbol], |row| row.get(0))?;
         if count > 0 {
             used_count += 1;
             if used_names.len() < 3 {
-                used_names.push(symbol.clone());
+                used_names.push(symbol);
             }
         }
     }

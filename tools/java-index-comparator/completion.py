@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from common import ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot
@@ -47,6 +48,26 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
             raise ToolError('Java-applicable contract was classified outside the task')
         if any(coverage[feature] != 'out-of-scope' for feature in JAVA_EXCLUDED_FEATURES):
             raise ToolError('non-Java contracts were included in final Java coverage')
+        inapplicable = {feature for feature, status in coverage.items() if status == 'inapplicable'}
+        if inapplicable - {'xml-usages:target', 'resource-usages:target'}:
+            raise ToolError('required Java coverage cannot be dismissed as inapplicable')
+        if inapplicable:
+            from android_contracts import verify_absence_evidence
+            verify_absence_evidence(state)
+            absence_value = canonical_json({'absence': True})
+            for feature in inapplicable:
+                parent = feature.removesuffix(':target')
+                absence = state.execute("""SELECT expected_json,actual_json FROM checks
+                    WHERE feature=? AND subject='target-absence' AND status='complete' AND verdict='pass'""",
+                                        (parent,)).fetchone()
+                try:
+                    proved = absence is not None and \
+                        canonical_json(json.loads(absence['expected_json']).get('samples')) == absence_value and \
+                        canonical_json(json.loads(absence['actual_json'])) == absence_value
+                except (ValueError, TypeError, AttributeError):
+                    proved = False
+                if not proved:
+                    raise ToolError('inapplicable target has no executed Android absence evidence')
         if state.execute("""SELECT 1 FROM coverage c WHERE c.status='implemented'
             AND NOT EXISTS (SELECT 1 FROM checks k WHERE k.feature=c.feature) LIMIT 1""").fetchone():
             raise ToolError('implemented coverage contract has no executed check')

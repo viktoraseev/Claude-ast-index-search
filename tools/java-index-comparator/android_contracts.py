@@ -24,6 +24,48 @@ RES_DIRS = {'values', 'layout', 'drawable', 'menu', 'navigation', 'mipmap',
             'anim', 'animator', 'color', 'font', 'interpolator', 'raw', 'transition', 'xml'}
 
 
+def source_traits(path, extension):
+    parts = path.parts
+    resource = any(parts[i] == 'res' and parts[i + 1].split('-')[0] in RES_DIRS
+                   for i in range(len(parts) - 2))
+    relevant = resource or path.name == 'AndroidManifest.xml' or extension in {
+        '.java', '.xml', '.gradle', '.kts', '.kt', '.properties', '.toml'}
+    return resource, relevant
+
+
+def verify_absence_evidence(state):
+    """Read-only proof check; current file contents are bound by inventory SHA."""
+    metadata = dict(state.execute('SELECT key,value FROM metadata'))
+    inventory_digest = hashlib.sha256()
+    count = size = 0
+    for row in state.execute('SELECT * FROM file_inventory ORDER BY rowid'):
+        inventory_digest.update((canonical_json(tuple(row)) + '\n').encode())
+        path = Path(row['path'])
+        resource, relevant = source_traits(path, row['extension'])
+        if row['kind'] == 'link-directory':
+            raise ToolError('Android absence evidence contains an unfollowed directory link')
+        if not relevant:
+            continue
+        count += 1
+        size += row['size']
+        if resource or path.name == 'AndroidManifest.xml' or row['kind'] != 'file' or \
+                count > 100000 or size > 512 * 1024 * 1024 or row['size'] > 4 * 1024 * 1024:
+            raise ToolError('Android absence evidence is inapplicable or exceeds its scan budget')
+        proof = state.execute('SELECT sha256,marker FROM android_applicability WHERE path=?',
+                              (row['path'],)).fetchone()
+        if proof is None or proof['marker'] != 0 or not row['sha256'] or proof['sha256'] != row['sha256']:
+            raise ToolError('Android absence evidence is missing or contradicts the inventory')
+    if inventory_digest.hexdigest() != metadata.get('inventory_sha256'):
+        raise ToolError('Android absence evidence has an incomplete recorded inventory')
+    if state.execute('SELECT count(*) FROM android_applicability').fetchone()[0] != count:
+        raise ToolError('Android absence evidence has an unexpected source population')
+    digest = hashlib.sha256()
+    for row in state.execute('SELECT * FROM android_applicability ORDER BY path'):
+        digest.update(canonical_json((row['path'], row['sha256'], bool(row['marker']))).encode())
+    if digest.hexdigest() != metadata.get('android_applicability_sha256'):
+        raise ToolError('Android absence evidence fingerprint is missing or changed')
+
+
 def applicability(state, root):
     with state:
         state.execute('DELETE FROM android_applicability')
@@ -37,11 +79,7 @@ def applicability(state, root):
     with state:
         for row in state.execute('SELECT * FROM file_inventory ORDER BY path'):
             path = Path(row['path'])
-            parts = path.parts
-            resource = any(parts[i] == 'res' and parts[i + 1].split('-')[0] in RES_DIRS
-                           for i in range(len(parts) - 2))
-            relevant = resource or path.name == 'AndroidManifest.xml' or row['extension'] in {
-                '.java', '.xml', '.gradle', '.kts', '.kt', '.properties', '.toml'}
+            resource, relevant = source_traits(path, row['extension'])
             if not relevant:
                 continue
             if row['kind'] != 'file':
