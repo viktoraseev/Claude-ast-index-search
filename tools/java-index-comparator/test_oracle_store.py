@@ -5,7 +5,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from audit import Fixture, InvocationOracle, SCHEMA, Unsupported
+from audit import Fixture, InvocationOracle, SCHEMA, Unsupported, SearchCollectionCap
 from common import StreamableHttpMcpClient, canonical_json, connect
 from oracle_store import Metrics, OracleStore
 from replay import StoredOracle
@@ -42,6 +42,56 @@ class OracleStorageTests(unittest.TestCase):
         summary = oracle.metrics.summary()
         self.assertEqual(summary['oracle.memory_hit']['count'], 99)
         self.assertEqual(summary['mcp.tool.ide_find_class']['count'], 1)
+
+    def test_capped_broad_navigation_refines_before_requesting_unused_cursor_pages(self):
+        # On the real large target the broad prefix returned 500 rows and a
+        # cursor; collecting more pages failed before name refinement ran.
+        for tool, field in [('ide_find_symbol', 'symbols'), ('ide_find_class', 'classes'),
+                            ('ide_find_file', 'files')]:
+            with self.subTest(tool=tool):
+                self.client.reset_mock()
+                self.client.call.side_effect = [
+                    {field: [{'name': 'Other'}] * 500, 'hasMore': True, 'nextCursor': 'unused'},
+                    AssertionError('capped broad answer must not be paginated'),
+                ]
+                fixture = Fixture(self.root, self.root / 'binary', self.root / 'index', self.state, self.client)
+                with self.assertRaises(SearchCollectionCap):
+                    fixture.paginated('first', tool, {'query': 'E'}, field)
+                self.client.call.assert_called_once()
+
+    def test_symbol_refinement_uses_only_the_complete_narrow_answer(self):
+        exact = {'name': 'Example', 'file': 'Example.java', 'line': 1, 'kind': 'CLASS'}
+        self.client.call.side_effect = [
+            {'symbols': [{'name': 'Unrelated'}] * 500, 'hasMore': True, 'nextCursor': 'unused'},
+            {'symbols': [exact], 'hasMore': False},
+        ]
+        fixture = Fixture(self.root, self.root / 'binary', self.root / 'index', self.state, self.client)
+        self.assertEqual(fixture.oracle_symbols({'id': 'first'}, 'Example'), [exact])
+        self.assertEqual([call.args[1] for call in self.client.call.call_args_list], [
+            {'project_path': str(self.root), 'query': query, 'language': 'Java',
+             'scope': 'project_files', 'includeGenerated': False, 'pageSize': 500}
+            for query in ('E', 'Ex')])
+
+    def test_bounded_prefix_proof_is_reused_only_as_a_partition_trigger(self):
+        self.client.call.return_value = {
+            'symbols': [{'name': 'Unrelated'}] * 500, 'hasMore': True, 'nextCursor': 'never-used'}
+        oracle = InvocationOracle(self.client, self.state)
+        fixture = Fixture(self.root, self.root / 'binary', self.root / 'index', self.state, oracle)
+        for check_id in ('first', 'second'):
+            with self.assertRaises(SearchCollectionCap):
+                fixture.paginated(check_id, 'ide_find_symbol', {'query': 'E'}, 'symbols')
+        self.client.call.assert_called_once()
+        self.assertEqual(self.state.execute('SELECT count(*) FROM pages').fetchone()[0], 2)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0], 1)
+
+    def test_usable_cursor_answers_are_not_cached(self):
+        self.client.call.return_value = {
+            'symbols': [{'name': 'Example'}] * 499, 'hasMore': True, 'nextCursor': 'live'}
+        oracle = InvocationOracle(self.client, self.state)
+        for _ in range(2):
+            oracle.call('ide_find_symbol', {'query': 'E'})
+        self.assertEqual(self.client.call.call_count, 2)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_cache').fetchone()[0], 0)
 
     def test_memory_hits_do_not_reparse_json_and_replies_cannot_be_mutated(self):
         oracle = InvocationOracle(self.client, self.state)

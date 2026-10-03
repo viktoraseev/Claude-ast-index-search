@@ -165,11 +165,18 @@ class InvocationOracle:
             self.metrics.record('mcp.tool.' + tool, time.perf_counter() - started)
 
     def _capture_reply(self, tool, arguments, response, key):
-        # Cursor snapshots may expire independently. Reuse single-page answers;
-        # paginated() still rejects the search collection cap on every use.
+        # Usable cursor pages expire independently and cannot be reused. A
+        # bounded prefix proof is different: paginated() rejects it on every
+        # use, before following its cursor, and refines the query instead.
         with self.state:
             capture = self.store.capture(tool, arguments, response)
-            if key is not None and isinstance(capture, Reply) and not any(capture.get(flag) for flag in ("stale", "truncated", "hasMore", "nextCursor")):
+            field = {'ide_find_class': 'classes', 'ide_find_symbol': 'symbols', 'ide_find_file': 'files'}.get(tool)
+            rows = capture.get(field) if isinstance(capture, Reply) and field else None
+            bounded_prefix = (isinstance(rows, list) and len(rows) >= 500
+                              and all(isinstance(row, dict) for row in rows)
+                              and not (capture.get('hasMore') and not capture.get('nextCursor')))
+            if key is not None and isinstance(capture, Reply) and not any(capture.get(flag) for flag in ('stale', 'truncated')) and \
+                    (bounded_prefix or not any(capture.get(flag) for flag in ('hasMore', 'nextCursor'))):
                 self.state.execute('INSERT OR REPLACE INTO oracle_cache VALUES (?,?)', (key, capture.response_id))
                 self.memory.put(key, capture)
             self.metrics.flush()
@@ -613,17 +620,21 @@ class Fixture:
             cursor = response.get("nextCursor")
             if response.get("hasMore") and not cursor:
                 raise Unsupported("MCP hasMore=true without nextCursor")
+            if cursor and cursor in cursors:
+                raise Unsupported("MCP returned a repeated cursor")
+            # A broad navigation answer at the existing collection bound is
+            # unusable as complete truth even when it has a cursor. Refine the
+            # query before fetching pages that will be discarded anyway; large
+            # real-project prefixes can lose their cursor during collection.
+            if tool in {"ide_find_class", "ide_find_symbol", "ide_find_file"} and len(items) >= 500:
+                raise SearchCollectionCap("search reached navigation collection cap; query needs partitioning")
             if not cursor:
-                # This plugin has a hard 500-result search collection cap.
-                if tool in {"ide_find_class", "ide_find_symbol", "ide_find_file"} and len(items) >= 500:
-                    raise SearchCollectionCap("search reached server collection cap; query needs partitioning")
+                # Text at the collection bound is not complete truth either.
                 if tool == "ide_search_text" and len(items) >= 5000:
                     raise SearchCollectionCap("text search reached server collection cap; query needs partitioning")
                 if tool == "ide_find_references" and response.get("totalIsExact") is False:
                     raise Unsupported("MCP reference total is not exact")
                 break
-            if cursor in cursors:
-                raise Unsupported("MCP returned a repeated cursor")
             cursors.add(cursor)
             page += 1
             arguments = {"project_path": str(self.root), "pageSize": 500, "cursor": cursor}
