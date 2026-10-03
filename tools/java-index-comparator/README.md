@@ -29,6 +29,14 @@ explicit source parent edges, including external parents, and MCP project childr
 Search reference aggregation, ranking, command options, and other command contracts
 remain explicitly pending. A passing subset never establishes a complete audit.
 
+The five Perl commands share per-file MCP text anchors, literal query filters,
+exact import pragma exclusions, and ordered limit checks. They compare lexical
+line locations, not semantic Perl navigation. A full file-type inventory proves
+language absence independently, and the CLI must still return empty results.
+Relevant links, mixed-case suffixes, and ignored source scopes remain unresolved.
+Synthetic paginated-oracle tests validate the adapter and production CLI; they
+do not establish live-project MCP equivalence.
+
 Replay streams the first 100 failures in capture order plus every unsupported
 or error contract. Each check executes the current CLI against a rebuilt index;
 all recorded oracle operations and pagination requests are bound to their

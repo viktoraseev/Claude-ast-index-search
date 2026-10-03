@@ -174,6 +174,26 @@ def set_phase(state: sqlite3.Connection, round_id: int, phase: str, **values: st
         state.execute(f"UPDATE rounds SET {','.join(assignments)} WHERE id=?", (phase, *values.values(), round_id))
 
 
+def verify_equivalence(state: sqlite3.Connection, summary: dict, directory: Path) -> None:
+    """Do not let optimizations silently drop established case/feature scopes."""
+    policy = state.execute("SELECT value FROM configuration WHERE key='equivalence_reference'").fetchone()
+    if not policy or summary.get('remaining_checks') or any(summary.get('counts', {}).get(key) for key in ('fail', 'unsupported', 'error')):
+        # A deliberately bounded repair batch is not a completed full audit.
+        return
+    try:
+        reference = json.loads(policy[0])
+    except (TypeError, ValueError) as error:
+        raise ToolError('invalid persisted audit-equivalence reference') from error
+    if not isinstance(reference, str) or not reference:
+        raise ToolError('invalid persisted audit-equivalence reference')
+    from check_audit_equivalence import compare
+    result = compare(Path(reference), Path(summary['evidence']), directory / 'audit-equivalence.sqlite')
+    if not result['verified']:
+        raise ToolError('audit equivalence failed; see private case-level report before continuing')
+    print(canonical_json({'audit_equivalence': {key: result[key] for key in
+                                               ('original_cases', 'present_cases', 'additional_cases', 'text_truth_cases', 'verified')}}), flush=True)
+
+
 def create_or_find_pr(repository: Path, target: str, branch: str, directory: Path) -> str:
     remote = git(repository, "remote", "get-url", "origin")
     match = re.search(r"github\.com[:/]([^/]+)/[^/]+(?:\.git)?$", remote)
@@ -259,6 +279,9 @@ def run(arguments: argparse.Namespace) -> int:
                 if getattr(arguments, 'defer_pr', None) is not None:
                     state.execute("INSERT OR REPLACE INTO configuration VALUES ('defer_pr',?)",
                                   (canonical_json(arguments.defer_pr),))
+                if getattr(arguments, 'equivalence_reference', None) is not None:
+                    state.execute("INSERT OR REPLACE INTO configuration VALUES ('equivalence_reference',?)",
+                                  (canonical_json(str(arguments.equivalence_reference.resolve())),))
             resume_batch = getattr(arguments, "resume_batch", None)
             if resume_batch is not None:
                 row = state.execute("SELECT * FROM rounds WHERE phase!='done' ORDER BY id DESC LIMIT 1").fetchone()
@@ -307,6 +330,7 @@ def run(arguments: argparse.Namespace) -> int:
                         )
                         summary = scan(scan_arguments)
                         print(canonical_json({key: summary[key] for key in ("counts", "remaining_checks", "unimplemented_features", "complete")}), flush=True)
+                        verify_equivalence(state, summary, directory)
                         if summary["complete"]:
                             set_phase(state, round_id, "pr", summary_json=canonical_json(summary))
                             continue
@@ -323,6 +347,7 @@ def run(arguments: argparse.Namespace) -> int:
                         reload_driver(completed)
                     elif phase == "verify":
                         summary = json.loads(row["summary_json"])
+                        verify_equivalence(state, summary, directory)
                         try:
                             logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
                             # Fixture tests invoke the production release CLI;
@@ -364,6 +389,7 @@ def run(arguments: argparse.Namespace) -> int:
                         set_phase(state, round_id, "done")
                         completed += 1
                     elif phase == "pr":
+                        verify_equivalence(state, json.loads(row['summary_json']), directory)
                         logged(["cargo", "test", "--release", "--workspace"], repository, directory, "final-tests")
                         logged(["git", "push", "origin", branch], repository, directory, "final-push")
                         deferred = state.execute("SELECT value FROM configuration WHERE key='defer_pr'").fetchone()
@@ -404,6 +430,8 @@ def main() -> int:
     pr_policy.add_argument('--create-pr', dest='defer_pr', action='store_false', default=None,
                            help='Create the PR after a complete audit, overriding a persisted deferral')
     parser.add_argument("--seed-evidence", type=Path)
+    parser.add_argument('--equivalence-reference', type=Path,
+                        help='Preserve prior full-audit case IDs/feature coverage/text truth; persists across resumes')
     parser.add_argument("--resume-batch", type=Path,
                         help="Resume a stopped audit using a batch revalidated against the current binary")
     parser.add_argument("--timeout", type=float, default=120)

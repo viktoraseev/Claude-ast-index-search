@@ -24,6 +24,10 @@ SCHEMA = '''CREATE TABLE IF NOT EXISTS file_inventory(
     size INTEGER NOT NULL, modified INTEGER NOT NULL, sha256 TEXT NOT NULL
 );'''
 
+# Fingerprint every source type used by a lexical contract, including Perl
+# files that are not in the Java navigation snapshot.
+LEXICAL_EXTENSIONS = {'.kt', '.kts', '.swift', '.pm', '.pl', '.pod', '.t'}
+
 
 def inventory_rows(root):
     """Bound memory to one directory listing and a streamed file hash."""
@@ -38,7 +42,7 @@ def inventory_rows(root):
             kind = 'link-directory' if name in names else 'link-file' if path.is_symlink() else 'file'
             extension = path.suffix.lower()
             fingerprint = (os.readlink(path) if path.is_symlink() else
-                           file_sha256(path) if extension in {'.kt', '.kts', '.swift'} else '')
+                           file_sha256(path) if extension in LEXICAL_EXTENSIONS else '')
             yield (path.relative_to(root).as_posix(), extension, kind,
                    stat.st_size, stat.st_mtime_ns, fingerprint)
 
@@ -62,25 +66,25 @@ def inventory(state, root):
     return digest.hexdigest()
 
 
-def applicable_paths(state, feature):
-    extensions = EXTENSIONS[feature]
+def applicable_paths(state, feature, contracts=EXTENSIONS):
+    extensions = contracts[feature]
     return state.execute('SELECT * FROM file_inventory WHERE extension IN (' +
                          ','.join('?' for _ in extensions) + ') ORDER BY path', extensions)
 
 
-def applicability(state, feature):
+def applicability(state, feature, contracts=EXTENSIONS):
     if not state.execute("SELECT 1 FROM metadata WHERE key='inventory_sha256'").fetchone():
         return 'pending', 'full file-type inventory has not been completed'
     if state.execute("SELECT 1 FROM file_inventory WHERE kind='link-directory' LIMIT 1").fetchone():
         return 'pending', 'inventory contains an untraversed directory link; absence cannot be established'
-    rows = applicable_paths(state, feature)
+    rows = applicable_paths(state, feature, contracts)
     first = next(rows, None)
     if first is None:
-        return 'inapplicable', 'independent source inventory: no ' + '/'.join(EXTENSIONS[feature]) + ' files; CLI empty-result checks required'
+        return 'inapplicable', 'independent source inventory: no ' + '/'.join(contracts[feature]) + ' files; CLI empty-result checks required'
     if state.execute('SELECT 1 FROM file_inventory WHERE kind!=\'file\' AND extension IN (' +
-                     ','.join('?' for _ in EXTENSIONS[feature]) + ') LIMIT 1', EXTENSIONS[feature]).fetchone():
+                     ','.join('?' for _ in contracts[feature]) + ') LIMIT 1', contracts[feature]).fetchone():
         return 'pending', 'relevant source link is not followed; source scope unresolved'
-    if any(Path(row['path']).suffix != row['extension'] for row in applicable_paths(state, feature)):
+    if any(Path(row['path']).suffix != row['extension'] for row in applicable_paths(state, feature, contracts)):
         return 'pending', 'uppercase source suffix requires a separate CLI/oracle scope contract'
     # Presence in the full inventory proves applicability, but does not prove
     # that the CLI and IDE search the same ignored/generated source scope.
@@ -89,7 +93,7 @@ def applicability(state, feature):
     body = source.read_text().split('const EXCLUDED_DIRS:', 1)[1].split('];', 1)[0]
     excluded = set(re.findall(r'"([^"]+)"', body))
     if any(any(part.startswith('.') or part in excluded for part in Path(row['path']).parts[:-1])
-           for row in applicable_paths(state, feature)):
+           for row in applicable_paths(state, feature, contracts)):
         return 'pending', 'applicable source exists in hidden/generated directories; CLI/oracle source scope alignment remains unresolved'
     if any(Path(row['path']).name in {'.gitignore', '.arcignore', '.ignore'} and row['size']
            for row in state.execute('SELECT path,size FROM file_inventory')):

@@ -37,6 +37,7 @@ from build_index import build_ast_index, freeze_binary
 from java_structure import structure_server
 from oracle_store import Metrics, OracleStore, Reply, ReplyCache, SCHEMA as ORACLE_SCHEMA
 import mobile_contracts
+import perl_contracts
 import text_snapshot
 
 
@@ -917,17 +918,18 @@ class Fixture:
             mobile_contracts.inventory(self.state, self.root)
             self._inventory_ready = True
         feature = check['feature']
+        contracts = perl_contracts if feature in perl_contracts.EXTENSIONS else mobile_contracts
         query = json.loads(check['subject'])['query']
-        status, reason = mobile_contracts.applicability(self.state, feature)
+        status, reason = contracts.applicability(self.state, feature)
         if status == 'pending':
             raise Unsupported(reason)
         expected = set()
-        for row in mobile_contracts.applicable_paths(self.state, feature):
+        for row in contracts.applicable_paths(self.state, feature):
             file = row['path']
             path = self.root / file
             if file_sha256(path) != row['sha256']:
-                raise ToolError('mobile source changed after inventory')
-            pattern = mobile_contracts.query_pattern(feature, query, row['extension'])
+                raise ToolError('lexical source changed after inventory')
+            pattern = contracts.query_pattern(feature, query, row['extension'])
             # Partition by inventory file before querying, so every pagination
             # chain has an explicit language/root scope and the Java fallback
             # cannot silently erase Kotlin/Swift matches at the collection cap.
@@ -940,7 +942,7 @@ class Fixture:
             for match in matches:
                 line = match.get('line')
                 if relative_path(match.get('file', match.get('path')), self.root) != file or not isinstance(line, int) or line < 1:
-                    raise Unsupported('mobile text oracle returned an invalid scope/location')
+                    raise Unsupported('lexical text oracle returned an invalid scope/location')
                 locations.add(line)
             # Only one file is retained at a time, and oracle columns on the
             # same line collapse into the CLI's line-oriented identity.
@@ -950,22 +952,22 @@ class Fixture:
                         continue
                     locations.remove(number)
                     if not re.search(pattern, line):
-                        raise Unsupported('mobile oracle anchor differs from source snapshot')
-                    if mobile_contracts.accepts(feature, query, line):
+                        raise Unsupported('lexical oracle anchor differs from source snapshot')
+                    if contracts.accepts(feature, query, line):
                         expected.add((file, number))
                         if len(expected) >= 1000000:
-                            raise Unsupported('mobile search exceeds bounded CLI collection limit')
+                            raise Unsupported('lexical search exceeds bounded CLI collection limit')
             if locations:
-                raise Unsupported('mobile oracle line exceeds source snapshot')
+                raise Unsupported('lexical oracle line exceeds source snapshot')
         ordered = sorted(expected)
         if len(ordered) >= 1000000:
-            raise Unsupported('mobile search exceeds bounded CLI collection limit')
+            raise Unsupported('lexical search exceeds bounded CLI collection limit')
         arguments = [] if query is None else [query]
         outputs, expected_keys, actual_keys = {}, set(), set()
         for limit in sorted({0, 1, 3, 1000000}):
             output = self.text_cli(feature, *arguments, '--limit', str(limit))
             outputs[str(limit)] = output
-            actual = mobile_contracts.output_locations(feature, output, self.root, limit)
+            actual = contracts.output_locations(feature, output, self.root, limit)
             expected_keys.update((limit, index, *location) for index, location in enumerate(ordered[:limit]))
             actual_keys.update((limit, index, *location) for index, location in enumerate(actual))
         return {'source': reason, 'locations': ordered}, outputs, expected_keys, actual_keys
@@ -1335,7 +1337,7 @@ class Fixture:
                 handler = self.introspection_check
             if check['feature'] in INTERNAL_FEATURES:
                 handler = self.map_check if check['feature'] == 'map' else self.analysis_management_check
-            if check['feature'] in mobile_contracts.EXTENSIONS:
+            if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
             if handler is None:
                 raise Unsupported(f"no live handler for {check['feature']}")
@@ -1478,6 +1480,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
     mobile_contracts.plan_mobile(state, root)
+    perl_contracts.plan_perl(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

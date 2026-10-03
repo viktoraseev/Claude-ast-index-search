@@ -12,6 +12,25 @@ from common import ToolError, connect
 
 
 class CycleTests(unittest.TestCase):
+    def test_equivalence_gate_is_persisted_and_rejects_dropped_cases(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            state = connect(directory / 'cycle.sqlite')
+            self.addCleanup(state.close)
+            state.executescript(cycle.SCHEMA)
+            with state:
+                state.execute("INSERT INTO configuration VALUES ('equivalence_reference',?)",
+                              (cycle.canonical_json(str(directory / 'reference.sqlite')),))
+            summary = {'evidence': str(directory / 'new.sqlite'), 'remaining_checks': 0, 'counts': {'pass': 10}}
+            with patch('check_audit_equivalence.compare', return_value={'verified': False}) as check:
+                with self.assertRaises(ToolError):
+                    cycle.verify_equivalence(state, summary, directory)
+                check.assert_called_once()
+            with patch('check_audit_equivalence.compare') as check:
+                for partial in ({'remaining_checks': 1}, {'counts': {'fail': 1}}, {'counts': {'error': 1}}):
+                    cycle.verify_equivalence(state, {**summary, **partial}, directory)
+                check.assert_not_called()
+
     def test_empty_problem_batch_prioritizes_a_coverage_family(self):
         summary = {"evidence": "evidence.sqlite", "counts": {"pass": 100},
                    "unimplemented_features": 53}

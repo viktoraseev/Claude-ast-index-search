@@ -1,207 +1,138 @@
-//! Perl-specific commands
-//!
-//! Commands for working with Perl codebases:
-//! - perl_exports: Find @EXPORT/@EXPORT_OK definitions
-//! - perl_subs: Find subroutine definitions
-//! - perl_pod: Find POD documentation
-//! - perl_tests: Find test assertions
-//! - perl_imports: Find use/require statements
+//! Lexical Perl searches with accepted-line limits and stable source ordering.
 
 use std::path::Path;
 
 use anyhow::Result;
 use colored::Colorize;
 
-use super::{relative_path, search_files_limited};
+use super::{relative_path, search_files_filtered};
 
-/// Find Perl @EXPORT and @EXPORT_OK definitions
-pub fn cmd_perl_exports(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    // Search for @EXPORT and @EXPORT_OK definitions
-    let pattern = r"our\s+@EXPORT|our\s+@EXPORT_OK|@EXPORT\s*=|@EXPORT_OK\s*=";
-
-    let mut results: Vec<(String, usize, String)> = vec![];
-
-    search_files_limited(root, pattern, &["pm"], limit, |path, line_num, line| {
-        if let Some(q) = query {
-            if !line.to_lowercase().contains(&q.to_lowercase()) {
-                return;
-            }
-        }
-
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(100).collect();
-        results.push((rel_path, line_num, content));
-    })?;
-
-    println!("{}", format!("Perl exports ({}):", results.len()).bold());
-
-    for (path, line_num, content) in &results {
-        println!("  {}:{}", path.cyan(), line_num);
-        println!("    {}", content);
-    }
-
-    Ok(())
+fn matches_query(text: &str, query: Option<&str>) -> bool {
+    query.is_none_or(|q| text.to_lowercase().contains(&q.to_lowercase()))
 }
 
-/// Find Perl subroutine definitions
-pub fn cmd_perl_subs(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    // Search for sub definitions
-    let pattern = r"^\s*sub\s+\w+";
+/// Read the identifier after sub/use/require, without its arguments or body.
+fn declaration_name(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace();
+    words.next()?;
+    words
+        .next()?
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
+        .next()
+}
 
-    let mut results: Vec<(String, usize, String)> = vec![];
+fn is_pragma(line: &str) -> bool {
+    let mut words = line.split_whitespace();
+    if words.next() != Some("use") {
+        return false;
+    }
+    declaration_name(line).is_some_and(|name| {
+        matches!(
+            name,
+            "strict" | "warnings" | "constant" | "base" | "parent" | "utf8"
+        ) || name
+            .strip_prefix('v')
+            .is_some_and(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()))
+    })
+}
 
-    search_files_limited(
+/// Collect only accepted lines, in path/line order, using the shared bounded search.
+fn print_search<K>(
+    root: &Path,
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    title: &str,
+    width: usize,
+    keep: K,
+) -> Result<()>
+where
+    K: Fn(&str) -> bool + Sync,
+{
+    let mut results = Vec::new();
+    search_files_filtered(
         root,
         pattern,
-        &["pm", "pl", "t"],
+        extensions,
         limit,
+        |_, line| keep(line),
         |path, line_num, line| {
-            if let Some(q) = query {
-                if !line.to_lowercase().contains(&q.to_lowercase()) {
-                    return;
-                }
-            }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(80).collect();
-            results.push((rel_path, line_num, content));
+            let content: String = line.trim().chars().take(width).collect();
+            results.push((relative_path(root, path), line_num, content));
         },
     )?;
-
-    println!(
-        "{}",
-        format!("Perl subroutines ({}):", results.len()).bold()
-    );
-
-    for (path, line_num, content) in &results {
+    println!("{}", format!("{} ({}):", title, results.len()).bold());
+    for (path, line_num, content) in results {
         println!("  {}:{}", path.cyan(), line_num);
         println!("    {}", content);
     }
-
     Ok(())
 }
 
-/// Find POD documentation sections
-pub fn cmd_perl_pod(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    // Search for POD documentation sections
-    // =head1, =head2, =head3, =head4, =item, =over, =back, =pod, =cut, =begin, =end
-    let pattern = r"^=(head[1-4]|item|over|back|pod|cut|begin|end|for)\b";
-
-    let mut results: Vec<(String, usize, String)> = vec![];
-
-    search_files_limited(
+/// Find Perl @EXPORT and @EXPORT_OK definitions.
+pub fn cmd_perl_exports(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    print_search(
         root,
-        pattern,
+        r"\bour\s+@EXPORT(?:_OK)?\b|@EXPORT(?:_OK)?\s*=",
+        &["pm"],
+        limit,
+        "Perl exports",
+        100,
+        |line| matches_query(line, query),
+    )
+}
+
+/// Find Perl subroutine definitions, filtered by declared name.
+pub fn cmd_perl_subs(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    print_search(
+        root,
+        r"^\s*sub\s+\w+",
+        &["pm", "pl", "t"],
+        limit,
+        "Perl subroutines",
+        80,
+        |line| declaration_name(line).is_some_and(|name| matches_query(name, query)),
+    )
+}
+
+/// Find POD documentation sections.
+pub fn cmd_perl_pod(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
+    print_search(
+        root,
+        r"^=(head[1-4]|item|over|back|pod|cut|begin|end|for)\b",
         &["pm", "pl", "pod"],
         limit,
-        |path, line_num, line| {
-            if let Some(q) = query {
-                if !line.to_lowercase().contains(&q.to_lowercase()) {
-                    return;
-                }
-            }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(100).collect();
-            results.push((rel_path, line_num, content));
-        },
-    )?;
-
-    println!(
-        "{}",
-        format!("POD documentation ({}):", results.len()).bold()
-    );
-
-    for (path, line_num, content) in &results {
-        println!("  {}:{}", path.cyan(), line_num);
-        println!("    {}", content);
-    }
-
-    Ok(())
+        "POD documentation",
+        100,
+        |line| matches_query(line, query),
+    )
 }
 
-/// Find Perl test assertions (Test::More, Test::Simple)
+/// Find lexical Test::More / Test::Simple assertion lines.
 pub fn cmd_perl_tests(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    // Search for Test::More and Test::Simple assertions
-    // ok(), is(), isnt(), like(), unlike(), cmp_ok(), is_deeply(), diag(), pass(), fail()
-    // subtest, plan, done_testing, SKIP, TODO
-    let pattern = r"\b(ok|is|isnt|like|unlike|cmp_ok|is_deeply|diag|pass|fail|subtest|plan|done_testing|SKIP|TODO)\s*[\(\{]";
-
-    let mut results: Vec<(String, usize, String)> = vec![];
-
-    search_files_limited(
+    print_search(
         root,
-        pattern,
+        r"\b(ok|is|isnt|like|unlike|cmp_ok|is_deeply|diag|pass|fail|subtest|plan|done_testing|SKIP|TODO)\s*[\(\{]",
         &["t", "pm", "pl"],
         limit,
-        |path, line_num, line| {
-            if let Some(q) = query {
-                if !line.to_lowercase().contains(&q.to_lowercase()) {
-                    return;
-                }
-            }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(100).collect();
-            results.push((rel_path, line_num, content));
-        },
-    )?;
-
-    println!("{}", format!("Perl tests ({}):", results.len()).bold());
-
-    for (path, line_num, content) in &results {
-        println!("  {}:{}", path.cyan(), line_num);
-        println!("    {}", content);
-    }
-
-    Ok(())
+        "Perl tests",
+        100,
+        |line| matches_query(line, query),
+    )
 }
 
-/// Find Perl use/require statements
+/// Find Perl use/require statements, excluding exact use pragmas.
 pub fn cmd_perl_imports(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
-    // Search for use/require statements
-    let pattern = r"^\s*(use|require)\s+[A-Za-z]";
-
-    let mut results: Vec<(String, usize, String)> = vec![];
-
-    search_files_limited(
+    print_search(
         root,
-        pattern,
+        r"^\s*(use|require)\s+[A-Za-z]",
         &["pm", "pl", "t"],
         limit,
-        |path, line_num, line| {
-            // Skip 'use strict', 'use warnings', 'use constant', 'use base', 'use parent'
-            let trimmed = line.trim();
-            if trimmed.starts_with("use strict")
-                || trimmed.starts_with("use warnings")
-                || trimmed.starts_with("use constant")
-                || trimmed.starts_with("use base")
-                || trimmed.starts_with("use parent")
-                || trimmed.starts_with("use utf8")
-                || trimmed.starts_with("use v5")
-                || trimmed.starts_with("use 5.")
-            {
-                return;
-            }
-
-            if let Some(q) = query {
-                if !line.to_lowercase().contains(&q.to_lowercase()) {
-                    return;
-                }
-            }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(100).collect();
-            results.push((rel_path, line_num, content));
+        "Perl imports",
+        100,
+        |line| {
+            !is_pragma(line)
+                && declaration_name(line).is_some_and(|name| matches_query(name, query))
         },
-    )?;
-
-    println!("{}", format!("Perl imports ({}):", results.len()).bold());
-
-    for (path, line_num, content) in &results {
-        println!("  {}:{}", path.cyan(), line_num);
-        println!("    {}", content);
-    }
-
-    Ok(())
+    )
 }
