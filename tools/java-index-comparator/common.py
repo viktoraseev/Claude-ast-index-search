@@ -58,9 +58,18 @@ def file_sha256(path: Path) -> str:
 
 def adapter_digest() -> str:
     """Invalidate checkpoints when execution or normalization code changes."""
-    directory = Path(__file__).parent
-    return stable_id({name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
-                      for name in ("audit.py", "common.py", "oracle_store.py", "build_index.py", "replay.py", "java_structure.py", "JavaStructure.java", "mobile_contracts.py", "perl_contracts.py", "annotation_contracts.py", "text_snapshot.py", "lifecycle_contracts.py", "root_contracts.py", "module_contracts.py", "install_contracts.py", "profile_contracts.py", "delegate_contracts.py", "route_contracts.py", "vcs_contracts.py", "stack_contracts.py", "context_contracts.py")})
+    directory = Path(__file__).resolve().parent
+    sources = {}
+    # This is one flat directory of comparator code, never target source or
+    # artifact traversal. A new helper cannot fall out of a handwritten list.
+    for path in directory.iterdir():
+        if path.suffix not in {'.py', '.java'} or path.name.startswith('test_'):
+            continue
+        if path.is_symlink():
+            raise ToolError('comparison runtime source link has unresolved fingerprint scope')
+        if path.is_file():
+            sources[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return stable_id(sources)
 
 
 def connect(path: Path, *, read_only: bool = False) -> sqlite3.Connection:

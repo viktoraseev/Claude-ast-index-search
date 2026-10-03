@@ -47,6 +47,7 @@ import profile_contracts
 import delegate_contracts
 import route_contracts
 import android_contracts
+import android_syntax_contracts
 import vcs_contracts
 import stack_contracts
 import context_contracts
@@ -478,6 +479,7 @@ class Fixture:
         self._install_results = None
         self._install_error = None
         self._android_results = None
+        self._android_syntax_results = None
         self._context_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
@@ -1642,6 +1644,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def android_syntax_check(self, check: sqlite3.Row):
+        if self._android_syntax_results is None:
+            self._android_syntax_results = android_syntax_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._android_syntax_results)
+        return {'source': android_syntax_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def context_check(self, check: sqlite3.Row):
         if self._context_results is None:
             self._context_results = context_contracts.exercise(self.binary, self.database.parent)
@@ -1710,6 +1720,8 @@ class Fixture:
                 handler = self.stack_check
             if check['feature'] in android_contracts.FEATURES:
                 handler = self.android_check
+            if check['feature'] in android_syntax_contracts.FEATURES:
+                handler = self.android_syntax_check
             if check['feature'] == 'api':
                 handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
@@ -1779,6 +1791,7 @@ def required_features(help_text: str = '') -> set[str]:
                      "android:syntax-resolution", "xml-usages:target", "resource-usages:target"})
     features.update(LIVE_FEATURES)
     features.update(route_contracts.FEATURES)
+    features.update(android_syntax_contracts.FEATURES)
     features.update(context_contracts.PENDING)
     return features
 
@@ -1904,6 +1917,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     profile_contracts.plan_profiles(state, root)
     route_contracts.plan_routes(state, root)
     android_contracts.plan_android(state, root)
+    android_syntax_contracts.plan_syntax(state, root)
     vcs_contracts.plan_vcs(state, root)
     stack_contracts.plan_stacks(state, root)
     context_contracts.plan_context(state, root)

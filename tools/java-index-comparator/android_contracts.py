@@ -99,7 +99,7 @@ def plan_android(state, root):
                               (stable_id({'feature': feature, 'subject': 'target-absence'}), feature, 'target-absence'))
         state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)',
                       ('android:syntax-resolution', 'pending',
-                       'Java static-import/namespaced/dependency resource resolution, comment/string lexical scope and XML Java identifiers/multiline/comment/attribute syntax require independent source contracts; ownership fixture does not establish them'))
+                       'Java static-import/namespaced/dependency resource resolution and comment/string lexical scope, XML namespace/entity resolution and additional definition types remain unresolved; disposable XML syntax fixtures do not establish target Android syntax equivalence'))
 
 
 def observation(text):

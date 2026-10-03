@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from audit import JAVA_EXCLUDED_FEATURES, SCHEMA, required_features
 from common import ToolError, adapter_digest, connect, file_sha256, source_snapshot
@@ -67,6 +68,42 @@ class CompletionTests(unittest.TestCase):
         (self.root / 'Example.java').write_text('class Changed {}')
         with self.assertRaises(StaleEvidence):
             self.check()
+
+    def test_android_contract_change_invalidates_the_actual_final_gate(self):
+        self.assertTrue(self.check()['verified'])
+        read = Path.read_bytes
+        def changed(path):
+            content = read(path)
+            return content + b'\n# changed Android contract\n' if path.name == 'android_contracts.py' else content
+        with patch.object(Path, 'read_bytes', changed):
+            with self.assertRaises(StaleEvidence):
+                self.check()
+
+    def test_new_runtime_helpers_are_automatically_included_in_the_final_gate(self):
+        directory = Path(__file__).resolve().parent
+        future = directory / 'future_contracts.py'
+        iterate, is_file, read, is_link = Path.iterdir, Path.is_file, Path.read_bytes, Path.is_symlink
+        def files(path):
+            yield from iterate(path)
+            if path == directory:
+                yield future
+        with patch.object(Path, 'iterdir', files), \
+                patch.object(Path, 'is_file', lambda path: path == future or is_file(path)), \
+                patch.object(Path, 'read_bytes', lambda path: b'# new runtime contract\n' if path == future else read(path)):
+            with self.assertRaises(StaleEvidence):
+                self.check()
+            with patch.object(Path, 'is_symlink', lambda path: path == future or is_link(path)):
+                with self.assertRaisesRegex(ToolError, 'source link'):
+                    self.check()
+
+    def test_test_only_edits_do_not_change_the_execution_fingerprint(self):
+        previous = adapter_digest()
+        read = Path.read_bytes
+        def changed(path):
+            content = read(path)
+            return content + b'\n# changed test only\n' if path.name.startswith('test_') else content
+        with patch.object(Path, 'read_bytes', changed):
+            self.assertEqual(adapter_digest(), previous)
 
     def test_same_size_and_mtime_descriptor_edit_invalidates_actual_final_gate(self):
         path = self.root / 'pom.xml'

@@ -14,6 +14,7 @@ use crate::db;
 use crate::minified;
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
 
+mod android_xml;
 mod maven_manifest;
 /// File-size cap for parsing. Larger files are recorded in the `files`
 /// table (so `update` still tracks their mtime) but never parsed — their
@@ -4027,25 +4028,6 @@ pub fn index_xml_usages(
 ) -> Result<usize> {
     let module_lookup = ModuleLookup::from_db(conn)?;
 
-    // Regex for class names in XML
-    // Full class name: <com.example.MyView ...>
-    static FULL_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"<([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)").unwrap()
-    });
-
-    let full_class_re = &*FULL_CLASS_RE;
-    // view class="..." or fragment android:name="..."
-    static CLASS_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r#"(?:class|android:name)\s*=\s*["']([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)["']"#).unwrap()
-    });
-
-    let class_attr_re = &*CLASS_ATTR_RE;
-    // android:id="@+id/xxx"
-    static ID_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"android:id\s*=\s*["']@\+?id/([^"']+)["']"#).unwrap());
-
-    let id_re = &*ID_RE;
-
     if progress {
         eprintln!(
             "Found {} XML layout files to index...",
@@ -4096,47 +4078,43 @@ pub fn index_xml_usages(
                             Err(_) => return Vec::new(),
                         };
 
+                        let visible = android_xml::visible(&content);
                         let mut rows = Vec::new();
-                        for (line_idx, line) in content.lines().enumerate() {
-                            if !line.contains('.')
-                                && !line.contains("class")
-                                && !line.contains("android:name")
-                            {
-                                continue;
+                        for tag in android_xml::tags(&visible) {
+                            let element_id = tag
+                                .attribute("android:id")
+                                .and_then(|a| {
+                                    a.value
+                                        .strip_prefix("@+id/")
+                                        .or_else(|| a.value.strip_prefix("@id/"))
+                                })
+                                .map(str::to_owned);
+                            if android_xml::is_java_class(tag.name) {
+                                rows.push((
+                                    module_id,
+                                    rel_path.clone(),
+                                    tag.line as i64,
+                                    tag.name.to_owned(),
+                                    "view_tag",
+                                    element_id.clone(),
+                                ));
                             }
-
-                            let line_num = line_idx as i64 + 1;
-                            let element_id = id_re
-                                .captures(line)
-                                .map(|c| c.get(1).unwrap().as_str().to_string());
-
-                            if line.contains('<') && line.contains('.') {
-                                for caps in full_class_re.captures_iter(line) {
-                                    rows.push((
-                                        module_id,
-                                        rel_path.clone(),
-                                        line_num,
-                                        caps.get(1).unwrap().as_str().to_string(),
-                                        "view_tag",
-                                        element_id.clone(),
-                                    ));
-                                }
-                            }
-
-                            if line.contains("class") || line.contains("android:name") {
-                                let usage_type = if line.contains("<fragment")
-                                    || line.contains("android:name")
+                            for attribute in &tag.attributes {
+                                if matches!(attribute.name, "class" | "android:name")
+                                    && android_xml::is_java_class(attribute.value)
                                 {
-                                    "fragment"
-                                } else {
-                                    "view_class_attr"
-                                };
-                                for caps in class_attr_re.captures_iter(line) {
+                                    let usage_type = if tag.name == "fragment"
+                                        || attribute.name == "android:name"
+                                    {
+                                        "fragment"
+                                    } else {
+                                        "view_class_attr"
+                                    };
                                     rows.push((
                                         module_id,
                                         rel_path.clone(),
-                                        line_num,
-                                        caps.get(1).unwrap().as_str().to_string(),
+                                        attribute.line as i64,
+                                        attribute.value.to_owned(),
                                         usage_type,
                                         element_id.clone(),
                                     ));
@@ -4246,24 +4224,6 @@ pub fn index_resources(
 
     let xml_ref_re = &*XML_REF_RE;
 
-    // Resource definitions regex for values/*.xml
-    static STRING_DEF_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"<string\s+name="([^"]+)""#).unwrap());
-
-    let string_def_re = &*STRING_DEF_RE;
-    static COLOR_DEF_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"<color\s+name="([^"]+)""#).unwrap());
-
-    let color_def_re = &*COLOR_DEF_RE;
-    static DIMEN_DEF_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"<dimen\s+name="([^"]+)""#).unwrap());
-
-    let dimen_def_re = &*DIMEN_DEF_RE;
-    static STYLE_DEF_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"<style\s+name="([^"]+)""#).unwrap());
-
-    let style_def_re = &*STYLE_DEF_RE;
-
     {
         let mut res_stmt = tx.prepare_cached(
             "INSERT INTO resources (module_id, type, name, file_path, line) VALUES (?1, ?2, ?3, ?4, ?5)"
@@ -4303,52 +4263,19 @@ pub fn index_resources(
             // Values files (strings, colors, dimens, styles)
             if rel_path.contains("/values") && rel_path.ends_with(".xml") {
                 if let Ok(content) = fs::read_to_string(res_path) {
-                    for (line_num, line) in content.lines().enumerate() {
-                        let line_num = line_num + 1;
-
-                        if let Some(caps) = string_def_re.captures(line) {
-                            let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![
-                                module_id,
-                                "string",
-                                name,
-                                rel_path,
-                                line_num as i64
-                            ])?;
-                            resource_count += 1;
-                        }
-                        if let Some(caps) = color_def_re.captures(line) {
-                            let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![
-                                module_id,
-                                "color",
-                                name,
-                                rel_path,
-                                line_num as i64
-                            ])?;
-                            resource_count += 1;
-                        }
-                        if let Some(caps) = dimen_def_re.captures(line) {
-                            let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![
-                                module_id,
-                                "dimen",
-                                name,
-                                rel_path,
-                                line_num as i64
-                            ])?;
-                            resource_count += 1;
-                        }
-                        if let Some(caps) = style_def_re.captures(line) {
-                            let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![
-                                module_id,
-                                "style",
-                                name,
-                                rel_path,
-                                line_num as i64
-                            ])?;
-                            resource_count += 1;
+                    let visible = android_xml::visible(&content);
+                    for tag in android_xml::tags(&visible) {
+                        if matches!(tag.name, "string" | "color" | "dimen" | "style") {
+                            if let Some(name) = tag.attribute("name") {
+                                res_stmt.execute(rusqlite::params![
+                                    module_id,
+                                    tag.name,
+                                    name.value,
+                                    rel_path,
+                                    tag.line as i64
+                                ])?;
+                                resource_count += 1;
+                            }
                         }
                     }
                 }
@@ -4387,11 +4314,22 @@ pub fn index_resources(
             "INSERT INTO resource_usages (resource_id, usage_file, usage_line, usage_type) VALUES (?1, ?2, ?3, ?4)"
         )?;
 
-        // Query code files from DB instead of walking filesystem again
+        // Resource XML is collected by the Android walker, but is not a
+        // symbol source and may be absent from `files`. Include it explicitly.
         let code_rel_paths: Vec<String> = {
             let mut stmt = tx.prepare("SELECT path FROM files WHERE path LIKE '%.kt' OR path LIKE '%.java' OR path LIKE '%.xml'")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            rows.filter_map(|r| r.ok()).collect()
+            let mut paths: Vec<String> = rows.filter_map(|r| r.ok()).collect();
+            paths.extend(
+                res_files
+                    .iter()
+                    .filter(|p| p.extension().is_some_and(|e| e == "xml"))
+                    .filter_map(|p| p.strip_prefix(root).ok())
+                    .map(|p| p.to_string_lossy().to_string()),
+            );
+            paths.sort();
+            paths.dedup();
+            paths
         };
         if progress {
             eprintln!("Scanning resource usages in parallel...");
@@ -4435,6 +4373,14 @@ pub fn index_resources(
                             .then_some(*id)
                     };
                     let mut usages = Vec::new();
+
+                    let visible;
+                    let content = if is_xml {
+                        visible = android_xml::visible(&content);
+                        &visible
+                    } else {
+                        &content
+                    };
 
                     for (line_idx, line) in content.lines().enumerate() {
                         let line_num = line_idx as i64 + 1;
