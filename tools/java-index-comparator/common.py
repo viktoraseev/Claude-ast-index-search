@@ -25,6 +25,13 @@ class ToolError(RuntimeError):
     pass
 
 
+class McpRemoteError(ToolError):
+    """Redacted public message; remote diagnostics belong only in artifacts."""
+    def __init__(self, message: str, kind: str, response: Any):
+        super().__init__(message)
+        self.kind, self.response = kind, response
+
+
 def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -268,7 +275,7 @@ class StreamableHttpMcpClient:
         if "error" in decoded:
             # JSON-RPC diagnostics may contain source fragments, not merely
             # protocol metadata. Never promote the server payload to stdout.
-            raise ToolError(f"MCP error for {method}")
+            raise McpRemoteError(f"MCP error for {method}", 'rpc', decoded)
         return decoded.get("result")
 
     def initialize(self) -> dict[str, Any]:
@@ -303,7 +310,7 @@ class StreamableHttpMcpClient:
             raise ToolError(f'MCP tool {name} returned an invalid result envelope')
         if result.get("isError"):
             # Error content can contain project source; never send it to logs.
-            raise ToolError(f"MCP tool {name} reported an error")
+            raise McpRemoteError(f"MCP tool {name} reported an error", 'tool', result)
         if any(not isinstance(part, dict) for part in result['content']):
             raise ToolError(f'MCP tool {name} returned invalid content blocks')
         texts = [part.get("text", "") for part in result["content"] if part.get("type") == "text"]

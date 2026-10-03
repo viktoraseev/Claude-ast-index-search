@@ -28,7 +28,7 @@ import tomllib
 from typing import Any
 
 from common import (
-    StreamableHttpMcpClient, ToolError, canonical_json, connect,
+    StreamableHttpMcpClient, ToolError, McpRemoteError, canonical_json, connect,
     discover_mcp_url, java_identifier_candidates, now_ms, source_snapshot, stable_id,
     java_code_without_literals, adapter_digest,
     file_sha256, java_files,
@@ -130,8 +130,18 @@ class InvocationOracle:
                 self.metrics.record('oracle.disk_decode', time.perf_counter() - started)
                 self.memory.put(key, cached)
                 return cached
-        response = self._network_call(tool, arguments)
+        try:
+            response = self._network_call(tool, arguments)
+        except McpRemoteError as error:
+            self._capture_failure(tool, arguments, error)
+            raise
         return self._capture_reply(tool, arguments, response, key)
+
+    def _capture_failure(self, tool, arguments, error):
+        # This runs on the SQLite-owning thread, never on a network worker.
+        with self.state:
+            self.store.capture_failure(tool, arguments, error)
+            self.metrics.flush()
 
     def _network_call(self, tool, arguments):
         started = time.perf_counter()
@@ -176,17 +186,26 @@ class InvocationOracle:
                     continue
                 futures = {executor.submit(self._network_call, tool, arguments): (key, arguments)
                            for key, arguments in missing.items()}
+                first_error = None
                 for future in as_completed(futures):
                     key, arguments = futures[future]
-                    response = self._capture_reply(tool, arguments, future.result(), key)
+                    try:
+                        network_reply = future.result()
+                    except McpRemoteError as error:
+                        self._capture_failure(tool, arguments, error)
+                        first_error = first_error or error
+                        continue
+                    response = self._capture_reply(tool, arguments, network_reply, key)
                     if isinstance(response, dict) and any(response.get(flag) for flag in ('stale', 'truncated')):
                         raise Unsupported('MCP prefetch snapshot is stale or truncated')
+                if first_error is not None:
+                    raise first_error
         self.metrics.record('oracle.prefetch_wall', time.perf_counter() - started)
 
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | {"api", "class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -1454,6 +1473,54 @@ class Fixture:
         finally:
             source.close()
 
+    def api_check(self, check: sqlite3.Row):
+        """Compare public declarations with javac within indexed Java file scope.
+
+        File scope comes from the native index; visibility does not. This is
+        independent syntax coverage, never MCP navigation equivalence.
+        """
+        module = json.loads(check['subject'])['module']
+        prefix = module.rstrip('/') + '/' if module not in ('', '.') else ''
+        source = connect(self.database, read_only=True)
+        expected = set()
+        try:
+            for row in source.execute("SELECT path FROM files WHERE path LIKE '%.java' ORDER BY path"):
+                file = row['path']
+                if file.startswith(prefix):
+                    expected.update((file, entry['line']) for entry in self.structure(file)
+                                    if entry.get('public_api'))
+        finally:
+            source.close()
+        outputs, expected_keys, actual_keys = {}, set(), set()
+        ordered = sorted(expected)
+        modules = [module or '.']
+        dotted = module.strip('/').replace('/', '.')
+        if '/' in module.strip('/') and not (self.root / dotted).exists():
+            modules.append(dotted)
+        for mode, limit in ((mode, limit) for mode in range(len(modules)) for limit in (0, 1, 3, 1000000)):
+            output = self.text_cli('api', modules[mode], '--limit', str(limit))
+            lines = output.splitlines()
+            header = re.fullmatch(r"Public API of '.+' \((\d+)\):", lines[0]) if lines else None
+            if not header:
+                raise Unsupported('unrecognized public API output')
+            locations = []
+            for line in lines[1:]:
+                if line.startswith('    ') or not line.strip() or line.strip() == 'No public API found.':
+                    continue
+                match = re.fullmatch(r'  (.+):(\d+)', line)
+                if not match or int(match[2]) < 1:
+                    raise Unsupported('unrecognized public API location')
+                locations.append((relative_path(match[1], self.root), int(match[2])))
+            if len(locations) != int(header[1]) or len(locations) > limit or len(set(locations)) != len(locations):
+                raise Unsupported('public API count differs from unique rendered locations')
+            java_locations = [item for item in locations if item[0].endswith('.java')]
+            # Java declarations are ordered and selected before foreign results.
+            # Other languages remain outside the syntax comparison.
+            outputs[f'{mode}:{limit}'] = java_locations
+            expected_keys.update((mode, limit, index, *item) for index, item in enumerate(ordered[:limit]))
+            actual_keys.update((mode, limit, index, *item) for index, item in enumerate(java_locations))
+        return {'source': 'independent javac; native indexed Java file scope', 'locations': ordered}, outputs, expected_keys, actual_keys
+
     def lifecycle_check(self, check: sqlite3.Row):
         if self._lifecycle_error is not None:
             raise self._lifecycle_error
@@ -1505,6 +1572,8 @@ class Fixture:
                 handler = self.lifecycle_check
             if check['feature'] in root_contracts.FEATURES:
                 handler = self.root_check
+            if check['feature'] == 'api':
+                handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
             if check['feature'] in annotation_contracts.EXTENSIONS:
@@ -1607,6 +1676,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                  lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
                  "internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
                  "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
+                 "independent JDK syntax: public API visibility and ordered limits within native indexed Java file scope; not MCP equivalence" if feature == "api" else
                  "live MCP text locations (Java deeplink scope)" if feature == "deeplinks" else
                  "live MCP text locations (Java suppression scope)" if feature == "suppress" else
                  "independent JDK syntax: injection declaration type locations (Java scope)" if feature == "inject" else
@@ -1662,6 +1732,10 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({'feature': 'map', 'subject': subject}), 'map', subject,
             ))
+            if module is not None:
+                state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
+                    stable_id({'feature': 'api', 'subject': subject}), 'api', subject,
+                ))
         for feature in ("stats", "query", "schema", "db-path", "todo", "deprecated", "deeplinks", *sorted(INTERNAL_FEATURES - {'map'})):
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",

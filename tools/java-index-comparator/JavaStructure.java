@@ -65,11 +65,40 @@ public class JavaStructure {
                 }
                 void emit(String kind, String name, int position, int finish, String extra) {
                     String qualified = qualifiedName(kind, name);
+                    boolean api = !List.of("import", "usage", "annotation", "component").contains(kind)
+                        && publicApi(getCurrentPath(), kind.equals("accessor"));
                     entries.add("{\"kind\":" + quote(kind) + ",\"name\":" + quote(name)
                         + ",\"line\":" + unit.getLineMap().getLineNumber(position)
                         + ",\"column\":" + (position - source.lastIndexOf('\n', position - 1))
                         + ",\"end_line\":" + unit.getLineMap().getLineNumber(Math.max(position, finish - 1))
-                        + (qualified == null ? "" : ",\"qualified_name\":" + quote(qualified)) + extra + "}");
+                        + (qualified == null ? "" : ",\"qualified_name\":" + quote(qualified))
+                        + ",\"public_api\":" + api + extra + "}");
+                }
+                boolean publicApi(TreePath path, boolean accessor) {
+                    Tree declaration = path.getLeaf();
+                    if (accessor && declaration instanceof ClassTree)
+                        return publicApi(path, false);
+                    ModifiersTree modifiers;
+                    if (declaration instanceof ClassTree type) {
+                        if (type.getSimpleName().length() == 0) return false;
+                        modifiers = type.getModifiers();
+                    } else if (declaration instanceof MethodTree method) modifiers = method.getModifiers();
+                    else if (declaration instanceof VariableTree variable) modifiers = variable.getModifiers();
+                    else return false;
+                    TreePath parent = path.getParentPath();
+                    if (parent == null) return false;
+                    Tree owner = parent.getLeaf();
+                    boolean implicit = owner instanceof ClassTree type
+                        && (type.getKind() == Tree.Kind.INTERFACE || type.getKind() == Tree.Kind.ANNOTATION_TYPE
+                            || (type.getKind() == Tree.Kind.ENUM && declaration instanceof VariableTree variable
+                                && variable.getInitializer() instanceof NewClassTree
+                                && source.substring(start(variable), end(variable)).stripLeading()
+                                    .startsWith(variable.getName().toString())));
+                    var flags = modifiers.getFlags();
+                    if (flags.contains(javax.lang.model.element.Modifier.PRIVATE)
+                        || flags.contains(javax.lang.model.element.Modifier.PROTECTED)
+                        || (!flags.contains(javax.lang.model.element.Modifier.PUBLIC) && !implicit)) return false;
+                    return owner instanceof CompilationUnitTree || (owner instanceof ClassTree && publicApi(parent, false));
                 }
                 String qualifiedName(String kind, String name) {
                     if (List.of("import", "usage", "annotation").contains(kind)) return null;

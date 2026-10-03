@@ -83,6 +83,19 @@ class ReplayTests(unittest.TestCase):
             self.assertTrue(result["verified"])
             self.assertEqual(result["counts"], {"pass": 1})
 
+    def test_replay_preserves_the_captured_java_scope(self):
+        with self.source:
+            self.source.execute("INSERT INTO metadata VALUES ('audit_scope','java')")
+        with patch('replay.build_ast_index'), patch('audit.Fixture.cli', return_value={
+                'items': [{'name': 'A', 'path': 'A.java', 'line': 1, 'qualified_name': 'p.A'}]}):
+            result = replay(self.evidence, self.root, self.binary, self.directory / 'replays')
+        self.assertTrue(result['verified'])
+        state = connect(Path(result['verification']), read_only=True)
+        try:
+            self.assertEqual(state.execute("SELECT value FROM metadata WHERE key='audit_scope'").fetchone()[0], 'java')
+        finally:
+            state.close()
+
     def test_unused_recorded_operations_prevent_a_replay_pass(self):
         with self.source:
             self.source.execute("INSERT INTO pages VALUES ('case',1,?,?,?)", (

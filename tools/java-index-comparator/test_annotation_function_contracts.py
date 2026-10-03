@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from audit import Fixture, SCHEMA, plan
-from common import connect
+from common import connect, source_snapshot
+from replay import replay
 import annotation_contracts
 import mobile_contracts
 
@@ -185,6 +186,16 @@ fun <T> Box<T>.needle() {}
             return output
         with patch.object(self.fixture, 'text_cli', side_effect=missing_java):
             self.assertEqual(self.evaluate('provides', 'Widget')['verdict'], 'fail')
+        # Replay must use the same Java-only contract, not ask for a foreign
+        # page missing from the captured request stream or invent its truth.
+        with self.state:
+            self.state.executemany('INSERT OR REPLACE INTO metadata VALUES (?,?)', {
+                'project_root': str(self.root), 'snapshot_sha256': source_snapshot(self.root)[0],
+            }.items())
+        result = replay(self.directory / 'checks.sqlite', self.root, self.fixture.binary,
+                        self.directory / 'replay')
+        self.assertTrue(result['verified'], result)
+        self.assertEqual(result['counts'], {'pass': 1})
 
     def test_hybrid_fixture_binds_paginated_anchors_and_exercises_production(self):
         (self.root / 'Example.kts').write_text('''// @Composable @Preview fun fake() {}

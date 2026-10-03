@@ -20,6 +20,128 @@ pub static JAVA_PARSER: JavaParser = JavaParser;
 
 pub struct JavaParser;
 
+/// Source locations of externally public Java declarations, including implicit members.
+pub(crate) fn public_api_lines(content: &str) -> Result<Vec<usize>> {
+    fn collect(
+        node: tree_sitter::Node<'_>,
+        content: &str,
+        implicit_public: bool,
+        lines: &mut std::collections::BTreeSet<usize>,
+    ) {
+        let mut cursor = node.walk();
+        let modifiers = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "modifiers");
+        let has_modifier = |keyword| {
+            modifiers.is_some_and(|modifiers| {
+                let mut cursor = modifiers.walk();
+                let found = modifiers
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == keyword);
+                found
+            })
+        };
+        let public = (implicit_public || has_modifier("public"))
+            && !has_modifier("private")
+            && !has_modifier("protected");
+        match node.kind() {
+            "program" | "enum_body_declarations" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    collect(child, content, implicit_public, lines);
+                }
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+                if public =>
+            {
+                if let Some(name) = node.child_by_field_name("name") {
+                    lines.insert(name.start_position().row + 1);
+                }
+                let implicit_members = matches!(
+                    node.kind(),
+                    "interface_declaration" | "annotation_type_declaration"
+                );
+                let body = node.child_by_field_name("body");
+                if node.kind() == "record_declaration" {
+                    if let Some(parameters) = node.child_by_field_name("parameters") {
+                        let mut cursor = parameters.walk();
+                        for parameter in parameters.named_children(&mut cursor) {
+                            let name = parameter.child_by_field_name("name").or_else(|| {
+                                let mut cursor = parameter.walk();
+                                let mut children = parameter.named_children(&mut cursor);
+                                children
+                                    .find(|child| child.kind() == "variable_declarator")
+                                    .and_then(|declarator| declarator.child_by_field_name("name"))
+                            });
+                            if let Some(name) = name {
+                                let overridden = body.is_some_and(|body| {
+                                    let mut cursor = body.walk();
+                                    let found = body.named_children(&mut cursor).any(|member| {
+                                        member.kind() == "method_declaration"
+                                            && member.child_by_field_name("name").is_some_and(
+                                                |other| {
+                                                    node_text(content, &other)
+                                                        == node_text(content, &name)
+                                                },
+                                            )
+                                            && member.child_by_field_name("parameters").is_some_and(
+                                                |params| params.named_child_count() == 0,
+                                            )
+                                    });
+                                    found
+                                });
+                                if !overridden {
+                                    lines.insert(name.start_position().row + 1);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(body) = body {
+                    let mut cursor = body.walk();
+                    for member in body.named_children(&mut cursor) {
+                        collect(member, content, implicit_members, lines);
+                    }
+                }
+            }
+            "field_declaration" | "constant_declaration" if public => {
+                let mut cursor = node.walk();
+                for declarator in node.named_children(&mut cursor) {
+                    if declarator.kind() == "variable_declarator" {
+                        if let Some(name) = declarator.child_by_field_name("name") {
+                            lines.insert(name.start_position().row + 1);
+                        }
+                    }
+                }
+            }
+            "enum_constant" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    lines.insert(name.start_position().row + 1);
+                }
+            }
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration"
+            | "annotation_type_element_declaration"
+                if public =>
+            {
+                if let Some(name) = node.child_by_field_name("name") {
+                    lines.insert(name.start_position().row + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut lines = std::collections::BTreeSet::new();
+    collect(tree.root_node(), content, false, &mut lines);
+    Ok(lines.into_iter().collect())
+}
+
 /// Find type tokens in Java fields and parameters annotated for injection.
 pub(crate) fn injection_lines(content: &str, type_re: &regex::Regex) -> Result<Vec<usize>> {
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
@@ -46,7 +168,7 @@ pub(crate) fn injection_lines(content: &str, type_re: &regex::Regex) -> Result<V
                             if let Some(parameters) = owner.child_by_field_name("parameters") {
                                 let mut params = parameters.walk();
                                 for parameter in parameters.named_children(&mut params) {
-                                    if let Some(ty) = injection_parameter_type(parameter) {
+                                    if let Some(ty) = parameter_type(parameter) {
                                         types.push(ty);
                                     }
                                 }
@@ -56,7 +178,7 @@ pub(crate) fn injection_lines(content: &str, type_re: &regex::Regex) -> Result<V
                         | "local_variable_declaration"
                         | "formal_parameter"
                         | "spread_parameter" => {
-                            if let Some(ty) = injection_parameter_type(owner) {
+                            if let Some(ty) = parameter_type(owner) {
                                 types.push(ty);
                             }
                         }
@@ -103,7 +225,7 @@ pub(crate) fn injection_lines(content: &str, type_re: &regex::Regex) -> Result<V
     }
 }
 
-fn injection_parameter_type(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+fn parameter_type(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     node.child_by_field_name("type").or_else(|| {
         if node.kind() != "spread_parameter" {
             return None;
@@ -111,7 +233,10 @@ fn injection_parameter_type(node: tree_sitter::Node<'_>) -> Option<tree_sitter::
         // Varargs types are unnamed fields in this grammar.
         let mut fields = node.walk();
         let mut children = node.named_children(&mut fields);
-        children.find(|field| field.kind() == "type_identifier" || field.kind().ends_with("_type"))
+        children.find(|field| {
+            matches!(field.kind(), "type_identifier" | "scoped_type_identifier")
+                || field.kind().ends_with("_type")
+        })
     })
 }
 
@@ -761,10 +886,13 @@ fn record_component_accessor_signature(
     component_node: &tree_sitter::Node,
     name: &str,
 ) -> String {
-    if let Some(type_node) = component_node.child_by_field_name("type") {
+    if let Some(type_node) = parameter_type(*component_node) {
         let mut type_text = node_text(content, &type_node).trim().to_string();
         if let Some(dim_node) = component_node.child_by_field_name("dimensions") {
             type_text.push_str(node_text(content, &dim_node).trim());
+        }
+        if component_node.kind() == "spread_parameter" {
+            type_text.push_str("[]");
         }
         return format!("{} {}()", type_text, name);
     }

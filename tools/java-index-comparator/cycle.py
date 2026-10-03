@@ -140,6 +140,8 @@ Round logs: {summary.get('round_logs', 'not available')}.
 Oracle connection: {canonical_json(summary.get('oracle', {}))}.
 Read the checks table using a streaming cursor: up to the first 100 verdict=fail
 rows, plus unsupported/error and pending coverage contracts. Group by cause;
+Remote MCP diagnostics, when available, are private in oracle_failures. They
+are not oracle truth or confirmed native mismatches; never print their payloads.
 do not generate one test per row. Add compact, public-safe regression fixtures
 that exercise actual production behaviour. Demonstrate failure before the fix,
 then repair ast-index. If a verdict is a normalization/scope/pagination bug,

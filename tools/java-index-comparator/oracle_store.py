@@ -4,7 +4,7 @@ from contextlib import contextmanager
 import time
 import threading
 
-from common import canonical_json, oracle_response_id
+from common import canonical_json, oracle_response_id, now_ms
 
 
 SCHEMA = """
@@ -32,6 +32,11 @@ CREATE TRIGGER IF NOT EXISTS pages_delete INSTEAD OF DELETE ON pages BEGIN
 END;
 CREATE TABLE IF NOT EXISTS oracle_cache(
  request_key TEXT PRIMARY KEY,response_id TEXT NOT NULL REFERENCES oracle_responses(id)
+);
+CREATE TABLE IF NOT EXISTS oracle_failures(
+ id TEXT PRIMARY KEY,tool TEXT NOT NULL,request_json TEXT NOT NULL,
+ kind TEXT NOT NULL,response_json TEXT NOT NULL,attempts INTEGER NOT NULL,
+ captured_at INTEGER NOT NULL
 );
 CREATE VIEW IF NOT EXISTS invocation_cache AS
  SELECT c.request_key,r.response_json FROM oracle_cache c JOIN oracle_responses r ON r.id=c.response_id;
@@ -139,6 +144,16 @@ class ReplyCache:
 class OracleStore:
     def __init__(self, state, metrics=None):
         self.state, self.metrics = state, metrics or Metrics(state)
+
+    def capture_failure(self, tool, arguments, error):
+        request, response = canonical_json(arguments), canonical_json(error.response)
+        identity = oracle_response_id(error.kind + ':' + tool, request, response)
+        # Failed diagnostics never enter successful responses, pages or caches.
+        # A repeated remote failure increments its count instead of copying it.
+        self.state.execute('''INSERT INTO oracle_failures VALUES (?,?,?,?,?,1,?)
+            ON CONFLICT(id) DO UPDATE SET attempts=attempts+1,captured_at=excluded.captured_at''',
+            (identity, tool, request, error.kind, response, now_ms()))
+        self.metrics.record('oracle.failure_capture', byte_count=len(response.encode()))
 
     def capture(self, tool, arguments, response):
         started = time.perf_counter()

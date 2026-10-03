@@ -101,6 +101,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     "binary_sha256": binary_hash, "original_evidence": str(evidence.resolve()),
                     "fixture_sha256": adapter_digest(),
                     "inventory_sha256": inventory_hash,
+                    "audit_scope": metadata.get('audit_scope', 'all'),
                 }.items())
                 state.executemany("INSERT OR REPLACE INTO coverage VALUES (?,?,?)",
                                   source.execute("SELECT feature,status,reason FROM coverage"))

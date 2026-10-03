@@ -441,30 +441,48 @@ pub fn cmd_api(root: &Path, module_path: &str, limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    // Find public classes, interfaces, functions in the module
+    // Java visibility depends on enclosing types and implicit interface members.
+    // Parse each Java file once; declaration-looking comments are not API.
+    let mut items: Vec<(String, usize, String)> = vec![];
+    if limit > 0 {
+        for path in super::project_source_files(root, &["java"])? {
+            if !path.starts_with(&module_dir) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)?;
+            if crate::minified::skip(&path, Some(source.as_bytes())) {
+                continue;
+            }
+            let lines: Vec<_> = source.lines().collect();
+            for line in crate::parsers::treesitter::java::public_api_lines(&source)? {
+                let content = lines[line - 1].trim().chars().take(100).collect();
+                items.push((relative_path(root, &path), line, content));
+                if items.len() == limit {
+                    break;
+                }
+            }
+            if items.len() == limit {
+                break;
+            }
+        }
+    }
+
     let pattern = r"(public\s+)?(class|interface|object|fun)\s+\w+";
 
-    let mut items: Vec<(String, usize, String)> = vec![];
+    search_files(&module_dir, pattern, &["kt"], |path, line_num, line| {
+        if items.len() >= limit {
+            return;
+        }
 
-    search_files(
-        &module_dir,
-        pattern,
-        &["kt", "java"],
-        |path, line_num, line| {
-            if items.len() >= limit {
-                return;
-            }
+        // Skip private/internal
+        if line.contains("private ") || line.contains("internal ") {
+            return;
+        }
 
-            // Skip private/internal
-            if line.contains("private ") || line.contains("internal ") {
-                return;
-            }
-
-            let rel_path = relative_path(root, path);
-            let content: String = line.trim().chars().take(100).collect();
-            items.push((rel_path, line_num, content));
-        },
-    )?;
+        let rel_path = relative_path(root, path);
+        let content: String = line.trim().chars().take(100).collect();
+        items.push((rel_path, line_num, content));
+    })?;
 
     if items.len() < limit {
         items.extend(swift_public_api(root, &module_dir, limit - items.len())?);

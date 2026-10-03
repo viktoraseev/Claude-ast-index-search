@@ -12,6 +12,12 @@
     (formal_parameter
       name: (identifier) @record_component_name) @record_component_node @definition))
 
+(record_declaration
+  parameters: (formal_parameters
+    (spread_parameter
+      (variable_declarator
+        name: (identifier) @record_component_name)) @record_component_node @definition))
+
 ; Interfaces
 (interface_declaration
   name: (identifier) @interface_name) @interface_node @definition

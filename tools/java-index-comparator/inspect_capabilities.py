@@ -5,24 +5,45 @@ import os
 from pathlib import Path
 import sys
 
-from common import StreamableHttpMcpClient, ToolError, canonical_json, connect, discover_mcp_url
+from common import StreamableHttpMcpClient, ToolError, McpRemoteError, canonical_json, connect, discover_mcp_url
 
 
 def inspect(client, root, state):
-    server = client.initialize()
-    tools = client.tools()
-    status = client.call('ide_project_status', {'project_path': str(root)}) if 'ide_project_status' in tools else {}
-    index_status = client.call('ide_index_status', {'project_path': str(root)}) if 'ide_index_status' in tools else {}
-    projects = [project for project in status.get('projects', [])
-                if os.path.normpath(project.get('path', '')) == str(root)]
     state.execute('CREATE TABLE IF NOT EXISTS capabilities(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
     with state:
-        state.executemany('INSERT OR REPLACE INTO capabilities VALUES (?,?)',
-                          [('server', canonical_json(server)), ('tools', canonical_json(tools)),
-                           ('target_status', canonical_json(projects)),
-                           ('index_status', canonical_json(index_status))])
+        # An interrupted retry cannot leave stale target availability visible.
+        state.execute("DELETE FROM capabilities WHERE key IN ('target_status','index_status','failure')")
+        state.execute("INSERT OR REPLACE INTO capabilities VALUES ('stage',?)", (canonical_json('initialize'),))
+
+    def checkpoint(key, value, next_stage):
+        with state:
+            state.executemany('INSERT OR REPLACE INTO capabilities VALUES (?,?)',
+                              [(key, canonical_json(value)), ('stage', canonical_json(next_stage))])
+
+    stage = 'initialize'
+    try:
+        server = client.initialize()
+        checkpoint('server', server, 'tools')
+        stage = 'tools'
+        tools = client.tools()
+        checkpoint('tools', tools, 'target_status')
+        stage = 'target_status'
+        status = client.call('ide_project_status', {'project_path': str(root)}) if 'ide_project_status' in tools else {}
+        projects = [project for project in status.get('projects', [])
+                    if os.path.normpath(project.get('path', '')) == str(root)]
+        checkpoint('target_status', projects, 'index_status')
+        stage = 'index_status'
+        index_status = client.call('ide_index_status', {'project_path': str(root)}) if 'ide_index_status' in tools else {}
+        checkpoint('index_status', index_status, 'complete')
+    except ToolError as error:
+        diagnostic = {'error_type': type(error).__name__}
+        if isinstance(error, McpRemoteError):
+            diagnostic.update(kind=error.kind, response=error.response)
+        checkpoint('failure', diagnostic, 'failed:' + stage)
+        raise
     return {'tools': {name: sorted(tool.get('inputSchema', {}).get('properties', {}))
                       for name, tool in sorted(tools.items())},
+            'complete': True,
             'target_status_fields': sorted({key for project in projects for key in project}),
             'index_status_fields': sorted(index_status)}
 
