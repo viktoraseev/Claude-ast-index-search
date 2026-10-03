@@ -6215,27 +6215,38 @@ pub fn search_symbol_seeds(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    if query.trim().is_empty() || query.contains("::") {
-        return search_symbols(conn, query, limit);
-    }
+    search_symbol_seeds_scoped(conn, query, limit, &SearchScope::none())
+}
 
-    let mut stmt = conn.prepare(
+/// Sample candidates after applying the exploration scope, before the cap.
+pub fn search_symbol_seeds_scoped(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
+    if query.trim().is_empty() || query.contains("::") {
+        return search_symbols_scoped(conn, query, limit, scope);
+    }
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE symbols_fts MATCH ?1
+        WHERE symbols_fts MATCH ?1{scope_clause}
         ORDER BY s.id
-        LIMIT ?2
+        LIMIT ?{}
         "#,
-    )?;
-
+        2 + scope_params.len()
+    );
+    let mut values = vec![escape_fts5_query(query)];
+    values.extend(scope_params);
+    values.push(limit.to_string());
+    let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(
-            params![escape_fts5_query(query), limit as i64],
-            row_to_search_result,
-        )?
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
@@ -6256,6 +6267,16 @@ pub fn search_symbol_seeds_ranked(
     terms: &[String],
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_symbol_seeds_ranked_scoped(conn, terms, limit, &SearchScope::none())
+}
+
+/// Rank the bounded candidate pool within the requested scope.
+pub fn search_symbol_seeds_ranked_scoped(
+    conn: &Connection,
+    terms: &[String],
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
     let query = terms
         .iter()
         .filter(|term| !term.trim().is_empty())
@@ -6265,20 +6286,25 @@ pub fn search_symbol_seeds_ranked(
     if query.is_empty() {
         return Ok(vec![]);
     }
+    let (scope_clause, scope_params) = scope.path_condition();
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols_fts fts
         JOIN symbols s ON fts.rowid = s.id
         JOIN files f ON s.file_id = f.id
-        WHERE symbols_fts MATCH ?1
+        WHERE symbols_fts MATCH ?1{scope_clause}
         ORDER BY {VENDOR_PATH_SQL}, {IMPORT_LAST_SQL}, {FTS_RANK}, s.id
-        LIMIT ?2
-        "#
+        LIMIT ?{}
+        "#,
+        2 + scope_params.len()
     );
+    let mut values = vec![query];
+    values.extend(scope_params);
+    values.push(limit.to_string());
     let mut stmt = conn.prepare(&sql)?;
     let results = stmt
-        .query_map(params![query, limit as i64], row_to_search_result)?
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
 }
@@ -6302,6 +6328,17 @@ pub fn search_symbols_in_matching_paths(
     per_file: usize,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
+    search_symbols_in_matching_paths_scoped(conn, terms, per_file, limit, &SearchScope::none())
+}
+
+/// Apply scope before both the per-file and overall path candidate budgets.
+pub fn search_symbols_in_matching_paths_scoped(
+    conn: &Connection,
+    terms: &[String],
+    per_file: usize,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
     use rusqlite::types::Value;
     let terms: Vec<String> = terms
         .iter()
@@ -6315,8 +6352,9 @@ pub fn search_symbols_in_matching_paths(
         .map(|n| format!("instr(lower(f.path), ?{n}) > 0"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let per_file_at = terms.len() + 1;
-    let limit_at = terms.len() + 2;
+    let (scope_clause, scope_params) = scope.path_condition();
+    let per_file_at = terms.len() + scope_params.len() + 1;
+    let limit_at = per_file_at + 1;
     let sql = format!(
         r#"
         SELECT name, qualified_name, kind, line, signature, path, root_path, end_line FROM (
@@ -6329,7 +6367,7 @@ pub fn search_symbols_in_matching_paths(
                    ) AS rank_in_file
             FROM files f
             CROSS JOIN symbols s ON s.file_id = f.id
-            WHERE {path_filter}
+            WHERE {path_filter}{scope_clause}
               AND NOT {VENDOR_PATH_SQL}
               AND s.kind NOT IN ('import', 'column')
         )
@@ -6339,6 +6377,7 @@ pub fn search_symbols_in_matching_paths(
         "#
     );
     let mut values: Vec<Value> = terms.into_iter().map(Value::Text).collect();
+    values.extend(scope_params.into_iter().map(Value::Text));
     values.push(Value::Integer(per_file as i64));
     values.push(Value::Integer(limit as i64));
     let mut stmt = conn.prepare(&sql)?;
@@ -6661,6 +6700,32 @@ pub fn find_files_with_roots_scoped(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(results)
+}
+
+/// Stream exact basename candidates so convention ranking can precede its cap.
+pub fn visit_files_by_basename_scoped(
+    conn: &Connection,
+    basename: &str,
+    scope: &SearchScope,
+    mut visit: impl FnMut(FileResult),
+) -> Result<()> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
+        "SELECT f.path, f.root_path FROM files f \
+         WHERE (f.path = ?1 OR substr(f.path, -length(?1)-1) = '/' || ?1){scope_clause} \
+         ORDER BY f.path, f.root_path"
+    );
+    let mut values = vec![basename.to_string()];
+    values.extend(scope_params);
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+    while let Some(row) = rows.next()? {
+        visit(FileResult {
+            path: row.get(0)?,
+            root_path: row.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+        });
+    }
+    Ok(())
 }
 
 /// Find symbols by name: the exact name first; failing that, names whose last
@@ -8133,67 +8198,55 @@ pub fn search_symbols_fuzzy(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchResult>> {
-    if query.contains("::") {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
-            FROM symbols s
-            JOIN files f ON s.file_id = f.id
-            WHERE COALESCE(s.qualified_name, s.name) LIKE ?1
-            ORDER BY
-                CASE WHEN COALESCE(s.qualified_name, s.name) = ?2 THEN 0
-                     WHEN COALESCE(s.qualified_name, s.name) LIKE ?3 THEN 1
-                     ELSE 2 END,
-                length(COALESCE(s.qualified_name, s.name))
-            LIMIT ?4
-            "#,
-        )?;
-        let exact = if query.starts_with("::") {
-            format!("%{}", query)
-        } else {
-            query.to_string()
-        };
-        let contains_pattern = if query.starts_with("::") {
-            format!("%{}%", query)
-        } else {
-            format!("%{}%", query)
-        };
-        let prefix_pattern = if query.starts_with("::") {
-            format!("%{}", query)
-        } else {
-            format!("{query}%")
-        };
-        return Ok(stmt
-            .query_map(
-                params![contains_pattern, exact, prefix_pattern, limit as i64],
-                row_to_search_result,
-            )?
-            .collect::<Result<Vec<_>, _>>()?);
-    }
+    search_symbols_fuzzy_scoped(conn, query, limit, &SearchScope::none())
+}
 
-    // Single query: contains match with ranking by relevance
-    // exact match (name = query) first, then prefix, then contains — sorted by length
-    let contains_pattern = format!("%{}%", query);
-    let mut stmt = conn.prepare(
+/// Fuzzy candidates filtered before the exploration budget is applied.
+pub fn search_symbols_fuzzy_scoped(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
+    let expression = if query.contains("::") {
+        "COALESCE(s.qualified_name, s.name)"
+    } else {
+        "s.name"
+    };
+    let (scope_clause, scope_params) = scope.path_condition();
+    let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
         FROM symbols s
         JOIN files f ON s.file_id = f.id
-        WHERE s.name LIKE ?1
+        WHERE {expression} LIKE ?1{scope_clause}
         ORDER BY
-            CASE WHEN s.name = ?2 THEN 0
-                 WHEN s.name LIKE ?3 THEN 1
+            CASE WHEN {expression} = ?{exact_at} THEN 0
+                 WHEN {expression} LIKE ?{prefix_at} THEN 1
                  ELSE 2 END,
-            length(s.name)
-        LIMIT ?4
+            length({expression}), {expression}, f.root_path, f.path, s.line
+        LIMIT ?{limit_at}
         "#,
-    )?;
-    let prefix_pattern = format!("{}%", query);
+        exact_at = 2 + scope_params.len(),
+        prefix_at = 3 + scope_params.len(),
+        limit_at = 4 + scope_params.len()
+    );
+    let mut values = vec![format!("%{query}%")];
+    values.extend(scope_params);
+    values.push(if query.starts_with("::") {
+        format!("%{query}")
+    } else {
+        query.to_string()
+    });
+    values.push(if query.starts_with("::") {
+        format!("%{query}")
+    } else {
+        format!("{query}%")
+    });
+    values.push(limit.to_string());
+    let mut stmt = conn.prepare(&sql)?;
     let results: Vec<SearchResult> = stmt
-        .query_map(
-            params![contains_pattern, query, prefix_pattern, limit as i64],
-            row_to_search_result,
-        )?
+        .query_map(rusqlite::params_from_iter(values), row_to_search_result)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)

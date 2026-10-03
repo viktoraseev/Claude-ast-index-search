@@ -53,6 +53,7 @@ import vcs_contracts
 import rank_contracts
 import stack_contracts
 import context_contracts
+import explore_contracts
 import graph_contracts
 import unused_dep_contracts
 import java_dependency_contracts
@@ -495,6 +496,7 @@ class Fixture:
         self._android_syntax_results = None
         self._java_resource_results = None
         self._context_results = None
+        self._explore_results = None
         self._unused_dep_results = None
         self._graph_results = None
         self._vcs_results = None
@@ -1689,6 +1691,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def explore_budget_check(self, check: sqlite3.Row):
+        if self._explore_results is None:
+            self._explore_results = explore_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._explore_results)
+        return {'source': explore_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def unused_dep_check(self, check: sqlite3.Row):
         if check['feature'] == 'unused-deps:target':
             return unused_dep_contracts.verify_target(self)
@@ -1784,6 +1794,8 @@ class Fixture:
                 handler = self.rank_check
             if check['feature'] in context_contracts.FEATURES:
                 handler = self.context_check
+            if check['feature'] in explore_contracts.FEATURES:
+                handler = self.explore_budget_check
             if check['feature'] in unused_dep_contracts.FEATURES | {'unused-deps:target'}:
                 handler = self.unused_dep_check
             if check['feature'] in java_dependency_contracts.FEATURES:
@@ -1870,6 +1882,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(android_syntax_contracts.FEATURES)
     features.update(java_resource_contracts.FEATURES)
     features.update(context_contracts.PENDING)
+    features.update(explore_contracts.FEATURES)
     features.update(graph_contracts.FEATURES)
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
     features.update(java_dependency_contracts.FEATURES)
@@ -2003,6 +2016,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     rank_contracts.plan_rank(state, root)
     stack_contracts.plan_stacks(state, root)
     context_contracts.plan_context(state, root)
+    explore_contracts.plan_explore(state, root)
     graph_contracts.plan_graph(state, root)
     unused_dep_contracts.plan_unused(state, root)
     java_dependency_contracts.plan_dependencies(state, root)

@@ -512,10 +512,10 @@ pub(crate) fn resolved_dependents_of_filtered(
                 .take(limit)
                 .map(|info| db::SearchResult {
                     name: info.name.clone(),
-                    qualified_name: None,
+                    qualified_name: info.qualified_name.clone(),
                     kind: info.kind.clone(),
                     line: info.line,
-                    end_line: None,
+                    end_line: info.end_line,
                     signature: None,
                     path: info.path.clone(),
                     root_path: info.root_path.clone(),
