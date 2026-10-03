@@ -4226,6 +4226,15 @@ pub fn index_resources(
 
     let xml_ref_re = &*XML_REF_RE;
 
+    // XML in Java Android projects can name a resource's package explicitly.
+    // Keep the package identity even when a local resource has the same name.
+    static XML_NAMESPACE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"@(?:([A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*):)?(drawable|string|color|dimen|style|layout|id|mipmap)/([a-zA-Z_][a-zA-Z0-9_]*)",
+        )
+        .unwrap()
+    });
+
     {
         let mut res_stmt = tx.prepare_cached(
             "INSERT INTO resources (module_id, type, name, file_path, line) VALUES (?1, ?2, ?3, ?4, ?5)"
@@ -4390,6 +4399,19 @@ pub fn index_resources(
                             .all(|(other, _)| other == owner)
                             .then_some(*id)
                     };
+                    let resolve_namespace_resource =
+                        |namespace: &str, res_type: &str, res_name: &str| {
+                            let owners = namespace_owners.get(namespace)?;
+                            let [owner] = owners.as_slice() else {
+                                return None;
+                            };
+                            resource_ids
+                                .get(res_type)?
+                                .get(res_name)?
+                                .iter()
+                                .find(|(module, _)| *module == Some(*owner))
+                                .map(|(_, id)| *id)
+                        };
                     let mut usages = Vec::new();
 
                     // Java references are syntax expressions, not arbitrary
@@ -4405,17 +4427,11 @@ pub fn index_resources(
                             std::collections::BTreeMap::new();
                         for reference in references {
                             let resource_id = if let Some(namespace) = &reference.namespace {
-                                namespace_owners.get(namespace).and_then(|owners| {
-                                    let [owner] = owners.as_slice() else {
-                                        return None;
-                                    };
-                                    resource_ids
-                                        .get(&reference.resource_type)?
-                                        .get(&reference.name)?
-                                        .iter()
-                                        .find(|(module, _)| *module == Some(*owner))
-                                        .map(|(_, id)| *id)
-                                })
+                                resolve_namespace_resource(
+                                    namespace,
+                                    &reference.resource_type,
+                                    &reference.name,
+                                )
                             } else {
                                 resolve_resource(&reference.resource_type, &reference.name)
                             };
@@ -4469,7 +4485,22 @@ pub fn index_resources(
                             }
                         }
 
-                        if line.contains('@') {
+                        if is_xml && line.contains('@') {
+                            for caps in XML_NAMESPACE_REF_RE.captures_iter(line) {
+                                let res_type = caps.get(2).unwrap().as_str();
+                                let res_name = caps.get(3).unwrap().as_str();
+                                let resource_id = match caps.get(1).map(|m| m.as_str()) {
+                                    Some("android") => None,
+                                    Some(namespace) => {
+                                        resolve_namespace_resource(namespace, res_type, res_name)
+                                    }
+                                    None => resolve_resource(res_type, res_name),
+                                };
+                                if let Some(resource_id) = resource_id {
+                                    usages.push((resource_id, rel_path.clone(), line_num, "xml"));
+                                }
+                            }
+                        } else if line.contains('@') {
                             for caps in xml_ref_re.captures_iter(line) {
                                 let res_type = caps.get(1).unwrap().as_str();
                                 let res_name = caps.get(2).unwrap().as_str();

@@ -426,10 +426,10 @@ pub fn cmd_unused_deps(
         {
             // Get resources defined in the dependency module
             let mut res_stmt = conn.prepare(
-                "SELECT r.type, r.name FROM resources r
+                "SELECT DISTINCT r.type, r.name FROM resources r
                  JOIN modules m ON r.module_id = m.id
                  WHERE m.name = ?1
-                 ORDER BY r.type,r.name,r.id",
+                 ORDER BY r.type,r.name",
             )?;
             let resources = res_stmt.query_map(params![dep_name], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -443,7 +443,8 @@ pub fn cmd_unused_deps(
                     "SELECT ru.usage_type FROM resource_usages ru
                      JOIN resources r ON ru.resource_id = r.id
                      JOIN modules owner ON owner.id=r.module_id
-                     WHERE {usage_scope} AND owner.name=?2 AND r.type=?3 AND r.name=?4"
+                     WHERE {usage_scope} AND owner.name=?2 AND r.type=?3 AND r.name=?4
+                     ORDER BY ru.usage_file,ru.usage_line,ru.id"
                 ))?;
                 let usages = usage_stmt
                     .query_map(params![module_path, dep_name, res_type, res_name], |row| {

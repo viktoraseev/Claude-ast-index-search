@@ -20,9 +20,6 @@ PENDING = {
     'unused-deps:semantic-resolution': 'Java visibility, ambiguous wildcard imports, lexical type/variable '
         'shadowing, inherited/nested static members, receiver dispatch and attached-root resolution '
         'remain unresolved; authored import/type identities do not establish compiler-wide or MCP equivalence',
-    'unused-deps:android-ownership': 'Default XML/resource dependency usage, qualified class/resource '
-        'ownership and Android module collisions need a separate applicable Java Android contract; '
-        'zero XML/resource samples in the lexical fixture do not establish it',
 }
 TARGET_REASON = 'independent source/state: full inventory and Maven descriptors prove an edgeless Java module graph; executed missing/edgeless unused-deps output; not MCP equivalence'
 
