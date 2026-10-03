@@ -2,11 +2,13 @@
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from audit import Fixture, SCHEMA, plan, required_features
+from build_index import build_ast_index
 from common import ToolError, adapter_digest, connect
 import context_contracts
 
@@ -83,6 +85,34 @@ class ContextContractsTests(unittest.TestCase):
             return content + b'\n# changed contract\n' if path.name == 'context_contracts.py' else content
         with patch.object(Path, 'read_bytes', changed):
             self.assertNotEqual(adapter_digest(), before)
+
+    def test_java_syntax_commands_report_the_configured_read_budget(self):
+        source = 'class Probe { @Inject Service service; void leaf() {} void run() { leaf(); } }\n'
+        (self.root / 'Probe.java').write_text(source)
+        database = self.directory / 'syntax-budget.sqlite'
+        build_ast_index(str(self.binary), self.root, database, 'syntax-budget')
+        for command in (('callers', 'leaf'), ('call-tree', 'leaf'), ('inject', 'Service')):
+            for budget, succeeds in ((len(source.encode()), True), (8, False)):
+                with self.subTest(command=command[0], budget=budget):
+                    environment = {**os.environ, 'AST_INDEX_ROOT': str(self.root),
+                                   'AST_INDEX_DB_PATH': str(database),
+                                   'AST_INDEX_CACHE_DIR': str(self.directory / f'cache-{command[0]}-{budget}'),
+                                   'AST_INDEX_MAX_FILE_SIZE': str(budget), 'NO_COLOR': '1'}
+                    result = subprocess.run([str(self.binary), *command], cwd=self.root, env=environment,
+                                            capture_output=True, text=True, timeout=30)
+                    if succeeds:
+                        self.assertEqual(result.returncode, 0)
+                        self.assertIn('Probe.java', result.stdout)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('Java syntax source exceeds the 8 byte budget', result.stderr)
+        # An oversized file outside the requested scope is not parser input.
+        for command in ('callers', 'call-tree'):
+            with self.subTest(excluded_command=command):
+                result = subprocess.run([str(self.binary), command, 'leaf', '--in-file', 'absent.java'],
+                                        cwd=self.root, env=environment, capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0)
+                self.assertNotIn('Probe.java', result.stdout)
 
 
 if __name__ == '__main__':

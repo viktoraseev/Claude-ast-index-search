@@ -2074,6 +2074,10 @@ pub fn cmd_graph_metrics(
     for spec in specs {
         matched.extend(resolve_symbol_spec(&conn, spec, filter)?);
     }
+    // Several specs can select the same declaration, including qualified and
+    // unqualified aliases. Union identities before totals and result limits.
+    let mut seen = HashSet::new();
+    matched.retain(|info| seen.insert(info.id));
     let ids: Vec<i64> = matched.iter().map(|info| info.id).collect();
     let metrics = db::load_symbol_graph_metrics(&conn, &ids)?;
     let mut items: Vec<MetricsItem> = matched
@@ -2097,7 +2101,7 @@ pub fn cmd_graph_metrics(
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    if report.page.items.is_empty() {
+    if report.page.pagination.total == 0 {
         println!(
             "{}",
             format!("No symbol matches {}.", specs.join(", ")).yellow()

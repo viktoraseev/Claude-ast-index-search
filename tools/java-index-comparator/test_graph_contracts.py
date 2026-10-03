@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from audit import Fixture, SCHEMA, plan, required_features
 from common import ToolError, adapter_digest, connect
 import graph_contracts
+import graph_metrics_contracts
 
 
 class GraphContractsTests(unittest.TestCase):
@@ -71,11 +72,36 @@ class GraphContractsTests(unittest.TestCase):
     def test_contract_edits_invalidate_evidence(self):
         before = adapter_digest()
         read = Path.read_bytes
-        def changed(path):
-            content = read(path)
-            return content + b'\n# changed graph contract\n' if path.name == 'graph_contracts.py' else content
-        with patch.object(Path, 'read_bytes', changed):
-            self.assertNotEqual(adapter_digest(), before)
+        for filename in ('graph_contracts.py', 'graph_metrics_contracts.py'):
+            def changed(path):
+                content = read(path)
+                return content + b'\n# changed graph contract\n' if path.name == filename else content
+            with patch.object(Path, 'read_bytes', changed):
+                self.assertNotEqual(adapter_digest(), before)
+
+    def test_metrics_normalization_preserves_duplicate_declarations(self):
+        # Aliases must be unioned in production. The comparator must not hide
+        # duplicate CLI rows while normalizing names or pagination.
+        row = {'symbol': dict(path='Probe.java', line=3, name='leaf'),
+               **graph_metrics_contracts.authored_metrics()['leaf']}
+        self.assertEqual(len(graph_metrics_contracts.metric_rows({'items': [row, row]})), 2)
+        unexpected = {**row, 'symbol': dict(path='Other.java', line=1, name='unexpected')}
+        self.assertEqual(graph_metrics_contracts.metric_rows({'items': [unexpected]})[0][0],
+                         ('Other.java', 1, 'unexpected'))
+        with self.assertRaises(ToolError):
+            graph_metrics_contracts.metric_rows({'items': [{'symbol': {}}]})
+
+    def test_independent_rank_population_and_disconnected_metric_expectations(self):
+        ranks = graph_metrics_contracts.stationary_ranks()
+        self.assertEqual(sum(ranks.values()), len(ranks))
+        self.assertEqual(ranks['left'], ranks['right'])
+        self.assertNotIn('isolated', ranks)
+        metrics = graph_metrics_contracts.authored_metrics()
+        # Repeated calls form one distinct edge, and the fourth hop lies
+        # outside the documented transitive caller depth.
+        self.assertEqual(metrics['twice']['fan_out'], 1)
+        self.assertEqual(metrics['leaf']['dependents'], 7)
+        self.assertEqual(metrics['isolated']['pagerank'], 0)
 
 
 if __name__ == '__main__':

@@ -1,8 +1,8 @@
 """Java graph selection and local traversal on authored source, not MCP truth.
 
 The expected edges below are explicit invocations in tiny synthetic sources.
-Native DB rows never supply expected identities. Cross-file Java dispatch,
-graph metrics/ranking and attached-root traversal remain separate contracts.
+Native DB rows never supply expected identities. Cross-file Java dispatch and
+attached-root traversal remain separate contracts.
 """
 from collections import deque
 from pathlib import Path
@@ -10,13 +10,15 @@ import tempfile
 
 from common import ToolError, stable_id
 from root_contracts import Runner
+import graph_metrics_contracts
 
-FEATURES = {'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle'}
+FEATURES = {'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle'} | graph_metrics_contracts.FEATURES
 REASON = ('independent source/state: disposable Java qualified graph seeds, local invocation '
-          'edges, traversal caps and graph freshness; not MCP equivalence')
+          'edges, traversal caps, graph freshness, rational stationary metrics, ranked '
+          'pages and metrics/top text rendering; not MCP equivalence')
 PENDING_REASON = ('Java import/package/receiver/overload resolution, attached-root traversal, '
-                  'ambiguity budgets, graph metrics/top and rendering remain unresolved; '
-                  'graph:java-selection/traversal/lifecycle cover disposable local Java invocations only')
+                  'ambiguity budgets and traversal text rendering remain unresolved; '
+                  'graph subcontracts cover disposable local Java invocations, metrics/top and their rendering only')
 SOURCE = '''package fixture.{package};
 class Probe {{
     int leaf() {{ return 1; }}
@@ -191,4 +193,7 @@ class Outer {
     lifecycle('stale-query', (True, True), runner.json('graph', 'dependents', 'leaf'))
     lifecycle('refresh', (True, False), runner.json('graph', 'dependents', 'leaf', '--refresh'))
     lifecycle('fresh-status', (True, False), runner.json('graph', 'status'))
+    metrics_expected, metrics_actual = graph_metrics_contracts.exercise(binary, base)
+    expected.update(metrics_expected)
+    actual.update(metrics_actual)
     return expected, actual

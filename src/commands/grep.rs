@@ -29,6 +29,30 @@ use super::{
 };
 use crate::db;
 
+fn read_java_syntax_source(path: &Path, budget: u64) -> Result<String> {
+    let file = std::fs::File::open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.len() <= budget,
+        "Java syntax source exceeds the {budget} byte budget"
+    );
+    read_java_syntax_stream(file, budget)
+}
+
+fn read_java_syntax_stream(reader: impl std::io::Read, budget: u64) -> Result<String> {
+    use std::io::Read;
+
+    // Bound the read itself: a file may grow after the metadata check.
+    let mut bytes = Vec::new();
+    reader
+        .take(budget.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= budget,
+        "Java syntax source exceeds the {budget} byte budget"
+    );
+    Ok(String::from_utf8(bytes)?)
+}
+
 /// All source code extensions (for grep-based commands: todo, search, callers, etc.)
 pub const ALL_SOURCE_EXTENSIONS: [&str; 58] = [
     "kt", "java", "swift", "m", "h",    // Mobile
@@ -322,24 +346,28 @@ pub fn cmd_callers(
             path.extension().is_some_and(|ext| ext == "java") || !def_pattern.is_match(line)
         },
         |path, line_num, line| {
+            let rel_path = super::display_path(&resolver, root, path);
+            if in_file.is_some_and(|filter| !rel_path.contains(filter)) {
+                return None;
+            }
             if path.extension().is_some_and(|ext| ext == "java") {
                 if java_calls.as_ref().is_none_or(
                     |(cached, _): &(PathBuf, std::collections::HashSet<usize>)| cached != path,
                 ) {
-                    let calls = match std::fs::read_to_string(path)
-                        .map_err(anyhow::Error::from)
-                        .and_then(|content| {
-                            crate::parsers::treesitter::java::invocation_lines(
-                                &content,
-                                function_name,
-                            )
-                        }) {
-                        Ok(calls) => calls,
-                        Err(error) => {
-                            java_error = Some(error);
-                            return None;
-                        }
-                    };
+                    let calls =
+                        match read_java_syntax_source(path, crate::indexer::max_file_size_bytes())
+                            .and_then(|content| {
+                                crate::parsers::treesitter::java::invocation_lines(
+                                    &content,
+                                    function_name,
+                                )
+                            }) {
+                            Ok(calls) => calls,
+                            Err(error) => {
+                                java_error = Some(error);
+                                return None;
+                            }
+                        };
                     java_calls = Some((path.to_path_buf(), calls));
                 }
                 if !java_calls.as_ref().unwrap().1.contains(&line_num) {
@@ -347,12 +375,6 @@ pub fn cmd_callers(
                 }
             } else if !caller_regex.is_match(line) {
                 return None;
-            }
-            let rel_path = super::display_path(&resolver, root, path);
-            if let Some(filter) = in_file {
-                if !rel_path.contains(filter) {
-                    return None;
-                }
             }
             let content: String = line.chars().take(70).collect();
             Some((rel_path, line_num, content))
@@ -688,7 +710,7 @@ fn find_caller_functions(
         {
             continue;
         }
-        let content = std::fs::read_to_string(path)?;
+        let content = read_java_syntax_source(path, crate::indexer::max_file_size_bytes())?;
         let owners =
             crate::parsers::treesitter::java::invocation_callers(&content, function_names, limit)?;
         for (sites, owners) in java_callers.iter_mut().zip(owners) {
@@ -1074,12 +1096,17 @@ pub fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
         if items.len() >= limit {
             break;
         }
-        let Ok(content) = std::fs::read_to_string(path) else {
-            continue;
-        };
         let java = path
             .extension()
             .is_some_and(|extension| extension == "java");
+        let content = if java {
+            read_java_syntax_source(path, crate::indexer::max_file_size_bytes())?
+        } else {
+            let Ok(content) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            content
+        };
         if !content.contains("Inject") && !content.contains("Autowired") {
             continue;
         }
@@ -1407,6 +1434,44 @@ fn find_ast_grep_binary() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod java_syntax_budget_tests {
+    #[test]
+    fn java_source_over_the_syntax_budget_is_an_error_not_unbounded_input() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let directory = tempfile::tempdir_in(base).unwrap();
+        let path = directory.path().join("Probe.java");
+        let source = "class Probe {}";
+        std::fs::write(&path, source).unwrap();
+        assert_eq!(
+            super::read_java_syntax_source(&path, source.len() as u64).unwrap(),
+            source
+        );
+        assert!(super::read_java_syntax_source(&path, source.len() as u64 - 1).is_err());
+    }
+
+    #[test]
+    fn java_stream_read_is_bounded_even_if_the_source_grows() {
+        let mut stream = std::io::Cursor::new(b"class Probe {} trailing data");
+        let error = super::read_java_syntax_stream(&mut stream, 8).unwrap_err();
+        assert!(error.to_string().contains("8 byte budget"));
+        assert_eq!(stream.position(), 9);
+    }
+
+    #[test]
+    fn java_stream_preserves_utf8_and_empty_file_semantics() {
+        let source = "class Пример {}";
+        assert_eq!(
+            super::read_java_syntax_stream(source.as_bytes(), source.len() as u64).unwrap(),
+            source
+        );
+        assert!(super::read_java_syntax_stream(&b"\xff"[..], 1).is_err());
+        assert_eq!(super::read_java_syntax_stream(&b""[..], 0).unwrap(), "");
+        assert!(super::read_java_syntax_stream(&b"x"[..], 0).is_err());
+    }
 }
 
 #[cfg(test)]

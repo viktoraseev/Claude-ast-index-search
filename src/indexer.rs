@@ -24,7 +24,7 @@ mod maven_manifest;
 /// Configurable via `AST_INDEX_MAX_FILE_SIZE` (bytes). Default: 1 MB.
 mod swift_manifest;
 
-fn max_file_size_bytes() -> u64 {
+pub(crate) fn max_file_size_bytes() -> u64 {
     std::env::var("AST_INDEX_MAX_FILE_SIZE")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
