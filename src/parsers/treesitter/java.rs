@@ -1300,6 +1300,7 @@ fn is_inside_type_body(node: &tree_sitter::Node) -> bool {
                 p.kind(),
                 "class_body"
                     | "interface_body"
+                    | "annotation_type_body"
                     | "enum_body"
                     | "enum_body_declarations"
                     | "record_body"

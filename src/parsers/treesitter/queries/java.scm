@@ -38,6 +38,10 @@
 (method_declaration
   name: (identifier) @method_name) @method_node @definition
 
+; Annotation elements are callable declarations, including elements with defaults.
+(annotation_type_element_declaration
+  name: (identifier) @method_name) @method_node @definition
+
 ; Constructors
 (constructor_declaration
   name: (identifier) @constructor_name) @constructor_node @definition
@@ -48,6 +52,11 @@
 
 ; Fields
 (field_declaration
+  declarator: (variable_declarator
+    name: (identifier) @field_name)) @field_node @definition
+
+; Interface and annotation fields use a different grammar node from class fields.
+(constant_declaration
   declarator: (variable_declarator
     name: (identifier) @field_name)) @field_node @definition
 
