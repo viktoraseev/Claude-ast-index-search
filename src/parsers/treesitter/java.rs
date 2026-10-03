@@ -1248,6 +1248,15 @@ pub fn collect_qualified_name_occurrences(content: &str) -> Result<QualifiedName
                         }
                     }
                     "object_creation_expression" => is_local = true,
+                    "enum_constant" => {
+                        // A constant-specific body is an anonymous subclass,
+                        // but the constant itself keeps the named enum owner.
+                        if parent.child_by_field_name("name").map(|owner| owner.id())
+                            != Some(capture.node.id())
+                        {
+                            is_local = true;
+                        }
+                    }
                     _ => {}
                 }
                 node = parent.parent();
