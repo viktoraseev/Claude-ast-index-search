@@ -9,6 +9,7 @@ from audit import Fixture, InvocationOracle, SCHEMA
 from build_index import build_ast_index, freeze_binary
 from common import StreamableHttpMcpClient, ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot, stable_id
 import mobile_contracts
+import text_snapshot
 
 
 class StoredOracle:
@@ -114,6 +115,8 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 with state:
                     state.execute("INSERT OR REPLACE INTO metadata VALUES ('supplemental_oracle_evidence',?)", (str(oracle_evidence.resolve()),))
             refreshed = 0
+            snapshot_copied = False
+            has_text_snapshot = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='text_snapshot_dependencies'").fetchone()
             for check in problem_batch(source, limit):
                 existing = state.execute("SELECT status FROM checks WHERE id=?", (check["id"],)).fetchone()
                 if existing and existing[0] == "complete":
@@ -121,7 +124,11 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 with state:
                     state.execute("INSERT OR REPLACE INTO checks(id,feature,subject) VALUES (?,?,?)", (check["id"], check["feature"], check["subject"]))
                 oracle = StoredOracle(source, check["id"])
-                fixture = Fixture(root, binary, database, state, oracle, schedule_followups=False)
+                batch_text = bool(has_text_snapshot and source.execute('SELECT 1 FROM text_snapshot_dependencies WHERE check_id=?', (check['id'],)).fetchone())
+                if batch_text and not snapshot_copied:
+                    text_snapshot.copy_snapshot(source, state, root)
+                    snapshot_copied = True
+                fixture = Fixture(root, binary, database, state, oracle, schedule_followups=False, batch_text=batch_text)
                 fixture.evaluate(check)
                 try:
                     oracle.assert_consumed()

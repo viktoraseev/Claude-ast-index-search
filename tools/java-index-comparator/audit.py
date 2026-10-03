@@ -37,6 +37,7 @@ from build_index import build_ast_index, freeze_binary
 from java_structure import structure_server
 from oracle_store import Metrics, OracleStore, Reply, ReplyCache, SCHEMA as ORACLE_SCHEMA
 import mobile_contracts
+import text_snapshot
 
 
 SCHEMA = """
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS checks(
     UNIQUE(feature,subject)
 );
 CREATE INDEX IF NOT EXISTS checks_status ON checks(status, feature, subject);
+CREATE INDEX IF NOT EXISTS checks_verdict ON checks(verdict);
 CREATE TABLE IF NOT EXISTS source_structures(
     path TEXT PRIMARY KEY, modified INTEGER NOT NULL, size INTEGER NOT NULL, entries_json TEXT NOT NULL
 );
@@ -59,7 +61,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -363,7 +365,7 @@ def declaration_keys(items: list[dict[str, Any]], root: Path, name: str) -> Coun
 
 class Fixture:
     def __init__(self, root: Path, binary: Path, database: Path, state: sqlite3.Connection, client: Any,
-                 *, schedule_followups: bool = True):
+                 *, schedule_followups: bool = True, batch_text: bool = False):
         self.root, self.binary, self.state, self.client = root, binary, state, client
         client_metrics = getattr(client, 'metrics', None)
         self.metrics = client_metrics if isinstance(client_metrics, Metrics) else Metrics(state)
@@ -378,6 +380,9 @@ class Fixture:
         self.schedule_followups = schedule_followups
         self._injection_ready = False
         self._inventory_ready = False
+        self.batch_text = batch_text
+        self._text_batch_unavailable = False
+        self._text_snapshot = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
@@ -722,10 +727,21 @@ class Fixture:
     def text_search_check(self, check: sqlite3.Row):
         annotation = check['feature'] == 'annotations'
         query = '@' + check['subject'].lstrip('@') if annotation else check['subject']
-        expected = self.oracle_text(check, {
+        arguments = {
             'project_path': str(self.root), 'query': query, 'caseSensitive': True,
             'context': 'all', 'filePattern': '*.java', 'pageSize': 500,
-        })
+        }
+        if self.batch_text and not self._text_batch_unavailable and text_snapshot.TextSnapshot.eligible(query):
+            try:
+                if self._text_snapshot is None:
+                    self._text_snapshot = text_snapshot.TextSnapshot(self.root, self.state, self.client, self.metrics)
+                expected = self._text_snapshot.search(check['id'], query)
+            except text_snapshot.SnapshotUnavailable:
+                self._text_batch_unavailable = True
+                self.metrics.record('oracle.text_snapshot_fallback')
+                expected = self.oracle_text(check, arguments)
+        else:
+            expected = self.oracle_text(check, arguments)
         if annotation:
             actual = self.text_cli('annotations', check['subject'], '--limit', '1000000')
             lines = actual.splitlines()
@@ -1492,7 +1508,8 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         raise Unsupported("target has no Java source files; language contract needed")
     binary_hash = file_sha256(binary)
     contract = adapter_digest()
-    epoch = stable_id({"root": str(root), "snapshot": snapshot, "inventory": inventory_hash,
+    text_mode = getattr(arguments, 'text_mode', 'batch')
+    epoch = stable_id({"root": str(root), "snapshot": snapshot, "inventory": inventory_hash, "text_mode": text_mode,
                        "binary": binary_hash, "contract": contract})[:20]
     directory = output / epoch
     directory.mkdir(parents=True, exist_ok=True)
@@ -1503,6 +1520,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         metadata = {
             "project_root": str(root), "snapshot_sha256": snapshot,
             "binary_sha256": binary_hash, "java_files": str(len(source_files)),
+            "fixture_sha256": contract, "text_mode": text_mode,
         }
         with state:
             state.executemany("INSERT OR REPLACE INTO metadata VALUES (?,?)", metadata.items())
@@ -1520,14 +1538,14 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         if missing:
             raise Unsupported("Index MCP Server lacks tools required by live contracts: " + ", ".join(sorted(missing)))
         if "ide_project_status" in tools:
-            status = client.call("ide_project_status", {})
-            if not any(Path(p.get("path", "")).resolve() == root and p.get("open") for p in status.get("projects", [])):
+            status = client.call("ide_project_status", {'project_path': str(root)})
+            if not any(os.path.normpath(p.get("path", "")) == str(root) and p.get("open") for p in status.get("projects", [])):
                 raise ToolError("target project is not open in Index MCP Server")
         with state:
             state.execute("INSERT OR REPLACE INTO metadata VALUES ('mcp_server',?)", (canonical_json(server),))
         database = directory / "index.sqlite"
         build_ast_index(str(binary), root, database, snapshot, 4, False)
-        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state, metrics=metrics))
+        fixture = Fixture(root, binary, database, state, InvocationOracle(client, state, metrics=metrics), batch_text=text_mode == 'batch')
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
         plan(state, source_files, help_text, java_identifier_candidates(root), root)
         limit = arguments.case_limit
@@ -1576,6 +1594,8 @@ def main() -> int:
     parser.add_argument("--mcp-name", default="intellij-index")
     parser.add_argument("--mcp-url")
     parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument('--text-mode', choices=('batch', 'scalar'), default='batch',
+                        help='MCP full-line acquisition or legacy per-name searches; native CLI checks stay unchanged')
     parser.add_argument("--case-limit", type=int)
     parser.add_argument("--problem-limit", type=int, default=100)
     arguments = parser.parse_args()

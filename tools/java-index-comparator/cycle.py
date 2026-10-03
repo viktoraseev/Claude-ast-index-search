@@ -303,6 +303,7 @@ def run(arguments: argparse.Namespace) -> int:
                             ast_index=str(repository / "target/release/ast-index"),
                             mcp_url=arguments.mcp_url, mcp_name=arguments.mcp_name,
                             timeout=arguments.timeout, case_limit=None, problem_limit=100,
+                            text_mode=getattr(arguments, 'text_mode', 'batch'),
                         )
                         summary = scan(scan_arguments)
                         print(canonical_json({key: summary[key] for key in ("counts", "remaining_checks", "unimplemented_features", "complete")}), flush=True)
@@ -409,6 +410,8 @@ def main() -> int:
     parser.add_argument("--agent-command", default='["codex","exec","--approve-for-me","--json","-"]')
     parser.add_argument("--agent-timeout", type=float)
     parser.add_argument("--max-rounds", type=int)
+    parser.add_argument('--text-mode', choices=('batch', 'scalar'), default='batch',
+                        help='MCP text acquisition mode; native CLI and semantic checks are unchanged')
     arguments = parser.parse_args()
     if arguments.max_rounds is not None and arguments.max_rounds < 1:
         parser.error("max-rounds must be positive")

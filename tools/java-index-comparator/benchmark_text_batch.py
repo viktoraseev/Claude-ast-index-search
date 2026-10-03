@@ -40,6 +40,10 @@ def capture_file(fixture, relative, maximum_bytes=8 * 1024 * 1024):
         if actual != expected or any(relative_path(item.get('file', item.get('path')), fixture.root) != relative
                                      for item in matches):
             raise Unsupported('batch MCP did not confirm every nonempty source line exactly')
+        # Position coverage alone cannot detect unsaved/stale IDE text. The
+        # server's full-line regex previews must confirm source contents too.
+        if any(item.get('context') != lines[item['line'] - 1].strip() for item in matches):
+            raise Unsupported('batch MCP line contents differ from the source snapshot')
         if path.read_bytes() != data:
             raise Unsupported('source changed while capturing batch evidence')
         fixture.state.execute('DELETE FROM batch_lines WHERE path=?', (relative,))
@@ -53,9 +57,9 @@ def compare_recorded(baseline, output, root, selected):
     """One recorded check at a time; never load all replies/source into RAM."""
     totals = {'cases': 0, 'pass': 0, 'mismatch': 0, 'unsupported': 0,
               'recorded_pages': 0, 'recorded_requests': 0}
-    for check in baseline.execute("SELECT id,feature,subject FROM checks WHERE status='complete' "
+    for check in baseline.execute("SELECT id,feature,subject,verdict FROM checks WHERE status='complete' "
                                   "AND feature IN ('search:content','annotations') ORDER BY id"):
-        expected, pages, unsupported = set(), 0, False
+        expected, pages, unsupported = set(), 0, check['verdict'] in {'unsupported', 'error'}
         query = '@' + check['subject'].lstrip('@') if check['feature'] == 'annotations' else check['subject']
         for page in baseline.execute('SELECT request_json,response_json FROM pages WHERE check_id=? ORDER BY page',
                                       (check['id'],)):
