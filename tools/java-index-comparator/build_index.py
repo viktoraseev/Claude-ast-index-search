@@ -48,7 +48,7 @@ def build_ast_index(binary: str, root: Path, database: Path, snapshot: str,
         finally:
             state.close()
     database.parent.mkdir(parents=True, exist_ok=True)
-    environment = {**os.environ, "AST_INDEX_DB_PATH": str(database),
+    environment = {**os.environ, "AST_INDEX_DB_PATH": str(database), "AST_INDEX_ROOT": str(root),
                    "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1"}
     command = [binary, "rebuild", "--force", "--max-files", "0", "--threads", str(threads)]
     with database.with_suffix(".build.stdout.log").open("ab") as stdout, database.with_suffix(".build.stderr.log").open("ab") as stderr:

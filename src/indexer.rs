@@ -124,7 +124,13 @@ impl ModuleLookup {
     fn find(&self, file_path: &str) -> Option<i64> {
         self.sorted
             .iter()
-            .find(|(path, _)| file_path.starts_with(path.as_str()))
+            .find(|(path, _)| {
+                path.is_empty()
+                    || file_path == path
+                    || file_path
+                        .strip_prefix(path.as_str())
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
             .map(|(_, id)| *id)
     }
 }
@@ -4350,21 +4356,27 @@ pub fn index_resources(
         }
     }
 
-    // Build resource ID map: type -> name -> id (two-level for allocation-free lookup)
-    let resource_ids: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = {
-        let mut stmt = tx.prepare("SELECT id, type, name FROM resources")?;
+    // A logical resource can have configuration variants and the same name
+    // in unrelated modules. Keep ownership instead of overwriting by name.
+    type ResourceOwners = HashMap<String, HashMap<String, Vec<(Option<i64>, i64)>>>;
+    let resource_ids: ResourceOwners = {
+        let mut stmt = tx.prepare("SELECT id, type, name, module_id FROM resources ORDER BY id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?;
-        let mut map: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
-            std::collections::HashMap::new();
+        let mut map = ResourceOwners::new();
         for row in rows {
-            let (id, res_type, name) = row?;
-            map.entry(res_type).or_default().insert(name, id);
+            let (id, res_type, name, module_id) = row?;
+            map.entry(res_type)
+                .or_default()
+                .entry(name)
+                .or_default()
+                .push((module_id, id));
         }
         map
     };
@@ -4406,6 +4418,22 @@ pub fn index_resources(
                     };
 
                     let is_xml = rel_path.ends_with(".xml");
+                    let module_id = module_lookup.find(rel_path);
+                    let resolve_resource = |res_type: &str, res_name: &str| {
+                        let owners = resource_ids.get(res_type)?.get(res_name)?;
+                        if let Some((_, id)) = owners.iter().find(|(owner, _)| *owner == module_id)
+                        {
+                            return Some(*id);
+                        }
+                        // Retain cross-module lookup only when ownership is
+                        // unambiguous; dependency/namespace resolution needs
+                        // more information than a lexical R reference.
+                        let (owner, id) = owners.first()?;
+                        owners
+                            .iter()
+                            .all(|(other, _)| other == owner)
+                            .then_some(*id)
+                    };
                     let mut usages = Vec::new();
 
                     for (line_idx, line) in content.lines().enumerate() {
@@ -4416,9 +4444,7 @@ pub fn index_resources(
                                 let res_type = caps.get(1).unwrap().as_str();
                                 let res_name = caps.get(2).unwrap().as_str();
 
-                                if let Some(&resource_id) =
-                                    resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                                {
+                                if let Some(resource_id) = resolve_resource(res_type, res_name) {
                                     usages.push((resource_id, rel_path.clone(), line_num, "code"));
                                 }
                             }
@@ -4429,9 +4455,7 @@ pub fn index_resources(
                                 let res_type = caps.get(1).unwrap().as_str();
                                 let res_name = caps.get(2).unwrap().as_str();
 
-                                if let Some(&resource_id) =
-                                    resource_ids.get(res_type).and_then(|m| m.get(res_name))
-                                {
+                                if let Some(resource_id) = resolve_resource(res_type, res_name) {
                                     usages.push((resource_id, rel_path.clone(), line_num, "xml"));
                                 }
                             }

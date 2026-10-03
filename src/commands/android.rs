@@ -38,45 +38,46 @@ pub fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>
     // Search for class in XML usages
     let pattern = format!("%{}%", class_name);
 
-    let results: Vec<(String, String, i64, String, Option<String>)> =
-        if let Some(module) = module_filter {
-            let mut stmt = conn.prepare(
-                "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
+    let results: Vec<(String, String, i64, String, Option<String>)> = if let Some(module) =
+        module_filter
+    {
+        let mut stmt = conn.prepare(
+                "SELECT COALESCE(m.name, '(unassigned)'), x.file_path, x.line, x.class_name, x.element_id
              FROM xml_usages x
-             JOIN modules m ON x.module_id = m.id
+             LEFT JOIN modules m ON x.module_id = m.id
              WHERE x.class_name LIKE ?1 AND m.name = ?2
-             ORDER BY m.name, x.file_path, x.line",
+             ORDER BY x.file_path, x.line, m.name",
             )?;
-            let rows = stmt.query_map(params![pattern, module], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT m.name, x.file_path, x.line, x.class_name, x.element_id
+        let rows = stmt.query_map(params![pattern, module], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    } else {
+        let mut stmt = conn.prepare(
+                "SELECT COALESCE(m.name, '(unassigned)'), x.file_path, x.line, x.class_name, x.element_id
              FROM xml_usages x
-             JOIN modules m ON x.module_id = m.id
+             LEFT JOIN modules m ON x.module_id = m.id
              WHERE x.class_name LIKE ?1
-             ORDER BY m.name, x.file_path, x.line
+             ORDER BY x.file_path, x.line, m.name
              LIMIT 100",
             )?;
-            let rows = stmt.query_map(params![pattern], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
+        let rows = stmt.query_map(params![pattern], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
 
     println!(
         "{}",
@@ -166,8 +167,12 @@ pub fn cmd_resource_usages(
             "SELECT r.type, r.name, r.file_path
              FROM resources r
              JOIN modules m ON r.module_id = m.id
-             LEFT JOIN resource_usages ru ON r.id = ru.resource_id
-             WHERE m.name = ?1 AND ru.id IS NULL
+             WHERE m.name = ?1 AND NOT EXISTS (
+                 SELECT 1 FROM resource_usages ru
+                 JOIN resources used ON used.id = ru.resource_id
+                 WHERE used.type = r.type AND used.name = r.name
+                   AND used.module_id IS r.module_id
+             )
              ORDER BY r.type, r.name",
         )?;
 
@@ -217,12 +222,16 @@ pub fn cmd_resource_usages(
                 "SELECT ru.usage_file, ru.usage_line, ru.usage_type
                  FROM resource_usages ru
                  JOIN resources r ON ru.resource_id = r.id
-                 WHERE r.type = ?1 AND r.name = ?2 AND ru.usage_file LIKE ?3
+                 WHERE r.type = ?1 AND r.name = ?2 AND (
+                     SELECT m.name FROM modules m
+                     WHERE m.path = '' OR ru.usage_file = m.path
+                        OR substr(ru.usage_file, 1, length(m.path) + 1) = m.path || '/'
+                     ORDER BY length(m.path) DESC LIMIT 1
+                 ) = ?3
                  ORDER BY ru.usage_file, ru.usage_line
                  LIMIT 100",
             )?;
-            let module_pattern = format!("%{}%", module);
-            let rows = stmt.query_map(params![res_type, res_name, module_pattern], |row| {
+            let rows = stmt.query_map(params![res_type, res_name, module], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?;
             rows.filter_map(|r| r.ok()).collect()

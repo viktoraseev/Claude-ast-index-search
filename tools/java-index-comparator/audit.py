@@ -46,6 +46,7 @@ import install_contracts
 import profile_contracts
 import delegate_contracts
 import route_contracts
+import android_contracts
 
 
 SCHEMA = """
@@ -75,7 +76,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -473,8 +474,10 @@ class Fixture:
         self._root_error = None
         self._install_results = None
         self._install_error = None
+        self._android_results = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
+            "AST_INDEX_ROOT": str(root),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
         }
 
@@ -1622,6 +1625,17 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def android_check(self, check: sqlite3.Row):
+        if check['subject'] == 'target-absence':
+            expected, actual = android_contracts.verify_absence(self, check['feature'])
+        else:
+            if self._android_results is None:
+                self._android_results = android_contracts.exercise(self.binary, self.database.parent)
+            expected, actual = (section[check['feature']] for section in self._android_results)
+        return {'source': android_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1655,6 +1669,8 @@ class Fixture:
                 handler = self.profile_check
             if check['feature'] in route_contracts.FEATURES:
                 handler = self.route_check
+            if check['feature'] in android_contracts.FEATURES:
+                handler = self.android_check
             if check['feature'] == 'api':
                 handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
@@ -1845,6 +1861,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     module_contracts.plan_modules(state, root)
     profile_contracts.plan_profiles(state, root)
     route_contracts.plan_routes(state, root)
+    android_contracts.plan_android(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

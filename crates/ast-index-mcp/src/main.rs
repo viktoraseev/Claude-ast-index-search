@@ -626,7 +626,9 @@ fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Resu
         .get("project_root")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_root.clone());
+        .unwrap_or_else(|| default_root.clone())
+        .canonicalize()
+        .context("project_root must name an accessible directory")?;
 
     // Default output format is compact text (token-efficient). Agents can
     // request raw JSON via `format: "json"` when they need structured
@@ -641,6 +643,10 @@ fn call_tool(params: Value, ast_index_bin: &str, default_root: &PathBuf) -> Resu
     let output = Command::new(ast_index_bin)
         .args(&argv)
         .current_dir(&resolved_root)
+        // A per-call root overrides the server's inherited default; use the
+        // absolute path so a relative request is not resolved a second time
+        // against the child's newly selected working directory.
+        .env("AST_INDEX_ROOT", &resolved_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()

@@ -192,6 +192,7 @@ def build_ast_index(
             connection.close()
     environment = os.environ.copy()
     environment["AST_INDEX_DB_PATH"] = str(database)
+    environment["AST_INDEX_ROOT"] = str(project_root)
     command = [
         ast_binary,
         "rebuild",

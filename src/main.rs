@@ -11,6 +11,7 @@ use ast_index::{commands, db};
 #[command(name = "ast-index")]
 #[command(about = "Fast code search for multi-language projects")]
 #[command(version)]
+#[command(after_help = "AST_INDEX_ROOT pins an exact project directory (absolute or relative to cwd), without ancestor discovery.")]
 #[command(help_template = "\
 {before-help}{name} v{version}
 {about}
@@ -1107,10 +1108,21 @@ fn main() -> Result<()> {
             | Commands::Changed { .. }
     );
     let changed_command = matches!(&cli.command, Commands::Changed { .. });
+    let version_command = matches!(&cli.command, Commands::Version);
     let release_command_publication = matches!(&cli.command, Commands::Watch);
-    let (root, mut command_cache_lease) = if changed_command {
-        // `changed` discovers only VCS markers from the invocation directory.
-        // It must never probe or create the ast-index cache.
+    let explicit_root = if version_command {
+        None
+    } else {
+        explicit_project_root()?
+    };
+    let (root, mut command_cache_lease) = if let Some(root) = explicit_root {
+        // An explicit boundary applies to cache-independent scans as well as
+        // indexed commands. Never fall back to an ancestor or the invocation
+        // directory when the caller selected a different source root.
+        (root, None)
+    } else if changed_command || version_command {
+        // `version` needs no project discovery. `changed` starts VCS discovery
+        // at the invocation directory. Neither command probes the index cache.
         (std::env::current_dir()?, None)
     } else if cache_independent {
         // These commands use only the working tree or executable metadata.
@@ -2289,6 +2301,21 @@ fn shell_quote(arg: &str) -> String {
 
 fn find_project_root_for_write() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
+}
+
+fn explicit_project_root() -> Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os("AST_INDEX_ROOT").filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(value)
+        .canonicalize()
+        .context("AST_INDEX_ROOT must name an accessible project directory")?;
+    if !root.is_dir() {
+        return Err(anyhow::anyhow!(
+            "AST_INDEX_ROOT must name a project directory, not a file"
+        ));
+    }
+    Ok(Some(root))
 }
 
 /// After a successful rebuild/update, sweep index caches for other projects

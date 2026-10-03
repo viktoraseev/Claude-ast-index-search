@@ -15,7 +15,7 @@ from common import ToolError
 
 
 FEATURES = {'add-root', 'remove-root', 'subtree', 'global:local',
-            'global:subtree', 'global:walk-up'}
+            'global:subtree', 'global:walk-up', 'global:explicit-root'}
 REASON = ('independent source/state: disposable Java root registration, cache selection '
           'and SQL/text scope checks; not MCP equivalence')
 SOURCE = '''package fixture.{package};
@@ -154,6 +154,51 @@ class Runner:
         return expected, actual
 
 
+def explicit_root_samples(binary, directory):
+    boundary = Path(__file__).resolve().parents[2] / '.artifacts'
+    directory = Path(directory).resolve()
+    if not directory.is_relative_to(boundary.resolve()):
+        raise ToolError('explicit root fixtures must stay inside repository .artifacts')
+    directory.mkdir(parents=True, exist_ok=True)
+    runner = Runner(binary, directory)
+    runner.root.mkdir()
+    (runner.root / '.git').mkdir()
+    (runner.root / 'pom.xml').write_text('<project><artifactId>parent</artifactId></project>')
+    (runner.root / 'ParentOnly.java').write_text('class ParentOnly {}\n')
+    target = runner.root / 'java-only'
+    target.mkdir()
+    (target / 'TargetOnly.java').write_text('class TargetOnly {}\n')
+    invoker = directory / 'invoker'
+    invoker.mkdir()
+    (invoker / '.git').mkdir()
+    (invoker / 'InvokerOnly.java').write_text('class InvokerOnly {}\n')
+    environment = {'AST_INDEX_ROOT': str(target),
+                   'AST_INDEX_DB_PATH': str(directory / 'explicit.sqlite')}
+    expected, actual = {}, {}
+    for label, root, cwd in (('absolute', str(target), target),
+                              ('relative', 'java-only', runner.root)):
+        expected[label + ':markers'] = []
+        output = runner.json('detect-stacks', cwd=cwd, environment={**environment, 'AST_INDEX_ROOT': root})
+        actual[label + ':markers'] = output.get('stacks')
+    runner.command('rebuild', '--force', cwd=invoker, environment=environment)
+    for label, flags, env in (('explicit', [], {}), ('explicit-over-walk-up', ['--walk-up'],
+                                                      {'AST_INDEX_WALK_UP': '1'})):
+        expected[label + ':declarations'] = [('TargetOnly', 'TargetOnly.java', 1)]
+        output = runner.json(*flags, 'class', '--pattern', '*Only', '--limit', '100', cwd=invoker,
+                             environment={**environment, **env})
+        actual[label + ':declarations'] = sorted((r['name'], r['path'], r['line']) for r in output['items'])
+        expected[label + ':total'] = 1
+        actual[label + ':total'] = output['pagination']['total']
+    for label, root in (('missing', target / 'missing'), ('file', target / 'TargetOnly.java')):
+        expected[label + ':rejected'] = 1
+        actual[label + ':rejected'] = runner.command('detect-stacks', cwd=target,
+            environment={**environment, 'AST_INDEX_ROOT': str(root)}, acceptable=(0, 1))[0]
+    expected['version-independent-of-root'] = 0
+    actual['version-independent-of-root'] = runner.command('version', cwd=target,
+        environment={'AST_INDEX_ROOT': str(target / 'missing')})[0]
+    return expected, actual
+
+
 def exercise(binary, base):
     boundary = Path(__file__).resolve().parents[2] / '.artifacts'
     base = Path(base).resolve()
@@ -163,6 +208,8 @@ def exercise(binary, base):
     directory = Path(tempfile.mkdtemp(prefix='roots-', dir=base)).resolve()
     runner = Runner(binary, directory)
     expected, actual = ({feature: {} for feature in FEATURES} for _ in range(2))
+    expected['global:explicit-root'], actual['global:explicit-root'] = explicit_root_samples(
+        binary, directory / 'explicit-root')
     sources = {'project/Main.java': 'primary', 'project/A0.java': 'first',
                'project/A1.java': 'second', 'named/Main.java': 'named', 'legacy/Main.java': 'legacy'}
     for path, package in sources.items():

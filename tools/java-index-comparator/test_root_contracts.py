@@ -51,6 +51,10 @@ class RootContractsTests(unittest.TestCase):
         self.assertEqual(self.state.execute("SELECT status FROM coverage WHERE feature='global:scope-command-matrix'").fetchone()[0], 'pending')
         self.assertIn('global:scope-command-matrix', required_features())
 
+    def test_explicit_root_never_falls_back_to_parent_or_invocation_directory(self):
+        expected, actual = root_contracts.explicit_root_samples(self.binary, self.directory / 'explicit')
+        self.assertEqual(actual, expected)
+
     def test_well_shaped_wrong_or_empty_outcome_cannot_pass(self):
         check = self.state.execute("SELECT * FROM checks WHERE feature='global:subtree'").fetchone()
         for observed in ({'named': {'file:1': {'returned': 0}}}, {}):
