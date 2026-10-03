@@ -10,6 +10,7 @@ from audit import Fixture, SCHEMA, plan, required_features
 from common import ToolError, adapter_digest, connect
 import graph_contracts
 import graph_metrics_contracts
+import graph_traversal_contracts
 
 
 class GraphContractsTests(unittest.TestCase):
@@ -72,7 +73,7 @@ class GraphContractsTests(unittest.TestCase):
     def test_contract_edits_invalidate_evidence(self):
         before = adapter_digest()
         read = Path.read_bytes
-        for filename in ('graph_contracts.py', 'graph_metrics_contracts.py'):
+        for filename in ('graph_contracts.py', 'graph_metrics_contracts.py', 'graph_traversal_contracts.py'):
             def changed(path):
                 content = read(path)
                 return content + b'\n# changed graph contract\n' if path.name == filename else content
@@ -90,6 +91,19 @@ class GraphContractsTests(unittest.TestCase):
                          ('Other.java', 1, 'unexpected'))
         with self.assertRaises(ToolError):
             graph_metrics_contracts.metric_rows({'items': [{'symbol': {}}]})
+
+    def test_traversal_normalization_preserves_every_hop_and_duplicate_path(self):
+        normalize = graph_traversal_contracts.path_text
+        path = '    entry [function] Probe.java:6 -> [local]\n    leaf [function] Probe.java:3\n'
+        notice = graph_traversal_contracts.notice(2, 1)
+        output = 'header\n  path 1:\n' + path + notice
+        self.assertEqual(normalize(output), {'header': 'header\n', 'paths': [path], 'notice': notice})
+        self.assertEqual(len(normalize('header\n  path 1:\n' + path + '  path 2:\n' + path)['paths']), 2)
+        self.assertEqual(normalize('header\n' + graph_traversal_contracts.notice(2, 0))['notice'],
+                         graph_traversal_contracts.notice(2, 0))
+        altered = output.replace('Probe.java:3', 'Foreign.java:3')
+        self.assertNotEqual(normalize(altered), normalize(output))
+        self.assertNotEqual(normalize(output + 'unexpected footer\n'), normalize(output))
 
     def test_independent_rank_population_and_disconnected_metric_expectations(self):
         ranks = graph_metrics_contracts.stationary_ranks()

@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 from audit import Fixture, InvocationOracle, SCHEMA
-from build_index import build_ast_index, freeze_binary
+from build_index import build_ast_index, capture_binary, freeze_binary
 from common import StreamableHttpMcpClient, ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot, stable_id
 import mobile_contracts
 import text_snapshot
@@ -84,7 +84,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 raise ToolError('supplemental oracle target differs from the captured source snapshot')
             if archived_metadata.get('inventory_sha256', inventory_hash) != inventory_hash:
                 raise ToolError('supplemental oracle file-type inventory differs from target')
-        binary_hash = file_sha256(binary)
+        binary, binary_hash = capture_binary(binary, output / 'binaries')
         epoch = stable_id({"evidence": str(evidence.resolve()), "snapshot": snapshot, "inventory": inventory_hash, "binary": binary_hash, "limit": limit,
                            "fixture": adapter_digest(), "mcp_url": mcp_url,
                            "oracle_evidence": str(oracle_evidence.resolve()) if oracle_evidence else None})[:20]

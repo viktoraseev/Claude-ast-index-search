@@ -1729,6 +1729,52 @@ fn dispatch_render(format: &str, result: &ModuleRouteResult) -> Result<()> {
     }
 }
 
+/// Per-scan deduplication with a bounded page cache. An empty SQLite filename
+/// creates a private temporary database that spills to disk and disappears on
+/// close. It never modifies the project index or retains a project-sized set
+/// of symbol names in Rust memory.
+struct UsedDependencySymbols {
+    connection: Connection,
+}
+
+impl UsedDependencySymbols {
+    fn new() -> Result<Self> {
+        let connection = Connection::open("")?;
+        // The data is disposable, so journaling/durability are unnecessary.
+        // One transaction avoids per-symbol commits; cache spilling remains
+        // enabled even while the transaction is open.
+        connection.execute_batch(
+            "PRAGMA cache_size=-2048;
+             PRAGMA cache_spill=ON;
+             PRAGMA journal_mode=OFF;
+             PRAGMA synchronous=OFF;
+             CREATE TABLE used_symbols(name TEXT PRIMARY KEY) WITHOUT ROWID;
+             BEGIN;",
+        )?;
+        Ok(Self { connection })
+    }
+
+    fn insert(&self, name: &str) -> Result<()> {
+        self.connection
+            .prepare_cached("INSERT OR IGNORE INTO used_symbols(name) VALUES(?1)")?
+            .execute(params![name])?;
+        Ok(())
+    }
+
+    fn summary(&self) -> Result<(usize, Vec<String>)> {
+        let count = self
+            .connection
+            .query_row("SELECT count(*) FROM used_symbols", [], |row| row.get(0))?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT name FROM used_symbols ORDER BY name LIMIT 3")?;
+        let samples = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((count, samples))
+    }
+}
+
 /// Check dependency identities using Java syntax and other languages' indexed refs.
 fn count_symbols_used_in_module(
     conn: &Connection,
@@ -1736,7 +1782,7 @@ fn count_symbols_used_in_module(
     dependency_path: &str,
     module_path: &str,
 ) -> Result<(usize, Vec<String>)> {
-    let mut used = std::collections::BTreeSet::new();
+    let used = UsedDependencySymbols::new()?;
 
     // Bare refs cannot distinguish alpha.Widget from beta.Widget and omit
     // import-only/static anchors. Stream Java files, retaining one syntax tree
@@ -1842,7 +1888,7 @@ fn count_symbols_used_in_module(
             for name in owners.query_map(params![dependency_path, identity], |row| {
                 row.get::<_, String>(0)
             })? {
-                used.insert(name?);
+                used.insert(&name?)?;
             }
         }
     }
@@ -1865,9 +1911,41 @@ fn count_symbols_used_in_module(
         let symbol = symbol?;
         let count: i64 = stmt.query_row(params![module_path, &symbol], |row| row.get(0))?;
         if count > 0 {
-            used.insert(symbol);
+            used.insert(&symbol)?;
         }
     }
 
-    Ok((used.len(), used.into_iter().take(3).collect()))
+    used.summary()
+}
+
+#[cfg(test)]
+mod dependency_usage_memory_tests {
+    use super::UsedDependencySymbols;
+
+    #[test]
+    fn deduplication_exceeds_cache_without_an_unbounded_name_vector() {
+        let used = UsedDependencySymbols::new().unwrap();
+        let suffix = "x".repeat(64);
+        for number in (0..80_000).rev() {
+            let name = format!("Symbol{number:06}_{suffix}");
+            used.insert(&name).unwrap();
+            used.insert(&name).unwrap();
+        }
+        let (count, samples) = used.summary().unwrap();
+        assert_eq!(count, 80_000);
+        assert_eq!(
+            samples,
+            (0..3)
+                .map(|number| format!("Symbol{number:06}_{suffix}"))
+                .collect::<Vec<_>>()
+        );
+        let pragma = |name: &str| {
+            used.connection
+                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        assert_eq!(pragma("cache_size"), -2048);
+        assert!(pragma("cache_spill") > 0);
+        assert!(pragma("page_count") * pragma("page_size") > 2 * 1024 * 1024);
+    }
 }

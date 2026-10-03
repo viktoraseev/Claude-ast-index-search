@@ -72,7 +72,7 @@ class ModuleContracts(unittest.TestCase):
 
     def test_unused_dependencies_keep_java_enums_large_type_sets_and_exact_module_scope(self):
         # One authored fixture family, not one test per project database row.
-        for variant in ('enum', 'crowded', 'scope'):
+        for variant in ('enum', 'crowded', 'scope', 'duplicates'):
             with self.subTest(variant=variant):
                 library, consumer = variant + '-lib', variant + '-consumer'
                 dependency = ('<dependencies><dependency><groupId>fixture</groupId>'
@@ -87,6 +87,13 @@ class ModuleContracts(unittest.TestCase):
                     padding = ''.join(f'public static class Padding{i:03d} {{}}' for i in range(120))
                     declaration = 'public class Value {' + padding + 'public static class Wanted {}}'
                     usage = 'import dep.Value.Wanted; public class Use { Wanted value; }'
+                elif variant == 'duplicates':
+                    declaration = 'public class Value {' + ''.join(
+                        f'public static class {name} {{}}' for name in 'ABCD') + '}'
+                    fields = ' '.join(f'Value.{name} field{name};' for name in 'ABCD')
+                    usage = 'import dep.Value; public class Use { ' + fields + ' }'
+                    self.write(f'{variant}/consumer/Repeated.java',
+                               'package app; import dep.Value; class Repeated { ' + fields + ' }')
                 else:
                     declaration = 'public class Value {}'
                     usage = 'public class Use {}'
@@ -105,6 +112,12 @@ class ModuleContracts(unittest.TestCase):
                 self.assertIsNotNone(summary)
                 expected = (1, 0, 0, 1) if variant == 'scope' else (0, 0, 1, 1)
                 self.assertEqual(tuple(map(int, summary.groups())), expected)
+                if variant == 'duplicates':
+                    details = self.fixture.text_cli('unused-deps', variant + '.consumer', '--strict', '--verbose')
+                    # Five distinct type anchors across two files, but only
+                    # three stable examples; repeated uses must not inflate
+                    # the count or truncate it to the sample size.
+                    self.assertIn(f'  ✓ {variant}.lib - 5 symbols: A, B, C\n', details)
 
     def test_unused_dependency_android_checks_do_not_drop_tail_entries_or_include_siblings(self):
         for variant in ('xml-cap', 'xml-suffix', 'xml-package', 'xml-nested', 'xml-dollar-package',

@@ -1582,7 +1582,9 @@ pub fn cmd_graph_path(
                 .collect()
         })
         .collect();
-    let total = rendered.len();
+    // Path enumeration stops at max_paths, but pagination describes all
+    // shortest paths counted in the predecessor DAG, including an empty page.
+    let total = usize::try_from(shortest).unwrap_or(usize::MAX);
     let report = PathReport {
         graph: GraphState::from(&state),
         from: from_matches
@@ -1656,6 +1658,7 @@ pub fn cmd_graph_path(
             println!("    {}{}", hop.symbol.render(), edge);
         }
     }
+    super::print_truncation_notice_with_flag(report.page.pagination, "--max-paths");
     Ok(())
 }
 

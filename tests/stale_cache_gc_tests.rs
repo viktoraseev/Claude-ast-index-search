@@ -429,6 +429,23 @@ fn refuses_symlinked_gc_trash_directory() {
 
 #[test]
 fn held_shared_project_lease_defers_collection_until_released() {
+    const ISOLATED: &str = "AST_INDEX_GC_TEST_ISOLATED_RELEASE";
+    if std::env::var_os(ISOLATED).is_none() {
+        // Parallel process spawns can inherit GC's layout flock until exec,
+        // making a second best-effort sweep legitimately defer collection.
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "held_shared_project_lease_defers_collection_until_released",
+                "--nocapture",
+            ])
+            .env(ISOLATED, "1")
+            .spawn()
+            .unwrap();
+        assert!(wait_for_exit(&mut child, Duration::from_secs(30)).success());
+        return;
+    }
+
     let base = TempDir::new().unwrap();
     let now = test_now();
     let key = "1ea5e";

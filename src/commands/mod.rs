@@ -92,11 +92,15 @@ impl<T> Page<T> {
 }
 
 pub fn print_truncation_notice(pagination: Pagination) {
+    print_truncation_notice_with_flag(pagination, "--limit");
+}
+
+pub(crate) fn print_truncation_notice_with_flag(pagination: Pagination, flag: &str) {
     if pagination.truncated {
         println!(
             "  {}",
             format!(
-                "Truncated: showing {} of {} results; use --limit {} to see all.",
+                "Truncated: showing {} of {} results; use {flag} {} to see all.",
                 pagination.returned, pagination.total, pagination.total
             )
             .yellow()

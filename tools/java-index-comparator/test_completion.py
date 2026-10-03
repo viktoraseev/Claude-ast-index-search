@@ -184,6 +184,7 @@ class CompletionTests(unittest.TestCase):
                         'call-tree:semantic-resolution', 'explore:ranking-budgets',
                         'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle',
                         'graph:java-metrics', 'graph:java-top', 'graph:metrics-rendering',
+                        'graph:java-path-pagination', 'graph:traversal-rendering',
                         'unused-deps:java-ownership', 'unused-deps:java-types', 'unused-deps:transitive',
                         'unused-deps:semantic-resolution', 'unused-deps:android-ownership', 'unused-deps:target'):
             with self.subTest(feature=feature):

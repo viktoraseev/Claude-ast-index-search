@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -32,7 +33,9 @@ class SyntheticTextOracle:
 
 class TextSnapshotTests(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts' / 'tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=artifacts)
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name).resolve()
         self.root = self.directory / 'project'
@@ -178,6 +181,48 @@ class TextSnapshotTests(unittest.TestCase):
             with self.assertRaisesRegex(ToolError, 'changed during replay'):
                 replay(self.directory / 'evidence.sqlite', self.root, binary, self.directory / 'mutated-replay')
         self.assertEqual(len(evaluated), 2)
+
+    def test_atomic_build_replacement_cannot_interrupt_production_java_replay(self):
+        # Operate on a disposable copy, never mutate the actual build output.
+        built = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+        binary = self.directory / 'build-output'
+        shutil.copyfile(built, binary)
+        binary.chmod(0o755)
+        digest = file_sha256(binary)
+        fingerprint = source_snapshot(self.root)[0]
+        self.snapshot.search('type', 'Example')
+        with self.state:
+            self.state.executemany('INSERT OR REPLACE INTO metadata VALUES (?,?)',
+                                   [('project_root', str(self.root)), ('snapshot_sha256', fingerprint)])
+            self.state.execute("UPDATE checks SET verdict='fail' WHERE id='type'")
+
+        original_open, replaced = Path.open, []
+
+        def replace_after_open(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if path == binary and args == ('rb',) and not replaced:
+                replacement = self.directory / 'replacement'
+                shutil.copyfile(built, replacement)
+                with original_open(replacement, 'ab') as output:
+                    output.write(b'\nsynthetic replacement fingerprint\n')
+                replacement.chmod(0o755)
+                os.replace(replacement, binary)
+                replaced.append(True)
+            return stream
+
+        with patch.object(Path, 'open', replace_after_open), \
+                patch('replay.StreamableHttpMcpClient', side_effect=AssertionError('offline replay')):
+            result = replay(self.directory / 'evidence.sqlite', self.root, binary,
+                            self.directory / 'replacement-replay')
+        self.assertEqual(replaced, [True])
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['counts'], {'pass': 1})
+        state = connect(Path(result['verification']), read_only=True)
+        try:
+            self.assertEqual(state.execute("SELECT value FROM metadata WHERE key='binary_sha256'").fetchone()[0], digest)
+            self.assertEqual(file_sha256(Path(result['verification']).parent / 'ast-index'), digest)
+        finally:
+            state.close()
 
 
 if __name__ == '__main__':

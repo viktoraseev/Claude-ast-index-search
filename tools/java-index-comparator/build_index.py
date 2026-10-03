@@ -1,4 +1,5 @@
 """Isolated native rebuild with durable logs and no project payload on stdout."""
+import hashlib
 import os
 from pathlib import Path
 import sqlite3
@@ -6,6 +7,44 @@ import subprocess
 import tempfile
 
 from common import ToolError, connect, file_sha256
+
+
+def capture_binary(binary: Path, directory: Path) -> tuple[Path, str]:
+    """Copy and fingerprint one opened executable before selecting an epoch."""
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=".binary-", dir=directory)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as output, binary.open("rb") as source:
+            stamp = os.fstat(source.fileno())
+            digest = hashlib.sha256()
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+            # Atomic build replacements leave this descriptor usable. An
+            # in-place write must fail, including one restoring size/mtime.
+            source.seek(0)
+            verification = hashlib.sha256()
+            while chunk := source.read(1024 * 1024):
+                verification.update(chunk)
+            current = os.fstat(source.fileno())
+            if (stamp.st_size, stamp.st_mtime_ns) != (current.st_size, current.st_mtime_ns) or \
+                    digest.digest() != verification.digest():
+                raise ToolError("binary changed in place while creating its snapshot")
+        fingerprint = digest.hexdigest()
+        target = directory / fingerprint
+        temporary.chmod(0o755)
+        try:
+            # Publish without overwriting a snapshot another reader is using.
+            os.link(temporary, target)
+        except FileExistsError:
+            if file_sha256(target) != fingerprint:
+                raise ToolError("pinned binary differs from its content fingerprint")
+        return target, fingerprint
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def freeze_binary(binary: Path, directory: Path, expected_hash: str) -> Path:

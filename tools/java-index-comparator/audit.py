@@ -32,7 +32,7 @@ from common import (
     java_code_without_literals, adapter_digest,
     file_sha256, java_files,
 )
-from build_index import build_ast_index, freeze_binary
+from build_index import build_ast_index, capture_binary, freeze_binary
 from java_structure import structure_server
 from oracle_store import Metrics, OracleStore, Reply, ReplyCache, SCHEMA as ORACLE_SCHEMA
 import mobile_contracts
@@ -2009,7 +2009,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
     inventory_hash = mobile_contracts.inventory_snapshot(root)
     if not source_files:
         raise Unsupported("target has no Java source files; language contract needed")
-    binary_hash = file_sha256(binary)
+    binary, binary_hash = capture_binary(binary, output / 'binaries')
     contract = adapter_digest()
     text_mode = getattr(arguments, 'text_mode', 'batch')
     epoch = stable_id({"root": str(root), "snapshot": snapshot, "inventory": inventory_hash, "text_mode": text_mode,

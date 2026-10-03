@@ -11,14 +11,16 @@ import tempfile
 from common import ToolError, stable_id
 from root_contracts import Runner
 import graph_metrics_contracts
+import graph_traversal_contracts
 
-FEATURES = {'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle'} | graph_metrics_contracts.FEATURES
+FEATURES = ({'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle'} |
+            graph_metrics_contracts.FEATURES | graph_traversal_contracts.FEATURES)
 REASON = ('independent source/state: disposable Java qualified graph seeds, local invocation '
           'edges, traversal caps, graph freshness, rational stationary metrics, ranked '
-          'pages and metrics/top text rendering; not MCP equivalence')
+          'pages, shortest-path pagination and traversal/metrics/top text rendering; not MCP equivalence')
 PENDING_REASON = ('Java import/package/receiver/overload resolution, attached-root traversal, '
-                  'ambiguity budgets and traversal text rendering remain unresolved; '
-                  'graph subcontracts cover disposable local Java invocations, metrics/top and their rendering only')
+                  'ambiguity budgets, ambiguous/attached-root rendering and overlapping path seeds remain unresolved; '
+                  'graph subcontracts cover disposable local Java invocations, traversal pages/rendering and metrics/top only')
 SOURCE = '''package fixture.{package};
 class Probe {{
     int leaf() {{ return 1; }}
@@ -186,6 +188,9 @@ class Outer {
                                        {identity(r) for r in c['example']} == set(want[0]) for c in items)})
     output = runner.json('graph', 'dependencies', 'fixture.a.Probe', '--members')
     record('graph:java-traversal', 'class-members-internal-edges', [], output.get('items'))
+    traversal_expected, traversal_actual = graph_traversal_contracts.exercise(runner, authored)
+    expected.update(traversal_expected)
+    actual.update(traversal_actual)
     source = runner.root / 'a/Probe.java'
     source.write_text(source.read_text().replace('return 1;', 'return 2;'))
     runner.command('update')
