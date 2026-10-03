@@ -45,6 +45,7 @@ import module_contracts
 import install_contracts
 import profile_contracts
 import delegate_contracts
+import route_contracts
 
 
 SCHEMA = """
@@ -1615,6 +1616,12 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def route_check(self, check: sqlite3.Row):
+        expected, actual = route_contracts.exercise(self.binary, self.database.parent, check['feature'])
+        return {'source': route_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1646,6 +1653,8 @@ class Fixture:
                 handler = self.module_check
             if check['feature'] in profile_contracts.FEATURES:
                 handler = self.profile_check
+            if check['feature'] in route_contracts.FEATURES:
+                handler = self.route_check
             if check['feature'] == 'api':
                 handler = self.api_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
@@ -1713,6 +1722,7 @@ def required_features(help_text: str = '') -> set[str]:
                      "global:scope-command-matrix", "search:rank-presets",
                      "module-route:budgets", "detect-stacks:composition-budgets"})
     features.update(LIVE_FEATURES)
+    features.update(route_contracts.FEATURES)
     return features
 
 
@@ -1834,6 +1844,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     annotation_contracts.plan_annotations(state, root)
     module_contracts.plan_modules(state, root)
     profile_contracts.plan_profiles(state, root)
+    route_contracts.plan_routes(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

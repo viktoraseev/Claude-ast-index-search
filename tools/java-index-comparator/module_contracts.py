@@ -223,7 +223,7 @@ def paths(edges, start, end, depth, kind):
             adjacency.setdefault(a, {}).setdefault(b, k)
     if start == end:
         k = adjacency.get(start, {}).get(end)
-        return [((start, end, k),)] if k else []
+        return [((start, end, k),)] if k and depth >= 1 else []
     result, queue = [], deque([(start, (), frozenset({start}))])
     explored = 0
     while queue:
@@ -313,7 +313,7 @@ def verify(fixture, feature):
                                 selected = all_paths if all_mode else all_paths[:1]
                                 reason = ('missing_module_from' if start not in modules else
                                           'missing_module_to' if end not in modules else
-                                          'self' if start == end and not selected else
+                                          'self' if start == end and not paths(edges, start, end, 1, kind) else
                                           None if selected else
                                           'kind_filter' if kind != 'all' and paths(edges, start, end, depth, 'all') else 'unreachable')
                                 expected_keys[(key, 'envelope', canonical_json([start, end, len(selected), False, reason]))] += 1

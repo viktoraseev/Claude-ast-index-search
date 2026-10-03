@@ -749,7 +749,7 @@ fn render_text(result: &ModuleRouteResult) {
                 result.from, result.to
             ),
             "self" => format!("'{}' depends on itself (trivial path).", result.from),
-            "truncated_timeout" => {
+            "truncated_timeout" | "truncated_prune_timeout" => {
                 let progress = result
                     .search_stats
                     .as_ref()
@@ -873,10 +873,16 @@ fn dot_escape(s: &str) -> String {
 }
 
 fn render_mermaid(result: &ModuleRouteResult) {
+    println!("```mermaid");
+    println!("flowchart LR");
+    if result.truncated {
+        println!(
+            "  %% Truncated: {}",
+            result.truncation_reason.as_deref().unwrap_or("limit")
+        );
+    }
     if result.paths.is_empty() {
         let reason = result.empty_reason.as_deref().unwrap_or("no_path");
-        println!("```mermaid");
-        println!("flowchart LR");
         println!("  %% No path: {}", reason);
         println!("```");
         return;
@@ -897,8 +903,6 @@ fn render_mermaid(result: &ModuleRouteResult) {
         }
     }
 
-    println!("```mermaid");
-    println!("flowchart LR");
     for name in &node_order {
         let alias = &node_ids[name];
         // Mermaid label text inside `[]` must not contain `[](){}|"\n`.
@@ -932,6 +936,12 @@ fn render_mermaid(result: &ModuleRouteResult) {
 fn render_dot(result: &ModuleRouteResult) {
     println!("digraph module_route {{");
     println!("  rankdir=LR;");
+    if result.truncated {
+        println!(
+            "  // Truncated: {}",
+            result.truncation_reason.as_deref().unwrap_or("limit")
+        );
+    }
 
     if result.paths.is_empty() {
         let reason = result.empty_reason.as_deref().unwrap_or("no_path");
@@ -1256,6 +1266,14 @@ fn dfs_all_paths(
         }
 
         if child_id == to_id {
+            // Reaching the cap alone does not prove that paths were omitted.
+            // Look for one more complete path without storing it, so an exact
+            // fit can finish with truncated=false and memory stays bounded.
+            if results.len() >= max_paths {
+                truncated = true;
+                truncation_reason = Some("max_paths".to_string());
+                break 'outer;
+            }
             // Found a path — materialise it.
             //
             // Layout of current_path:
@@ -1290,11 +1308,6 @@ fn dfs_all_paths(
             let length = hops.len();
             results.push(RoutePath { hops, length });
 
-            if results.len() >= max_paths {
-                truncated = true;
-                truncation_reason = Some("max_paths".to_string());
-                break 'outer;
-            }
             continue; // Do not push to_id onto stack — stop here.
         }
 
@@ -1337,6 +1350,13 @@ fn dfs_all_paths(
 
     stats.elapsed_ms = deadline.elapsed().as_millis() as u64;
     Ok((results, truncated, truncation_reason, stats))
+}
+
+fn suggested_route_timeout(timeout_ms: u64) -> u64 {
+    timeout_ms
+        .saturating_mul(2)
+        .max(timeout_ms.saturating_add(1000))
+        .min(60_000)
 }
 
 /// Show dependency path(s) between two modules.
@@ -1477,7 +1497,22 @@ pub fn cmd_module_route(
         if fid == _tid {
             if let Some(real_kind) = db::get_module_self_edge_kind(&conn, fid, kind_filter)? {
                 // Real self-loop: surface the actual dep_kind from the DB,
-                // not a hardcoded default.
+                // while honoring the same budgets as every other 1-hop path.
+                let truncation_reason = if all && max_paths == 0 {
+                    Some("max_paths".to_string())
+                } else if deadline.elapsed().as_millis() as u64 >= timeout_ms {
+                    Some("timeout".to_string())
+                } else {
+                    None
+                };
+                let truncated = truncation_reason.is_some();
+                let empty_reason = if let Some(reason) = &truncation_reason {
+                    Some(format!("truncated_{}", reason))
+                } else if max_depth == 0 {
+                    Some("unreachable".to_string())
+                } else {
+                    None
+                };
                 let name = db::get_module_name(&conn, fid)?.unwrap_or_else(|| from.to_string());
                 let hop = EdgeHop {
                     from: name.clone(),
@@ -1487,16 +1522,28 @@ pub fn cmd_module_route(
                 let result = ModuleRouteResult {
                     from: from.to_string(),
                     to: to.to_string(),
-                    paths: vec![RoutePath {
-                        hops: vec![hop],
-                        length: 1,
-                    }],
-                    count: 1,
-                    truncated: false,
-                    truncation_reason: None,
-                    empty_reason: None,
+                    paths: if empty_reason.is_none() {
+                        vec![RoutePath {
+                            hops: vec![hop],
+                            length: 1,
+                        }]
+                    } else {
+                        vec![]
+                    },
+                    count: usize::from(empty_reason.is_none()),
+                    truncated,
+                    search_stats: truncated.then(|| SearchStats {
+                        nodes_visited: 0,
+                        edges_explored: 0,
+                        elapsed_ms: deadline.elapsed().as_millis() as u64,
+                        max_depth_reached: 0,
+                        timeout_ms,
+                        suggested_timeout_ms: (truncation_reason.as_deref() == Some("timeout"))
+                            .then(|| suggested_route_timeout(timeout_ms)),
+                    }),
+                    truncation_reason,
+                    empty_reason,
                     warnings,
-                    search_stats: None,
                 };
                 return dispatch_render(format, &result);
             }
@@ -1597,8 +1644,7 @@ pub fn cmd_module_route(
             ) {
             // Heuristic: 2× current, rounded up to next second. Capped at 60s
             // to keep the suggestion sane on pathological graphs.
-            let bumped = (timeout_ms.saturating_mul(2)).max(timeout_ms + 1000);
-            Some(bumped.min(60_000))
+            Some(suggested_route_timeout(timeout_ms))
         } else {
             None
         };
@@ -1628,10 +1674,7 @@ pub fn cmd_module_route(
                 // we don't know whether a path exists. Report as truncated,
                 // mirroring the --all behaviour, so callers can retry with a
                 // larger --timeout-ms.
-                let suggested_timeout_ms = {
-                    let bumped = (timeout_ms.saturating_mul(2)).max(timeout_ms + 1000);
-                    Some(bumped.min(60_000))
-                };
+                let suggested_timeout_ms = Some(suggested_route_timeout(timeout_ms));
                 let stats = SearchStats {
                     nodes_visited: 0,
                     edges_explored: 0,
