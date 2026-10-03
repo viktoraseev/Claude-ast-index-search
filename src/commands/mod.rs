@@ -412,13 +412,20 @@ pub fn search_files<F>(root: &Path, pattern: &str, extensions: &[&str], handler:
 where
     F: FnMut(&Path, usize, &str),
 {
-    search_files_in(
-        root,
-        std::slice::from_ref(&root.to_path_buf()),
-        pattern,
-        extensions,
-        handler,
-    )
+    let roots = project_search_roots(root)?;
+    search_files_in(root, &roots, pattern, extensions, handler)
+}
+
+fn project_search_roots(root: &Path) -> Result<Vec<PathBuf>> {
+    let Some(_lease) = db::acquire_project_lease_if_initialized(root)? else {
+        return Ok(if std::env::var_os("AST_INDEX_SUBTREE").is_some() {
+            Vec::new()
+        } else {
+            vec![root.to_path_buf()]
+        });
+    };
+    let conn = db::open_db_leased(root)?;
+    Ok(PathResolver::try_from_conn(root, &conn)?.grep_roots())
 }
 
 /// `search_files` over several roots in one parallel walk. `root` is still
@@ -572,6 +579,10 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
+    // An unknown subtree is an empty scope, never a primary-root fallback.
+    if roots.is_empty() {
+        return Ok(());
+    }
     let no_ignore = try_is_no_ignore_enabled(root)?;
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
     let arc_root = if no_ignore {
@@ -688,14 +699,8 @@ pub fn search_files_page<T, F>(
 where
     F: FnMut(&Path, usize, &str) -> Option<T>,
 {
-    search_files_page_in(
-        root,
-        std::slice::from_ref(&root.to_path_buf()),
-        pattern,
-        extensions,
-        limit,
-        filter_map,
-    )
+    let roots = project_search_roots(root)?;
+    search_files_page_in(root, &roots, pattern, extensions, limit, filter_map)
 }
 
 /// [`search_files_page`] skipping files `prefilter` rules out.
@@ -710,9 +715,10 @@ pub fn search_files_page_prefiltered<T, F>(
 where
     F: FnMut(&Path, usize, &str) -> Option<T>,
 {
+    let roots = project_search_roots(root)?;
     search_files_page_in_kept(
         root,
-        std::slice::from_ref(&root.to_path_buf()),
+        &roots,
         pattern,
         extensions,
         limit,
@@ -823,7 +829,9 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
-    let walker = project_walker(root)?;
+    let Some(walker) = project_walker(root)? else {
+        return Ok(());
+    };
 
     let (tx, rx) = channel::bounded::<(Arc<Path>, usize, String)>(limit.max(1000));
 
@@ -912,7 +920,9 @@ where
 /// The tree is walked in parallel and sorted afterwards, so the order does not
 /// depend on which thread reached a file first.
 pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<PathBuf>> {
-    let walker = project_walker(root)?;
+    let Some(walker) = project_walker(root)? else {
+        return Ok(Vec::new());
+    };
     let extensions: HashSet<&str> = extensions.iter().copied().collect();
     let (tx, rx) = channel::unbounded::<PathBuf>();
     walker.run(|| {
@@ -1155,9 +1165,13 @@ where
     })
 }
 
-/// Parallel walker over the primary root with the ignore rules the indexer
-/// applies, or none when the index was built with `--no-ignore`.
-fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
+/// Parallel walker over selected roots, using the indexer's ignore rules.
+/// Unknown or missing subtrees have no walker.
+fn project_walker(root: &Path) -> Result<Option<ignore::WalkParallel>> {
+    let roots = project_search_roots(root)?;
+    let Some(first) = roots.first() else {
+        return Ok(None);
+    };
     let no_ignore = try_is_no_ignore_enabled(root)?;
     let use_git = crate::indexer::has_git_repo(root) && !no_ignore;
     let arc_root = if no_ignore {
@@ -1166,7 +1180,10 @@ fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
         crate::indexer::find_arc_root(root)
     };
 
-    let mut wb = WalkBuilder::new(root);
+    let mut wb = WalkBuilder::new(first);
+    for extra in roots.iter().skip(1) {
+        wb.add(extra);
+    }
     wb.hidden(true)
         .git_ignore(use_git)
         .git_exclude(use_git)
@@ -1180,6 +1197,6 @@ fn project_walker(root: &Path) -> Result<ignore::WalkParallel> {
             wb.add_ignore(root_gitignore);
         }
     }
-    Ok(wb.build_parallel())
+    Ok(Some(wb.build_parallel()))
 }
 mod annotation_functions;

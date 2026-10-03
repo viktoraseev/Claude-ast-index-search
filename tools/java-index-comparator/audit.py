@@ -41,6 +41,7 @@ import perl_contracts
 import annotation_contracts
 import text_snapshot
 import lifecycle_contracts
+import root_contracts
 
 
 SCHEMA = """
@@ -185,7 +186,7 @@ class InvocationOracle:
 
 INTERNAL_FEATURES = {'unused-symbols', 'version', 'list-roots', 'subtree:list', 'map'}
 
-LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
+LIVE_FEATURES = INTERNAL_FEATURES | lifecycle_contracts.FEATURES | root_contracts.FEATURES | {"class", "class-qualified", "symbol", "file", "outline", "imports",
                  "search", "implementations", "hierarchy", "refs", "usages", "callers",
                  "stats", "query", "schema", "db-path", "outline:constructors", "search:files", "search:content", "annotations", "symbol:options", "class:options", "symbol:qualified-pattern", "class:qualified-pattern", "search:references", "search:ranking", "todo", "deprecated", "deeplinks", "suppress", "inject"}
 
@@ -417,6 +418,8 @@ class Fixture:
         self._symbol_prefetch_ready = False
         self._lifecycle_results = None
         self._lifecycle_error = None
+        self._root_results = None
+        self._root_error = None
         self.environment = {
             **os.environ, "AST_INDEX_DB_PATH": str(database),
             "AST_INDEX_CACHE_DIR": str(database.parent / "cache"), "NO_COLOR": "1",
@@ -1076,6 +1079,27 @@ class Fixture:
         ordered = [expected[identity] for identity in sorted(expected)]
         arguments = [] if query is None else [query]
         outputs, expected_keys, actual_keys = {}, set(), set()
+        if annotation_contracts.java_scope(self.state):
+            # Native provides has no language filter. Compare every Java result
+            # from the full page; foreign rows must not consume the Java limit.
+            full_limit = 1000000
+            output = self.text_cli(feature, *arguments, '--limit', str(full_limit))
+            outputs[str(full_limit)] = output
+            full = annotation_contracts.output_locations(feature, output, self.root, full_limit)
+            if len(full) >= full_limit:
+                raise Unsupported('mixed-language annotation result reached CLI collection limit')
+            java = [entry for entry in full if Path(entry[0]).suffix == '.java']
+            expected_keys.update(('java', index, *entry) for index, entry in enumerate(ordered))
+            actual_keys.update(('java', index, *entry) for index, entry in enumerate(java))
+            for limit in (0, 1, 3):
+                output = self.text_cli(feature, *arguments, '--limit', str(limit))
+                outputs[str(limit)] = output
+                actual = annotation_contracts.output_locations(feature, output, self.root, limit)
+                expected_keys.update(('native-prefix', limit, index, *entry)
+                                     for index, entry in enumerate(full[:limit]))
+                actual_keys.update(('native-prefix', limit, index, *entry)
+                                   for index, entry in enumerate(actual))
+            return {'source': reason, 'locations': ordered}, outputs, expected_keys, actual_keys
         for limit in (0, 1, 3, 1000000):
             output = self.text_cli(feature, *arguments, '--limit', str(limit))
             outputs[str(limit)] = output
@@ -1444,6 +1468,20 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def root_check(self, check: sqlite3.Row):
+        if self._root_error is not None:
+            raise self._root_error
+        if self._root_results is None:
+            try:
+                self._root_results = root_contracts.exercise(self.binary, self.database.parent / 'root-fixtures')
+            except (ToolError, OSError, subprocess.TimeoutExpired) as error:
+                self._root_error = error
+                raise
+        expected, actual = (section[check['feature']] for section in self._root_results)
+        return {'source': root_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -1465,6 +1503,8 @@ class Fixture:
                 handler = self.map_check if check['feature'] == 'map' else self.analysis_management_check
             if check['feature'] in lifecycle_contracts.FEATURES:
                 handler = self.lifecycle_check
+            if check['feature'] in root_contracts.FEATURES:
+                handler = self.root_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
             if check['feature'] in annotation_contracts.EXTENSIONS:
@@ -1508,7 +1548,13 @@ class Fixture:
             self.metrics.record('check.' + check['feature'], time.perf_counter() - started)
 
 
-def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_text: str, candidates: Any = (), root: Path | None = None) -> None:
+JAVA_EXCLUDED_FEATURES = (set(mobile_contracts.EXTENSIONS) | set(perl_contracts.EXTENSIONS)
+                          | {'composables', 'previews', 'swiftui', 'async-funcs',
+                             'storyboard-usages', 'asset-usages', 'deeplinks:non-java',
+                             'suppress:non-java', 'inject:non-java'})
+
+
+def required_features(help_text: str = '') -> set[str]:
     features = set(re.findall(r"^  ([a-z][a-z-]+)\s{2,}\S", help_text, re.MULTILINE))
     # The human help template omits some actual clap commands. Use the enum
     # shipped with this repository too, so a new command cannot disappear.
@@ -1520,11 +1566,18 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             features.add(name)
     if not {"class", "symbol", "file"}.issubset(features):
         raise Unsupported("cannot enumerate required CLI commands")
-    features.update({"global:format", "global:walk-up", "global:subtree", "global:local"})
+    features.update({"global:format", "global:walk-up", "global:subtree", "global:local",
+                     "global:scope-command-matrix"})
     features.update(LIVE_FEATURES)
+    return features
+
+
+def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_text: str, candidates: Any = (), root: Path | None = None, *, java_only: bool = False) -> None:
+    features = required_features(help_text)
     # A base navigation handler does not establish coverage of source bodies,
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
     pending_contracts = {
+        "global:scope-command-matrix": "Combined path filters and Java API/module/map/analysis/graph/conventions/explore scope contracts remain unresolved; root fixture covers navigation and text searches",
         "search:rank-presets": "history/graph ranking presets and test exclusion contracts not implemented yet",
         "deeplinks:non-java": "non-Java deeplink scopes require separate text/applicability contracts",
         "suppress:non-java": "Kotlin suppression scope requires a separate text/applicability contract",
@@ -1545,15 +1598,18 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                     for query in re.findall(r'"([^"\n]+)"', line):
                         suppression_queries.update((query, query.upper()))
     with state:
+        state.execute("INSERT OR REPLACE INTO metadata VALUES ('audit_scope',?)",
+                      ('java' if java_only else 'all',))
         for feature in sorted(features):
             state.execute("INSERT OR REPLACE INTO coverage VALUES (?,?,?)", (
                 feature, "implemented" if feature in LIVE_FEATURES else "pending",
-                (lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
+                (root_contracts.REASON if feature in root_contracts.FEATURES else
+                 lifecycle_contracts.REASON if feature in lifecycle_contracts.FEATURES else
                  "internal CLI/DB read-only analysis and management contracts; not MCP equivalence" if feature in INTERNAL_FEATURES else
                  "independent JDK syntax against outline and indexed symbols" if feature == "outline:constructors" else
-                 "live MCP text locations (Java scope only; other language scopes remain pending)" if feature == "deeplinks" else
-                 "live MCP text locations (Java suppression scope; Kotlin contract remains pending)" if feature == "suppress" else
-                 "independent JDK syntax: injection declaration type locations (Java scope; Kotlin contract remains pending)" if feature == "inject" else
+                 "live MCP text locations (Java deeplink scope)" if feature == "deeplinks" else
+                 "live MCP text locations (Java suppression scope)" if feature == "suppress" else
+                 "independent JDK syntax: injection declaration type locations (Java scope)" if feature == "inject" else
                  "live MCP text locations" if feature in {"annotations", "search:content", "todo", "deprecated"} else
                  "independent JDK syntax: qualified patterns and combined fuzzy/kind filters" if feature in {"symbol:qualified-pattern", "class:qualified-pattern"} else
                  "independent JDK syntax: patterns, filters, fuzzy lookup and source bodies" if feature in {"symbol:options", "class:options"} else
@@ -1563,7 +1619,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
                  "hybrid MCP/JDK child navigation and explicit source parent edges" if feature == "hierarchy" else
                  "live MCP code anchors rendered as import statements" if feature == "imports" else
                  "live CLI against database state" if feature in {"stats", "query", "schema", "db-path"} else
-                 "live MCP navigation identity") if feature in LIVE_FEATURES else "comparison contract not implemented yet",
+                 "live MCP navigation identity") if feature in LIVE_FEATURES else pending_contracts.get(feature, "comparison contract not implemented yet"),
             ))
         for feature, reason in pending_contracts.items():
             state.execute("INSERT OR IGNORE INTO coverage VALUES (?,'pending',?)", (feature, reason))
@@ -1610,12 +1666,20 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
             state.execute("INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)", (
                 stable_id({"feature": feature, "subject": "index-state"}), feature, "index-state",
             ))
-        for feature in sorted(lifecycle_contracts.FEATURES):
+        for feature in sorted(lifecycle_contracts.FEATURES | root_contracts.FEATURES):
             subject = 'disposable-fixture'
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
-    mobile_contracts.plan_mobile(state, root)
-    perl_contracts.plan_perl(state, root)
+    if java_only:
+        if root is not None:
+            mobile_contracts.inventory(state, root)
+        with state:
+            for feature in sorted(JAVA_EXCLUDED_FEATURES):
+                state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)',
+                              (feature, 'out-of-scope', 'explicit Java-only repair scope; not checked and not passing'))
+    else:
+        mobile_contracts.plan_mobile(state, root)
+        perl_contracts.plan_perl(state, root)
     annotation_contracts.plan_annotations(state, root)
 
 
@@ -1688,7 +1752,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         fixture = Fixture(root, binary, database, state, InvocationOracle(client, state, metrics=metrics),
                           batch_text=text_mode == 'batch', symbol_initials={name[0] for name in candidates})
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
-        plan(state, source_files, help_text, candidates, root)
+        plan(state, source_files, help_text, candidates, root, java_only=True)
         limit = arguments.case_limit
         processed = 0
         problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
@@ -1715,6 +1779,8 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             "deferred_outline_checks": state.execute("""SELECT count(*) FROM checks
                 WHERE status!='complete' AND (feature='outline' OR feature GLOB 'outline:*')""").fetchone()[0],
             "unimplemented_features": pending_features,
+            "scope": "java",
+            "out_of_scope_features": state.execute("SELECT count(*) FROM coverage WHERE status='out-of-scope'").fetchone()[0],
             "coverage_sources": coverage_sources(state),
             "inapplicable_features": state.execute("SELECT count(*) FROM coverage WHERE status='inapplicable'").fetchone()[0],
             "performance": metrics.summary(),

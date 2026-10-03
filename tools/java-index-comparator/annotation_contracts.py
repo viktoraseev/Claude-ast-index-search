@@ -25,8 +25,19 @@ class UnresolvedSyntax(ToolError):
     pass
 
 
+def java_scope(state):
+    row = state.execute("SELECT value FROM metadata WHERE key='audit_scope'").fetchone()
+    return row is not None and row[0] == 'java'
+
+
+def scope_extensions(state):
+    return {'provides': ('.java',)} if java_scope(state) else EXTENSIONS
+
+
 def applicability(state, feature, root=None):
-    status, reason = mobile_contracts.applicability(state, feature, EXTENSIONS)
+    if java_scope(state) and feature != 'provides':
+        return 'out-of-scope', 'explicit Java-only repair scope; not checked and not passing'
+    status, reason = mobile_contracts.applicability(state, feature, scope_extensions(state))
     if root is not None and status == 'pending' and 'alongside ignore rules' in reason:
         # Prove that the Git ignore scope does not remove any relevant source.
         # This is independent scope evidence, not native DB/MCP equivalence.
@@ -59,12 +70,13 @@ def applicability(state, feature, root=None):
             state.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)',
                           ('annotation_scope:' + feature, canonical_json(proof)))
     if status == 'implemented':
-        reason = 'hybrid MCP/source annotation text anchors and independent javac/Kotlin token binding; filters and ordered limits; not MCP semantic navigation'
+        binding = 'javac Java-only declaration binding' if java_scope(state) else 'javac/Kotlin token binding'
+        reason = 'hybrid MCP/source annotation text anchors and independent ' + binding + '; filters and ordered limits; not MCP semantic navigation'
     return status, reason
 
 
 def applicable_paths(state, feature):
-    return mobile_contracts.applicable_paths(state, feature, EXTENSIONS)
+    return mobile_contracts.applicable_paths(state, feature, scope_extensions(state))
 
 
 def pattern(feature):
@@ -272,6 +284,8 @@ def plan_annotations(state, root):
         for feature in EXTENSIONS:
             status, reason = applicability(state, feature, root)
             state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)', (feature, status, reason))
+            if status == 'out-of-scope':
+                continue
             if status == 'implemented':
                 try:
                     for row in applicable_paths(state, feature):

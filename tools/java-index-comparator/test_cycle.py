@@ -12,6 +12,13 @@ from common import ToolError, connect
 
 
 class CycleTests(unittest.TestCase):
+    def test_pr_requires_the_audited_head_and_clean_worktree(self):
+        for head, changed in (('different-head', []), ('audited-head', ['src/changed.rs'])):
+            with self.subTest(head=head, changed=changed), patch.object(cycle, 'git', return_value=head), patch.object(cycle, 'changed_files', return_value=changed), patch.object(cycle, 'verify_completed_evidence') as verify:
+                with self.assertRaises(cycle.ToolError):
+                    cycle.assert_ready({'evidence': 'evidence.sqlite'}, Path('target'), Path('repository'), 'audited-head')
+                verify.assert_not_called()
+
     def test_equivalence_gate_is_persisted_and_rejects_dropped_cases(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -39,6 +46,10 @@ class CycleTests(unittest.TestCase):
         self.assertIn("not just one easy command", prompt)
         self.assertIn("all relevant file types", prompt)
         self.assertIn("Java-only inventory is not proof", prompt)
+        self.assertIn("Scope is JAVA ONLY", prompt)
+        self.assertIn("Do not repair Kotlin, Swift, Perl, shell", prompt)
+        self.assertIn("Ignore non-Java pending rows in older evidence", prompt)
+        self.assertNotIn("All applicable ast-index features remain in scope", prompt)
 
     def test_recorded_problems_and_failed_verification_take_priority(self):
         cases = [{"counts": {kind: 1}} for kind in ("fail", "unsupported", "error")]
@@ -84,13 +95,16 @@ class CycleTests(unittest.TestCase):
     def test_deferred_pr_still_requires_a_complete_audit_and_final_tests(self):
         self.exercise_cycle(defer_pr=True)
 
+    def test_stale_final_audit_is_refreshed_without_creating_a_pr_or_repairing_again(self):
+        self.exercise_cycle(stale_ready=True)
+
     def test_pr_deferral_survives_driver_reload_without_the_flag(self):
         self.exercise_cycle(defer_pr=None, persisted_defer=True)
 
     def test_explicit_pr_creation_overrides_persisted_deferral(self):
         self.exercise_cycle(defer_pr=False, persisted_defer=True)
 
-    def exercise_cycle(self, failed_stage=None, resume=False, defer_pr=False, persisted_defer=False):
+    def exercise_cycle(self, failed_stage=None, resume=False, defer_pr=False, persisted_defer=False, stale_ready=False):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             arguments = argparse.Namespace(
@@ -154,13 +168,23 @@ class CycleTests(unittest.TestCase):
                         "fixture_sha256": cycle.adapter_digest(),
                     }.items())
                 batch.close()
-            with patch.object(cycle, "git", side_effect=git), patch.object(cycle, "changed_files", side_effect=lambda _: ["src/fix.rs"] if status["dirty"] else []), patch.object(cycle, "logged", side_effect=logged), patch.object(cycle, "replay", return_value={"verified": True}), patch.object(cycle, "seed_summary", return_value=summary), patch.object(cycle, "create_or_find_pr", return_value="https://github.com/owner/repository/pull/1") as create_pr, patch.object(cycle, "scan", side_effect=[final] if resume else [summary, final]) as scan, contextlib.redirect_stdout(io.StringIO()) as output:
+            def readiness(*args):
+                if stale_ready and not status.get('stale_refreshed'):
+                    status['stale_refreshed'] = True
+                    raise cycle.StaleEvidence('synthetic changed fingerprint')
+                return {'verified': True}
+
+            scans = [final] if resume else [summary, final]
+            if stale_ready:
+                scans.append(final)
+            with patch.object(cycle, "git", side_effect=git), patch.object(cycle, "changed_files", side_effect=lambda _: ["src/fix.rs"] if status["dirty"] else []), patch.object(cycle, "logged", side_effect=logged), patch.object(cycle, "replay", return_value={"verified": True}), patch.object(cycle, "seed_summary", return_value=summary), patch.object(cycle, "create_or_find_pr", return_value="https://github.com/owner/repository/pull/1") as create_pr, patch.object(cycle, "assert_ready", side_effect=readiness) as ready, patch.object(cycle, "scan", side_effect=scans) as scan, contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(cycle.run(arguments), 0)
             deferred = persisted_defer if defer_pr is None else defer_pr
             self.assertEqual(create_pr.call_count, 0 if deferred else 1)
             if deferred:
                 self.assertIn('"pr_deferred":true', output.getvalue())
-            self.assertEqual(scan.call_count, 1 if resume else 2)
+            self.assertEqual(scan.call_count, (1 if resume else 2) + int(stale_ready))
+            self.assertEqual(ready.call_count, 2 + int(stale_ready))
             self.assertTrue(all(call.args[0].case_limit is None for call in scan.call_args_list))
             self.assertIn(("git", "add", "--", "src/fix.rs"), commands)
             self.assertIn(("git", "push", "origin", "feature"), commands)

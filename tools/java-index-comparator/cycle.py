@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from common import ToolError, adapter_digest, discover_mcp_url, canonical_json, connect, file_sha256, now_ms, source_snapshot
+from completion import StaleEvidence, verify as verify_completed_evidence
 
 
 SCHEMA = """
@@ -126,6 +127,12 @@ the related contracts together. Do not trade correctness for a coverage count;
 leave genuinely unresolved contracts pending and explain the remaining gap."""
     return f"""Read AGENTS.md and repository contributor rules. This is one round of an
 automated differential repair, not permission to redefine the goal.
+Scope is JAVA ONLY, including shared ast-index functionality on Java sources.
+Do not repair Kotlin, Swift, Perl, shell or other non-Java parsers or contracts.
+Non-Java-only features are explicitly out-of-scope, NOT passing or inapplicable.
+Ignore non-Java pending rows in older evidence; keep every Java case and shared
+Java-applicable contract. Mixed-language output needs Java scope normalization,
+not repairs to the other language. Do not broaden this task to all languages.
 {priority}
 Target is read-only: {root}. Evidence SQLite: {summary['evidence']}.
 Latest verification: {canonical_json(summary.get('verification', {}))}.
@@ -150,7 +157,7 @@ silently classified as inapplicable. Mutation commands may be exercised only
 on disposable fixtures inside this repository's artifact directory, never on
 the read-only target, real hooks, shared MCP configuration or another index.
 Support missing audit contracts rather than marking them covered or skipping
-them. All applicable ast-index features remain in scope, not only class/symbol.
+them. All Java-applicable ast-index features remain in scope, not only class/symbol.
 Do not modify the target project. Do not commit target source, evidence databases,
 private names or large fixtures. Do not change AGENTS.md. Keep project payloads
 out of your messages. Do not commit or push: the driver verifies and commits.
@@ -230,6 +237,12 @@ def create_or_find_pr(repository: Path, target: str, branch: str, directory: Pat
     if not result:
         raise ToolError("PR creation did not produce a verifiable upstream PR")
     return result
+
+
+def assert_ready(summary: dict, root: Path, repository: Path, expected_head: str) -> dict:
+    if git(repository, 'rev-parse', 'HEAD') != expected_head or changed_files(repository):
+        raise ToolError('worktree or HEAD changed since the final audit; no PR was created')
+    return verify_completed_evidence(Path(summary['evidence']), root, repository / 'target/release/ast-index')
 
 
 def seed_summary(evidence: Path, root: Path, binary: Path) -> dict:
@@ -391,9 +404,20 @@ def run(arguments: argparse.Namespace) -> int:
                         set_phase(state, round_id, "done")
                         completed += 1
                     elif phase == "pr":
-                        verify_equivalence(state, json.loads(row['summary_json']), directory)
+                        final_summary = json.loads(row['summary_json'])
+                        verify_equivalence(state, final_summary, directory)
+                        try:
+                            assert_ready(final_summary, root, repository, row['base_head'])
+                        except StaleEvidence:
+                            set_phase(state, round_id, 'audit')
+                            continue
                         logged(["cargo", "test", "--release", "--workspace"], repository, directory, "final-tests")
                         logged(["git", "push", "origin", branch], repository, directory, "final-push")
+                        try:
+                            assert_ready(final_summary, root, repository, row['base_head'])
+                        except StaleEvidence:
+                            set_phase(state, round_id, 'audit')
+                            continue
                         deferred = state.execute("SELECT value FROM configuration WHERE key='defer_pr'").fetchone()
                         if deferred and deferred[0] not in {'true', 'false'}:
                             raise ToolError('invalid persisted PR policy; no PR was created')

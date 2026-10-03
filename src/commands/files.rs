@@ -43,7 +43,8 @@ pub fn cmd_file(root: &Path, pattern: &str, exact: bool, limit: usize, format: &
     } else {
         pattern.to_string()
     };
-    let files = db::find_files_with_roots(&conn, &search_pattern, limit)?;
+    let files =
+        db::find_files_with_roots_scoped(&conn, &search_pattern, limit, &db::SearchScope::none())?;
     let resolver = super::PathResolver::try_from_conn(root, &conn)?;
     let files: Vec<String> = files
         .into_iter()

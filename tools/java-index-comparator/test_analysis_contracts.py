@@ -46,7 +46,7 @@ class AnalysisContracts(unittest.TestCase):
                 reasons = dict(state.execute('SELECT feature,reason FROM coverage'))
                 for feature in ('unused-symbols', 'version', 'list-roots', 'subtree:list'):
                     self.assertTrue(reasons[feature].startswith('internal CLI'), reasons[feature])
-                self.assertEqual(state.execute("SELECT status FROM coverage WHERE feature='subtree'").fetchone()[0], 'pending')
+                self.assertEqual(state.execute("SELECT status FROM coverage WHERE feature='module'").fetchone()[0], 'pending')
             finally:
                 state.close()
 

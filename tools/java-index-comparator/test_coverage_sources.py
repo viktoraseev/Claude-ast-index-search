@@ -24,8 +24,9 @@ class CoverageSourcesTests(unittest.TestCase):
                 implemented = state.execute("SELECT count(*) FROM coverage WHERE status='implemented'").fetchone()[0]
                 self.assertEqual(sum(counts.values()), implemented)
                 self.assertEqual(counts['hybrid MCP/JDK'], 4)
-                self.assertEqual(counts['independent source/state'], 6)
-                for feature in ('rebuild', 'update', 'restore', 'clear', 'watch', 'watch-status'):
+                self.assertEqual(counts['independent source/state'], 12)
+                for feature in ('rebuild', 'update', 'restore', 'clear', 'watch', 'watch-status',
+                                'add-root', 'remove-root', 'subtree', 'global:local', 'global:subtree', 'global:walk-up'):
                     self.assertTrue(reasons[feature].startswith('independent source/state'), reasons[feature])
                     self.assertIn('not MCP equivalence', reasons[feature])
             finally:

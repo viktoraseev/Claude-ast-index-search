@@ -4,6 +4,11 @@ Index MCP Server is the reference for a read-only target project. The live
 fixture executes ast-index itself; recognizing a saved JSON shape is not a
 successful test.
 
+The repair scope is Java, including shared commands exercised on Java sources.
+Non-Java-only commands are explicitly out of scope: they neither count as
+passing checks nor block completion of the Java audit. Mixed-language output
+is normalized to the Java source scope without repairing other parsers.
+
 The intended repair process collects up to 100 confirmed problems, adds compact
 regression tests and fixes, validates the original problem batch, commits and
 pushes to a feature branch, then rebuilds and starts a full audit again.
@@ -29,14 +34,6 @@ explicit source parent edges, including external parents, and MCP project childr
 Search reference aggregation, ranking, command options, and other command contracts
 remain explicitly pending. A passing subset never establishes a complete audit.
 
-The five Perl commands share per-file MCP text anchors, literal query filters,
-exact import pragma exclusions, and ordered limit checks. They compare lexical
-line locations, not semantic Perl navigation. A full file-type inventory proves
-language absence independently, and the CLI must still return empty results.
-Relevant links, mixed-case suffixes, and ignored source scopes remain unresolved.
-Synthetic paginated-oracle tests validate the adapter and production CLI; they
-do not establish live-project MCP equivalence.
-
 Replay streams the first 100 failures in capture order plus every unsupported
 or error contract. Each check executes the current CLI against a rebuilt index;
 all recorded oracle operations and pagination requests are bound to their
@@ -50,6 +47,11 @@ replaceable. Failed repair tests or builds return to the agent with the original
 evidence and failure logs, without committing. After a complete audit it reruns workspace tests and creates or
 verifies an upstream PR at the tested commit. Missing contracts prevent that
 final step.
+
+A saved green summary is insufficient for a PR. The final gate rechecks the
+actual evidence, coverage, source inventory, binary and fixture fingerprints,
+plus the audited commit and clean worktree. An obsolete audit requires a fresh
+scan; it cannot authorize publication.
 
 Audits resume from durable checkpoints. Artifacts and agent transcripts stay
 outside the target project, under a persistent directory excluded from Git.

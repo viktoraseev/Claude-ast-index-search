@@ -157,6 +157,35 @@ fun <T> Box<T>.needle() {}
         self.fixture.evaluate(check)
         return self.state.execute('SELECT verdict,error,diff_json,expected_json FROM checks WHERE id=?', (feature,)).fetchone()
 
+    def test_java_only_providers_keep_java_results_after_foreign_rows_consume_limits(self):
+        (self.root / 'A.kts').write_text('@Provides fun foreign(): Widget = Widget()\n')
+        (self.root / 'Z.java').write_text('''class Z {
+    @Provides Widget first() { return null; }
+    @Provides Widget second() { return null; }
+    @Provides Widget third() { return null; }
+}
+''')
+        self.state.execute("INSERT INTO metadata VALUES ('audit_scope','java')")
+        self.state.commit()
+        oracle = PagedAnnotationOracle(self.root)
+        self.fixture.client = oracle
+        outcome = self.evaluate('provides', 'Widget')
+        self.assertEqual(outcome['verdict'], 'pass', tuple(outcome))
+        self.assertEqual(json.loads(outcome['expected_json'])['locations'],
+                         [['Z.java', 2], ['Z.java', 3], ['Z.java', 4]])
+        self.assertTrue(all(request.get('paths') == ['Z.java']
+                            for request in oracle.requests if 'cursor' not in request))
+        original = self.fixture.text_cli
+        def missing_java(feature, *arguments):
+            output = original(feature, *arguments)
+            if arguments[-1] == '1000000':
+                lines = output.splitlines()
+                lines[0] = lines[0].replace('(4)', '(3)')
+                return '\n'.join(lines[:-2]) + '\n'
+            return output
+        with patch.object(self.fixture, 'text_cli', side_effect=missing_java):
+            self.assertEqual(self.evaluate('provides', 'Widget')['verdict'], 'fail')
+
     def test_hybrid_fixture_binds_paginated_anchors_and_exercises_production(self):
         (self.root / 'Example.kts').write_text('''// @Composable @Preview fun fake() {}
 val note = "@Provides fun fake(): Widget = Widget()"
