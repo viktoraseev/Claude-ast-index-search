@@ -23,6 +23,15 @@ public class JavaStructure {
         return out.append('"').toString();
     }
 
+    static String importIdentifier(Tree tree) {
+        // Tree.toString() pretty-prints non-ASCII names as Unicode escapes;
+        // identifier names retain the actual Java spelling and source anchor.
+        if (tree instanceof IdentifierTree identifier) return identifier.getName().toString();
+        if (tree instanceof MemberSelectTree member)
+            return importIdentifier(member.getExpression()) + "." + member.getIdentifier();
+        throw new IllegalStateException("Unexpected import identifier tree");
+    }
+
     static String parse(Path file) throws Exception {
         JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
         if (compiler == null) throw new IllegalStateException("A JDK is required");
@@ -137,7 +146,7 @@ public class JavaStructure {
                     return null;
                 }
                 @Override public Void visitImport(ImportTree tree, Void unused) {
-                    String full = tree.getQualifiedIdentifier().toString();
+                    String full = importIdentifier(tree.getQualifiedIdentifier());
                     if (!full.endsWith(".*")) {
                         String name = full.substring(full.lastIndexOf('.') + 1);
                         emit("import", name, namePosition(tree, name, ""), end(tree));
@@ -283,7 +292,7 @@ public class JavaStructure {
             }.scan(unit, null);
             List<String> imports = new ArrayList<>();
             for (ImportTree declaration : unit.getImports())
-                imports.add(quote(declaration.getQualifiedIdentifier().toString()));
+                imports.add(quote(importIdentifier(declaration.getQualifiedIdentifier())));
             return "{\"entries\":[" + String.join(",", entries)
                 + "],\"imports\":[" + String.join(",", imports) + "]}";
         }

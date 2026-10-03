@@ -15,6 +15,21 @@ from java_structure import structure_server
 
 
 class StructureContracts(unittest.TestCase):
+    def test_unicode_import_names_use_identifiers_not_javac_pretty_printing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / 'Probe.java'
+            source.write_text('import example.Δείγμα;\n'
+                              'import static example.Δείγμα.τιμή;\n'
+                              'import example.Δείγμα.*;\n'
+                              'class Probe {}\n', encoding='utf-8')
+            document = structure_server(directory).read(source, document=True)
+            imports = [(entry['name'], entry['line']) for entry in document['entries']
+                       if entry['kind'] == 'import']
+            self.assertEqual(imports, [('Δείγμα', 1), ('τιμή', 2)])
+            self.assertEqual(document['imports'], ['example.Δείγμα', 'example.Δείγμα.τιμή',
+                                                 'example.Δείγμα.*'])
+
     def test_installed_runtime_preview_syntax_is_not_rejected_as_an_oracle_error(self):
         version = subprocess.run(['java', '-version'], capture_output=True, text=True, check=True)
         match = re.search(r'version "(\d+)', version.stderr + version.stdout)
