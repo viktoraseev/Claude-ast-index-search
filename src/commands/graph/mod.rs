@@ -366,7 +366,14 @@ pub fn resolve_symbol_spec(
         for info in found {
             if let Some(owner) = db::find_enclosing_container(conn, info.id)? {
                 let owner_name = owner.name.trim_start_matches("::");
-                if owner_name == container || (!absolute && is_path_suffix(owner_name, container)) {
+                let java_owner = info.path.ends_with(".java")
+                    && owner.qualified_name.as_deref().is_some_and(|name| {
+                        name == container || (!absolute && java_name_suffix(name, container))
+                    });
+                if java_owner
+                    || owner_name == container
+                    || (!absolute && is_path_suffix(owner_name, container))
+                {
                     kept.push(info);
                 }
             }
@@ -374,6 +381,18 @@ pub fn resolve_symbol_spec(
         return Ok(kept);
     }
 
+    // Java declarations keep their package/nesting in a separate DB column.
+    // Dropping that qualifier would merge unrelated same-name graph seeds,
+    // including an absent qualified name with an existing short name.
+    if spec.contains('.') {
+        found.retain(|info| {
+            !info.path.ends_with(".java")
+                || info
+                    .qualified_name
+                    .as_deref()
+                    .is_some_and(|name| java_name_suffix(name, spec))
+        });
+    }
     let wanted = spec.trim_start_matches("::");
     if found
         .iter()
@@ -384,6 +403,13 @@ pub fn resolve_symbol_spec(
         found.retain(|info| is_path_suffix(info.name.trim_start_matches("::"), wanted));
     }
     Ok(found)
+}
+
+fn java_name_suffix(qualified: &str, wanted: &str) -> bool {
+    qualified == wanted
+        || qualified
+            .strip_suffix(wanted)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// The matched symbols plus, for class-like ones, every definition inside

@@ -19,9 +19,9 @@ LAYOUT = '''<root xmlns:android="http://schemas.android.com/apk/res/android">
 <![CDATA[<fixture.Ghost title="@string/cdata_only" />]]>
 <Fixture.Widget_2 android:id="@+id/first"/><fixture.Other android:id="@+id/second"/>
 <view
-  class='fixture.Outer$Inner'
-  android:id='@+id/inner'
-  title='@string/title' />
+  class='fixture.Outer&#36;Inner'
+  android:id='&#x40;+id/inner'
+  title='&#64;string/title' />
 <fragment
   android:id="@+id/fragment"
   android:name="fixture.Fragment" />
@@ -35,7 +35,7 @@ VALUES = '''<resources>
 <!-- <string name="comment_only">Unused</string> -->
 <![CDATA[<string name="cdata_only">Unused</string>]]>
 <string translatable='false'
- name='title'>Title</string><string name="second">Second</string>
+ name='t&#x69;tle'>Title</string><string name="second">Second</string>
 <string name="comment_only">Unused</string><string name="cdata_only">Unused</string>
 <string name="unused">Unused</string>
 <color name='accent'>#fff</color>

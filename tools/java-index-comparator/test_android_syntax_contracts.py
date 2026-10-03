@@ -12,6 +12,25 @@ import android_syntax_contracts as contracts
 
 
 class AndroidSyntaxTests(unittest.TestCase):
+    def test_equivalent_character_references_preserve_class_and_resource_usages(self):
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts/tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+        # The live unified fixture includes encoded attributes/definitions;
+        # its plain spelling must have identical production observations.
+        layout = contracts.LAYOUT.replace('fixture.Outer&#36;Inner', 'fixture.Outer$Inner') \
+            .replace('&#64;string/title', '@string/title') \
+            .replace('&#x40;+id/inner', '@+id/inner')
+        values = contracts.VALUES.replace('t&#x69;tle', 'title')
+        self.assertNotEqual(layout, contracts.LAYOUT)
+        self.assertNotEqual(values, contracts.VALUES)
+        with tempfile.TemporaryDirectory(dir=artifacts) as temporary, \
+                patch.object(contracts, 'LAYOUT', layout), patch.object(contracts, 'VALUES', values):
+            expected, actual = contracts.exercise(binary, Path(temporary).resolve())
+        failures = [(feature, key) for feature in contracts.FEATURES for key in expected[feature]
+                    if expected[feature][key] != actual[feature][key]]
+        self.assertEqual(failures, [])
+
     def test_production_xml_syntax_and_corrupt_output(self):
         artifacts = Path(__file__).resolve().parents[2] / '.artifacts' / 'tests'
         artifacts.mkdir(parents=True, exist_ok=True)

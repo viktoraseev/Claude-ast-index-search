@@ -4101,7 +4101,7 @@ pub fn index_xml_usages(
                             }
                             for attribute in &tag.attributes {
                                 if matches!(attribute.name, "class" | "android:name")
-                                    && android_xml::is_java_class(attribute.value)
+                                    && android_xml::is_java_class(attribute.value.as_ref())
                                 {
                                     let usage_type = if tag.name == "fragment"
                                         || attribute.name == "android:name"
@@ -4114,7 +4114,7 @@ pub fn index_xml_usages(
                                         module_id,
                                         rel_path.clone(),
                                         attribute.line as i64,
-                                        attribute.value.to_owned(),
+                                        attribute.value.to_string(),
                                         usage_type,
                                         element_id.clone(),
                                     ));
@@ -4270,7 +4270,7 @@ pub fn index_resources(
                                 res_stmt.execute(rusqlite::params![
                                     module_id,
                                     tag.name,
-                                    name.value,
+                                    name.value.as_ref(),
                                     rel_path,
                                     tag.line as i64
                                 ])?;
@@ -4384,6 +4384,16 @@ pub fn index_resources(
 
                     for (line_idx, line) in content.lines().enumerate() {
                         let line_num = line_idx as i64 + 1;
+                        // Decode XML after physical line enumeration, so a numeric
+                        // newline cannot shift source locations. Never reparse
+                        // decoded markup or resolve external entities.
+                        let decoded_line;
+                        let line = if is_xml {
+                            decoded_line = android_xml::character_references(line);
+                            decoded_line.as_ref()
+                        } else {
+                            line
+                        };
 
                         if !is_xml && line.contains("R.") {
                             for caps in r_ref_re.captures_iter(line) {

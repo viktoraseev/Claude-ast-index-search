@@ -51,6 +51,7 @@ import android_syntax_contracts
 import vcs_contracts
 import stack_contracts
 import context_contracts
+import graph_contracts
 
 
 SCHEMA = """
@@ -481,6 +482,7 @@ class Fixture:
         self._android_results = None
         self._android_syntax_results = None
         self._context_results = None
+        self._graph_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
         self.environment = {
@@ -1660,6 +1662,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def graph_check(self, check: sqlite3.Row):
+        if self._graph_results is None:
+            self._graph_results = graph_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._graph_results)
+        return {'source': graph_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def stack_check(self, check: sqlite3.Row):
         expected, actual = stack_contracts.exercise(self.binary, self.database.parent)
         return {'source': stack_contracts.REASON, 'samples': expected}, actual, \
@@ -1716,6 +1726,8 @@ class Fixture:
                 handler = self.vcs_check
             if check['feature'] in context_contracts.FEATURES:
                 handler = self.context_check
+            if check['feature'] in graph_contracts.FEATURES:
+                handler = self.graph_check
             if check['feature'] in stack_contracts.FEATURES:
                 handler = self.stack_check
             if check['feature'] in android_contracts.FEATURES:
@@ -1793,6 +1805,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(route_contracts.FEATURES)
     features.update(android_syntax_contracts.FEATURES)
     features.update(context_contracts.PENDING)
+    features.update(graph_contracts.FEATURES)
     return features
 
 
@@ -1921,6 +1934,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     vcs_contracts.plan_vcs(state, root)
     stack_contracts.plan_stacks(state, root)
     context_contracts.plan_context(state, root)
+    graph_contracts.plan_graph(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

@@ -10707,6 +10707,8 @@ pub struct GraphSymbolInfo {
     pub path: String,
     #[serde(skip_serializing)]
     pub root_path: Option<String>,
+    #[serde(skip_serializing)]
+    pub qualified_name: Option<String>,
 }
 
 /// Whether a graph was built, and whether the index moved on since.
@@ -11246,6 +11248,7 @@ fn row_to_graph_symbol_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<GraphSy
         end_line: row.get(4)?,
         path: row.get(5)?,
         root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+        qualified_name: row.get(7)?,
     })
 }
 
@@ -11258,7 +11261,7 @@ pub fn load_graph_symbol_infos(
     for chunk in symbol_ids.chunks(GRAPH_ID_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!(
-            "SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path
+            "SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path, s.qualified_name
              FROM symbols s JOIN files f ON f.id = s.file_id
              WHERE s.id IN ({placeholders})"
         );
@@ -11286,7 +11289,7 @@ pub fn find_graph_symbols_by_name(conn: &Connection, name: &str) -> Result<Vec<G
         .replace('_', "\\_");
     let mut stmt = conn.prepare(
         r#"
-        SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path
+        SELECT s.id, s.name, s.kind, s.line, s.end_line, f.path, f.root_path, s.qualified_name
         FROM symbols s JOIN files f ON f.id = s.file_id
         WHERE s.name = ?1
            OR s.name = 'self.' || ?1
@@ -11310,7 +11313,7 @@ pub fn find_graph_symbols_by_name(conn: &Connection, name: &str) -> Result<Vec<G
 pub fn find_member_symbols(conn: &Connection, container_id: i64) -> Result<Vec<GraphSymbolInfo>> {
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT m.id, m.name, m.kind, m.line, m.end_line, f.path, f.root_path
+        SELECT m.id, m.name, m.kind, m.line, m.end_line, f.path, f.root_path, m.qualified_name
         FROM symbols c
         JOIN symbols m ON m.file_id = c.file_id
         JOIN files f ON f.id = m.file_id
@@ -11369,7 +11372,7 @@ pub fn find_enclosing_container(
 ) -> Result<Option<GraphSymbolInfo>> {
     let mut stmt = conn.prepare_cached(
         r#"
-        SELECT c.id, c.name, c.kind, c.line, c.end_line, f.path, f.root_path
+        SELECT c.id, c.name, c.kind, c.line, c.end_line, f.path, f.root_path, c.qualified_name
         FROM symbols s
         JOIN symbols c ON c.file_id = s.file_id
         JOIN files f ON f.id = c.file_id

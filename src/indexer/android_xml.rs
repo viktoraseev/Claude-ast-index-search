@@ -1,11 +1,12 @@
 //! Small lexical XML reader for Android resource/class locations.
-//! No entity expansion or external document loading is performed.
+//! Built-in character references are decoded once; no DTD expansion or external loading.
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 pub struct Attribute<'a> {
     pub name: &'a str,
-    pub value: &'a str,
+    pub value: Cow<'a, str>,
     pub line: usize,
 }
 
@@ -18,6 +19,53 @@ pub struct Tag<'a> {
 impl<'a> Tag<'a> {
     pub fn attribute(&self, name: &str) -> Option<&Attribute<'a>> {
         self.attributes.iter().find(|a| a.name == name)
+    }
+}
+
+/// Decode only XML's predefined entities and valid numeric character references.
+/// Unknown/invalid references remain literal, and decoded text is never re-parsed.
+pub fn character_references(value: &str) -> Cow<'_, str> {
+    static REFERENCES: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"&(?:amp|lt|gt|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);").unwrap());
+    if !value.contains('&') {
+        return Cow::Borrowed(value);
+    }
+    let mut output = String::new();
+    let mut consumed = 0;
+    for reference in REFERENCES.find_iter(value) {
+        let entity = &reference.as_str()[1..reference.len() - 1];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            numeric => {
+                let number = if let Some(hex) = numeric.strip_prefix("#x") {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    numeric
+                        .strip_prefix('#')
+                        .and_then(|decimal| decimal.parse::<u32>().ok())
+                };
+                number.filter(|n| matches!(n, 9 | 10 | 13 | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF))
+                    .and_then(char::from_u32)
+            }
+        };
+        if let Some(character) = decoded {
+            if consumed == 0 {
+                output.reserve(value.len());
+            }
+            output.push_str(&value[consumed..reference.start()]);
+            output.push(character);
+            consumed = reference.end();
+        }
+    }
+    if consumed == 0 {
+        Cow::Borrowed(value)
+    } else {
+        output.push_str(&value[consumed..]);
+        Cow::Owned(output)
     }
 }
 
@@ -104,7 +152,7 @@ pub fn tags(content: &str) -> Vec<Tag<'_>> {
                     let value = c.get(2).or_else(|| c.get(3)).unwrap();
                     Attribute {
                         name: key.as_str(),
-                        value: value.as_str(),
+                        value: character_references(value.as_str()),
                         line: line
                             + body[..name_len + key.start()]
                                 .bytes()
@@ -133,4 +181,46 @@ pub fn is_java_class(name: &str) -> bool {
         .unwrap()
     });
     CLASS.is_match(name)
+}
+
+#[cfg(test)]
+mod character_reference_tests {
+    use super::*;
+
+    #[test]
+    fn valid_numeric_and_predefined_references_decode_once() {
+        assert_eq!(
+            character_references("&#36;&#x24; &#xE9;&amp;&lt;&gt;&quot;&apos;"),
+            "$$ é&<>\"'"
+        );
+        assert_eq!(character_references("&amp;#36; &amp;amp;"), "&#36; &amp;");
+    }
+
+    #[test]
+    fn unknown_and_invalid_references_never_expand() {
+        let value = "&external; &#0; &#xD800; &#x110000; &#99999999999999999;";
+        assert!(matches!(character_references(value), Cow::Borrowed(_)));
+        assert_eq!(character_references(value), value);
+        assert!(matches!(
+            character_references("fixture.Class"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            character_references(&"&".repeat(10000)),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn decoded_attribute_markup_is_not_a_new_tag() {
+        let xml = "<view note='&lt;fixture.Ghost/&gt;' class='fixture.Outer&#36;Inner'/>";
+        let tags = tags(xml);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].name, "view");
+        assert_eq!(
+            tags[0].attribute("class").unwrap().value,
+            "fixture.Outer$Inner"
+        );
+        assert_eq!(tags[0].attribute("note").unwrap().value, "<fixture.Ghost/>");
+    }
 }
