@@ -3974,10 +3974,7 @@ impl IndexPublicationGuard {
         write_publication_marker(&publication_state_path(&self.db_path), &state)?;
         let clear_result = (|| -> Result<()> {
             if artifacts[0] {
-                snapshot_live_main(
-                    &self.db_path,
-                    &swap_artifact_path(&self.db_path, ""),
-                )?;
+                snapshot_live_main(&self.db_path, &swap_artifact_path(&self.db_path, ""))?;
                 sync_cache_directory(
                     self.db_path
                         .parent()
@@ -7309,11 +7306,9 @@ fn query_implementation_count(
     );
     let mut values = implementation_params(parent_name).to_vec();
     values.extend(scope_params);
-    let count: i64 = conn.query_row(
-        &sql,
-        rusqlite::params_from_iter(values.iter()),
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(values.iter()), |row| {
+        row.get(0)
+    })?;
     Ok(count as usize)
 }
 
@@ -7663,6 +7658,30 @@ pub fn find_symbol_id(
         .query_row(params![path, line, name, root_path.unwrap_or("")], |row| {
             row.get(0)
         })
+        .optional()?)
+}
+
+/// Keep a Java callable distinct from a same-name record property at the same
+/// source location. The legacy kind-agnostic lookup remains available.
+pub fn find_symbol_id_by_kind(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+    name: &str,
+    kind: &str,
+) -> Result<Option<i64>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND s.line = ?2 AND s.name = ?3 AND s.kind = ?5 AND ",
+        file_under_root_sql!("?4"),
+        " LIMIT 1"
+    ))?;
+    Ok(stmt
+        .query_row(
+            params![path, line, name, root_path.unwrap_or(""), kind],
+            |row| row.get(0),
+        )
         .optional()?)
 }
 
@@ -9633,7 +9652,11 @@ pub fn get_module_name(conn: &Connection, id: i64) -> Result<Option<String>> {
 }
 
 /// Symbols of files under `dir` whose path ends with `file_suffix`, in file order.
-pub fn find_symbols_under(conn: &Connection, dir: &str, file_suffix: &str) -> Result<Vec<SearchResult>> {
+pub fn find_symbols_under(
+    conn: &Connection,
+    dir: &str,
+    file_suffix: &str,
+) -> Result<Vec<SearchResult>> {
     let mut stmt = conn.prepare_cached(
         "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
          FROM symbols s

@@ -499,6 +499,16 @@ fn resolved_dependents_filtered(
     let ids: Vec<Option<i64>> = seeds
         .iter()
         .map(|seed| {
+            if seed.path.ends_with(".java") {
+                return db::find_symbol_id_by_kind(
+                    conn,
+                    seed.root_path.as_deref(),
+                    &seed.path,
+                    seed.line,
+                    &seed.name,
+                    &seed.kind,
+                );
+            }
             db::find_symbol_id(
                 conn,
                 seed.root_path.as_deref(),

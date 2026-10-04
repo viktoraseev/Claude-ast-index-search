@@ -1728,12 +1728,13 @@ impl Builder {
                 .into_iter()
                 .filter(|&candidate| {
                     let symbol = &self.syms[candidate as usize];
-                    self.files[symbol.file as usize]
-                        .java
-                        .as_ref()
-                        .is_some_and(|syntax| {
-                            syntax.accepts_arguments(&symbol.name, symbol.line, call.arguments)
-                        })
+                    symbol.kind == "function"
+                        && self.files[symbol.file as usize]
+                            .java
+                            .as_ref()
+                            .is_some_and(|syntax| {
+                                syntax.accepts_arguments(&symbol.name, symbol.line, call.arguments)
+                            })
                 })
                 .collect();
             match targets.len() {

@@ -114,6 +114,43 @@ class CallHierarchyContractsTests(unittest.TestCase):
         with patch.object(Path, 'read_bytes', changed):
             self.assertNotEqual(adapter_digest(), before)
 
+    def test_implicit_record_accessor_uses_an_exact_usage_anchor(self):
+        (self.root / 'Leaf.java').write_text('package fixture;\nrecord Leaf(int leaf) {}\n')
+        (self.root / 'Use.java').write_text('package fixture;\nclass Use {\n int read(Leaf value) { return value.leaf(); }\n}\n')
+        self.fixture.text_cli('rebuild', '--force')
+        self.plan()
+        anchor = self.state.execute("SELECT * FROM call_hierarchy_anchors WHERE kind='accessor'").fetchone()
+        def response(tool, request):
+            if request['file'] == 'Use.java':
+                return {'element': {'file': 'Leaf.java', 'line': anchor['line'], 'column': anchor['column']},
+                        'calls': [{'file': 'Use.java', 'line': 3, 'children': []}]}
+            return self.response(tool, request)
+        self.oracle.call.side_effect = response
+        result = self.evaluate()
+        self.assertEqual(result['verdict'], 'pass', {'error': result['error'], 'diff': result['diff_json']})
+        self.assertEqual(json.loads(result['expected_json'])['declarations'], 2)
+        self.assertEqual(json.loads(result['expected_json'])['items'],
+                         [['Probe.java', 4, 'entry'], ['Use.java', 3, 'read']])
+
+    def test_unresolved_implicit_accessor_cannot_be_fabricated_as_empty(self):
+        (self.root / 'Leaf.java').write_text('package fixture;\nrecord Leaf(int leaf) {}\n')
+        self.fixture.text_cli('rebuild', '--force')
+        self.plan()
+        self.assertEqual(self.evaluate()['verdict'], 'unsupported')
+
+    def test_owner_identity_respects_public_overload_union_and_exact_columns(self):
+        entries = [{'kind': 'method', 'name': 'entry', 'line': 4, 'column': 7},
+                   {'kind': 'method', 'name': 'entry', 'line': 4, 'column': 40}]
+        with patch.object(self.fixture, 'structure', return_value=entries):
+            self.assertEqual(contracts.owner(self.fixture, {'file': 'Probe.java', 'line': 4}),
+                             ('Probe.java', 4, 'entry'))
+        entries[1]['name'] = 'other'
+        with patch.object(self.fixture, 'structure', return_value=entries):
+            with self.assertRaises(contracts.UnsupportedHierarchy):
+                contracts.owner(self.fixture, {'file': 'Probe.java', 'line': 4})
+            self.assertEqual(contracts.owner(self.fixture, {'file': 'Probe.java', 'line': 4, 'column': 40}),
+                             ('Probe.java', 4, 'other'))
+
 
 if __name__ == '__main__':
     unittest.main()

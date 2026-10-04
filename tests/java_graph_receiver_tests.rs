@@ -620,6 +620,23 @@ fn check_bare_scope_source(source: &str, seed: &str, expected_line: u64) {
         })
         .collect();
     assert_eq!(actual, [("Probe.java", expected_line)]);
+    let caller = seed.rsplit('.').next().unwrap();
+    let line = source
+        .lines()
+        .position(|line| line.contains(&format!("{caller}(")))
+        .unwrap()
+        + 1;
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["call-tree", "getName", "--depth", "1"],
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.lines()
+            .any(|row| row == format!("    ← {caller} (Probe.java:{line})")),
+        "Java accessor call-tree lost its real caller: {text}"
+    );
 }
 
 #[test]
@@ -715,4 +732,13 @@ fn project_bound_method_reference_keeps_its_real_member() {
 #[test]
 fn project_unbound_method_reference_keeps_its_real_member() {
     check_expression_receiver("class Probe {\n java.util.function.Function<Decoy,String> use() { return Decoy::getName; }\n}\n", &["Decoy.java"]);
+}
+
+#[test]
+fn typed_record_receiver_keeps_only_its_accessor_function() {
+    check_bare_scope_source(
+        "record Rec(String getName) {}\nclass Probe {\n String library(Rec receiver) { return receiver.getName(); }\n}\n",
+        "Probe.library",
+        1,
+    );
 }
