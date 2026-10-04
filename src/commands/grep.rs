@@ -774,7 +774,7 @@ fn find_caller_functions(
                 if let Some(callers) =
                     super::graph::resolved_callers_of_filtered(conn, &targets, limit, |source| {
                         let path = absolute(&source.path, source.root_path.as_deref());
-                        source.kind == "function"
+                        matches!(source.kind.as_str(), "function" | "property" | "constant")
                             && source.path.ends_with(".java")
                             && selected.contains(path.as_path())
                             && in_file

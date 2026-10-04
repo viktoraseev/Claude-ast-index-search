@@ -1,6 +1,7 @@
 //! Turning name-based references into symbol-to-symbol edges: which
 //! definition owns each reference, and which definition its name denotes.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -26,6 +27,13 @@ use crate::db::{self, SymbolEdgeRow};
 /// Inheritance chains deeper than this are cut; real hierarchies are shallow
 /// and a cap keeps a malformed cyclic `inheritance` table from looping.
 const MAX_ANCESTOR_DEPTH: usize = 8;
+
+type JavaValueCache = HashMap<(u32, JavaReceiver, usize), Option<(u32, JavaReceiver)>>;
+thread_local! {
+    // Cleared for each reference; repeated unsuccessful chain projections
+    // otherwise expand exponentially even with a recursion depth bound.
+    static JAVA_VALUE_CACHE: RefCell<JavaValueCache> = RefCell::new(HashMap::new());
+}
 
 fn strip_source_extension(path: &str) -> &str {
     let file_start = path.rfind('/').map(|index| index + 1).unwrap_or(0);
@@ -1714,6 +1722,12 @@ impl Builder {
         let owner = &self.syms[source as usize];
         let call = java.parameter_call(&owner.name, owner.line, line, name)?;
         let Some(call) = call else {
+            if java
+                .expression_call(&owner.name, owner.line, line, name)
+                .is_some()
+            {
+                return self.resolve_java_expression_call(file, source, name, line);
+            }
             return Some(Err(DropReason::ReceiverUnresolved));
         };
         let resolve = |classes: Vec<u32>| -> Result<Resolution, DropReason> {
@@ -1988,46 +2002,1213 @@ impl Builder {
         receiver: &JavaReceiver,
         depth: usize,
     ) -> Vec<u32> {
-        if depth >= 16 {
+        if depth >= 32 {
             return Vec::new();
         }
+        if let Some((owner, value)) = self.java_value_receiver(source, receiver, depth + 1) {
+            return self.java_receiver_classes(owner, &value, depth + 1);
+        }
         match receiver {
-            JavaReceiver::Unknown => Vec::new(),
+            JavaReceiver::Unknown
+            | JavaReceiver::Parameter(_)
+            | JavaReceiver::Callback { .. }
+            | JavaReceiver::CollectedMap { .. }
+            | JavaReceiver::MethodProjection { .. } => Vec::new(),
+            JavaReceiver::Array(_) => Vec::new(),
+            JavaReceiver::Field { receiver, name } => {
+                let targets = self.java_field_targets(source, receiver, name, depth + 1);
+                let [target] = targets.as_slice() else {
+                    if let JavaReceiver::Type(path) = receiver.as_ref() {
+                        return self.resolve_java_type(
+                            source,
+                            self.namespace_of(source),
+                            &format!("{path}::{name}"),
+                            None,
+                        );
+                    }
+                    return Vec::new();
+                };
+                let symbol = &self.syms[*target as usize];
+                self.files[symbol.file as usize]
+                    .java
+                    .as_ref()
+                    .and_then(|java| java.member_receiver(&symbol.name, symbol.line))
+                    .map(|receiver| self.java_receiver_classes(*target, receiver, depth + 1))
+                    .unwrap_or_default()
+            }
+            JavaReceiver::Parameterized { path, .. } => {
+                self.resolve_java_type(source, self.namespace_of(source), path, None)
+            }
+            JavaReceiver::Element {
+                receiver,
+                operation,
+            } => {
+                if operation == "array-index" {
+                    return self.java_array_element_classes(source, receiver, depth + 1);
+                }
+                let kind = self.java_collection_kind(source, receiver, depth + 1);
+                if operation == "iterable-element"
+                    && matches!(receiver.as_ref(), JavaReceiver::Array(_))
+                {
+                    return self.java_array_element_classes(source, receiver, depth + 1);
+                }
+                if (matches!(operation.as_str(), "forEach" | "iterable-element")
+                    && matches!(
+                        kind.as_deref(),
+                        Some("List" | "Set" | "Collection" | "Iterable" | "Stream")
+                    ))
+                    || (kind.as_deref() == Some("Optional")
+                        && matches!(operation.as_str(), "stream-element" | "optional-element"))
+                    || (kind.as_deref() == Some("CompletableFuture")
+                        && operation == "future-element")
+                    || (kind.as_deref() == Some("Stream") && operation == "stream-element")
+                {
+                    self.java_element_classes(source, receiver, depth + 1)
+                } else {
+                    Vec::new()
+                }
+            }
             JavaReceiver::Type(path) => {
                 self.resolve_java_type(source, self.namespace_of(source), path, None)
             }
             JavaReceiver::This => self.class_scope(source).into_iter().collect(),
+            JavaReceiver::Super => self
+                .class_scope(source)
+                .and_then(|class| self.parents.get(&self.syms[class as usize].qual))
+                .cloned()
+                .unwrap_or_default(),
             JavaReceiver::Invocation {
                 receiver,
                 name,
                 line,
                 arguments,
+                ..
             } => {
                 let targets = if let Some(receiver) = receiver {
-                    let classes = self.java_receiver_classes(source, receiver, depth + 1);
+                    let Some((owner, value)) =
+                        self.java_declared_receiver(source, receiver, depth + 1)
+                    else {
+                        return Vec::new();
+                    };
+                    let classes = self.java_receiver_classes(owner, &value, depth + 1);
                     self.java_receiver_members(source, &classes, name, Some(*arguments))
                 } else {
-                    let file = self.syms[source as usize].file;
-                    self.resolve_java_static_call(file, source, name, *line)
-                        .or_else(|| self.resolve_java_bare_call(file, source, name, *line))
-                        .and_then(Result::ok)
-                        .map(|found| found.targets)
-                        .unwrap_or_default()
+                    self.java_invocation_targets(source, None, name, *line, *arguments, depth + 1)
                 };
-                // Do not guess an overload's result from the first declaration.
+                let mut common = None;
+                for target in targets {
+                    let symbol = &self.syms[target as usize];
+                    let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
+                        return Vec::new();
+                    };
+                    let classes = if let Some(parameter) =
+                        java.return_parameter(&symbol.name, symbol.line)
+                    {
+                        if java
+                            .parameter_index(&symbol.name, symbol.line, parameter)
+                            .is_some()
+                        {
+                            java.type_bound(&symbol.name, symbol.line, parameter)
+                                .map(|bound| {
+                                    self.resolve_java_type(
+                                        target,
+                                        self.namespace_of(target),
+                                        bound,
+                                        None,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        } else if let Some(class) = self.class_scope(target) {
+                            let owner = &self.syms[class as usize];
+                            let bound = receiver
+                                .as_deref()
+                                .and_then(|receiver| {
+                                    java.parameter_index(&owner.name, owner.line, parameter)
+                                        .map(|index| {
+                                            self.java_argument_classes(
+                                                source,
+                                                receiver,
+                                                index,
+                                                depth + 1,
+                                            )
+                                        })
+                                })
+                                .unwrap_or_default();
+                            if !bound.is_empty() {
+                                bound
+                            } else {
+                                java.type_bound(&owner.name, owner.line, parameter)
+                                    .map(|bound| {
+                                        self.resolve_java_type(
+                                            target,
+                                            self.namespace_of(target),
+                                            bound,
+                                            None,
+                                        )
+                                    })
+                                    .unwrap_or_default()
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    } else if let Some(receiver) = java.return_receiver(&symbol.name, symbol.line) {
+                        self.java_receiver_classes(target, receiver, depth + 1)
+                    } else if let Some(path) = java.return_type(&symbol.name, symbol.line) {
+                        self.resolve_java_type(target, self.namespace_of(target), path, None)
+                    } else {
+                        return Vec::new();
+                    };
+                    if classes.len() != 1
+                        || common.as_ref().is_some_and(|previous| *previous != classes)
+                    {
+                        return Vec::new();
+                    }
+                    common = Some(classes);
+                }
+                common.unwrap_or_default()
+            }
+        }
+    }
+
+    fn java_collection_kind(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Option<String> {
+        if depth >= 32 {
+            return None;
+        }
+        if let Some((owner, value)) = self.java_value_receiver(source, receiver, depth + 1) {
+            return self.java_collection_kind(owner, &value, depth + 1);
+        }
+        match receiver {
+            JavaReceiver::Field { receiver, name } => {
+                let targets = self.java_field_targets(source, receiver, name, depth + 1);
+                let [target] = targets.as_slice() else {
+                    return None;
+                };
+                let symbol = &self.syms[*target as usize];
+                self.files[symbol.file as usize]
+                    .java
+                    .as_ref()
+                    .and_then(|java| java.member_receiver(&symbol.name, symbol.line))
+                    .and_then(|receiver| self.java_collection_kind(*target, receiver, depth + 1))
+            }
+            JavaReceiver::Parameterized { path, .. } => {
+                if !self
+                    .resolve_java_type(source, self.namespace_of(source), path, None)
+                    .is_empty()
+                {
+                    return None;
+                }
+                let java = self.files[self.syms[source as usize].file as usize]
+                    .java
+                    .as_ref()?;
+                let qualified = if path == "Map::Entry" {
+                    let probe = JavaReceiver::Parameterized {
+                        path: "Map".to_owned(),
+                        arguments: Vec::new(),
+                    };
+                    if self
+                        .java_collection_kind(source, &probe, depth + 1)
+                        .as_deref()
+                        != Some("Map")
+                    {
+                        return None;
+                    }
+                    "java::util::Map::Entry".to_owned()
+                } else if path.contains("::") {
+                    path.clone()
+                } else if let Some(import) = java
+                    .imports
+                    .iter()
+                    .find(|import| import.rsplit("::").next() == Some(path.as_str()))
+                {
+                    import.clone()
+                } else {
+                    let package = match path.as_str() {
+                        "List" | "Collection" | "Set" | "Iterator" | "Map" | "Optional" => {
+                            "java::util"
+                        }
+                        "CompletableFuture" | "Future" => "java::util::concurrent",
+                        "AtomicReference" => "java::util::concurrent::atomic",
+                        "Supplier" | "Function" | "Consumer" | "UnaryOperator" | "BiFunction"
+                        | "BiConsumer" | "BinaryOperator" => "java::util::function",
+                        "Stream" => "java::util::stream",
+                        "Iterable" => "java::lang",
+                        _ => return None,
+                    };
+                    if java
+                        .imports
+                        .iter()
+                        .filter(|import| import.ends_with("::*"))
+                        .any(|import| {
+                            !matches!(
+                                import.as_str(),
+                                "java::util::*"
+                                    | "java::util::concurrent::*"
+                                    | "java::util::concurrent::atomic::*"
+                                    | "java::util::function::*"
+                                    | "java::util::stream::*"
+                                    | "java::lang::*"
+                            )
+                        })
+                    {
+                        return None;
+                    }
+                    if package != "java::lang"
+                        && !java
+                            .imports
+                            .iter()
+                            .any(|import| import == &format!("{package}::*"))
+                    {
+                        return None;
+                    }
+                    format!("{package}::{path}")
+                };
+                matches!(
+                    qualified.as_str(),
+                    "java::util::List"
+                        | "java::util::Collection"
+                        | "java::util::Set"
+                        | "java::lang::Iterable"
+                        | "java::util::Iterator"
+                        | "java::util::Map"
+                        | "java::util::Optional"
+                        | "java::util::stream::Stream"
+                        | "java::util::concurrent::CompletableFuture"
+                        | "java::util::concurrent::Future"
+                        | "java::util::concurrent::atomic::AtomicReference"
+                        | "java::util::Map::Entry"
+                        | "java::util::function::Supplier"
+                        | "java::util::function::Function"
+                        | "java::util::function::Consumer"
+                        | "java::util::function::UnaryOperator"
+                        | "java::util::function::BiFunction"
+                        | "java::util::function::BiConsumer"
+                        | "java::util::function::BinaryOperator"
+                )
+                .then(|| qualified.rsplit("::").next().unwrap_or_default().to_owned())
+            }
+            JavaReceiver::Invocation {
+                receiver,
+                name,
+                arguments,
+                first_argument,
+                ..
+            } => {
+                if name == "stream"
+                    && *arguments == 1
+                    && receiver
+                        .as_deref()
+                        .is_some_and(|receiver| self.java_is_arrays(source, receiver))
+                    && first_argument.is_some()
+                {
+                    return Some("Stream".to_owned());
+                }
+                if let Some(receiver) = receiver {
+                    let kind = self.java_collection_kind(source, receiver, depth + 1);
+                    if name == "stream"
+                        && *arguments == 0
+                        && matches!(kind.as_deref(), Some("List" | "Set" | "Collection"))
+                    {
+                        return Some("Stream".to_owned());
+                    }
+                    if matches!(kind.as_deref(), Some("List" | "Set" | "Collection"))
+                        && name == "iterator"
+                        && *arguments == 0
+                    {
+                        return Some("Iterator".to_owned());
+                    }
+                    if kind.as_deref() == Some("Stream") && *arguments == 0 {
+                        if matches!(name.as_str(), "findFirst" | "findAny") {
+                            return Some("Optional".to_owned());
+                        }
+                        if name == "toList" {
+                            return Some("List".to_owned());
+                        }
+                    }
+                    if kind.as_deref() == Some("Map")
+                        && *arguments == 0
+                        && matches!(name.as_str(), "values" | "keySet")
+                    {
+                        return Some("Collection".to_owned());
+                    }
+                    if kind.as_deref() == Some("Stream")
+                        && matches!(
+                            name.as_str(),
+                            "filter" | "peek" | "sorted" | "limit" | "skip" | "distinct"
+                        )
+                    {
+                        return kind;
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn java_invocation_targets(
+        &self,
+        source: u32,
+        receiver: Option<&JavaReceiver>,
+        name: &str,
+        line: i64,
+        arguments: usize,
+        depth: usize,
+    ) -> Vec<u32> {
+        if depth >= 32 {
+            return Vec::new();
+        }
+        if let Some(receiver) = receiver {
+            let classes = self.java_receiver_classes(source, receiver, depth + 1);
+            self.java_receiver_members(source, &classes, name, Some(arguments))
+        } else {
+            let file = self.syms[source as usize].file;
+            self.resolve_java_static_call(file, source, name, line)
+                .or_else(|| self.resolve_java_bare_call(file, source, name, line))
+                .and_then(Result::ok)
+                .map(|found| found.targets)
+                .unwrap_or_default()
+        }
+    }
+
+    fn java_element_classes(&self, source: u32, receiver: &JavaReceiver, depth: usize) -> Vec<u32> {
+        if depth >= 32 {
+            return Vec::new();
+        }
+        if let Some((owner, value)) = self.java_value_receiver(source, receiver, depth + 1) {
+            return self.java_element_classes(owner, &value, depth + 1);
+        }
+        match receiver {
+            JavaReceiver::Field { receiver, name } => {
+                let targets = self.java_field_targets(source, receiver, name, depth + 1);
                 let [target] = targets.as_slice() else {
                     return Vec::new();
                 };
                 let symbol = &self.syms[*target as usize];
-                let Some(path) = self.files[symbol.file as usize]
+                self.files[symbol.file as usize]
                     .java
                     .as_ref()
-                    .and_then(|java| java.return_type(&symbol.name, symbol.line))
-                else {
+                    .and_then(|java| java.member_receiver(&symbol.name, symbol.line))
+                    .map(|receiver| self.java_element_classes(*target, receiver, depth + 1))
+                    .unwrap_or_default()
+            }
+            JavaReceiver::Parameterized { arguments, .. } => {
+                let Some(kind) = self.java_collection_kind(source, receiver, depth + 1) else {
                     return Vec::new();
                 };
-                self.resolve_java_type(*target, self.namespace_of(*target), path, None)
+                let index = usize::from(matches!(kind.as_str(), "Map" | "Function" | "Entry"));
+                arguments
+                    .get(index)
+                    .and_then(Option::as_ref)
+                    .map(|argument| self.java_receiver_classes(source, argument, depth + 1))
+                    .unwrap_or_default()
             }
+            JavaReceiver::Invocation {
+                receiver,
+                name,
+                arguments,
+                first_argument,
+                ..
+            } => {
+                if name == "stream"
+                    && *arguments == 1
+                    && receiver
+                        .as_deref()
+                        .is_some_and(|receiver| self.java_is_arrays(source, receiver))
+                {
+                    return first_argument
+                        .as_deref()
+                        .map(|argument| {
+                            self.java_array_element_classes(source, argument, depth + 1)
+                        })
+                        .unwrap_or_default();
+                }
+                if let Some(receiver) = receiver {
+                    if self
+                        .java_collection_kind(source, receiver, depth + 1)
+                        .as_deref()
+                        == Some("Map")
+                        && name == "values"
+                        && *arguments == 0
+                    {
+                        return self.java_element_classes(source, receiver, depth + 1);
+                    }
+                    if self
+                        .java_collection_kind(source, receiver, depth + 1)
+                        .is_some()
+                        && matches!(
+                            name.as_str(),
+                            "stream"
+                                | "filter"
+                                | "peek"
+                                | "sorted"
+                                | "limit"
+                                | "skip"
+                                | "distinct"
+                                | "findFirst"
+                                | "findAny"
+                                | "toList"
+                                | "iterator"
+                        )
+                    {
+                        return self.java_element_classes(source, receiver, depth + 1);
+                    }
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn java_is_arrays(&self, source: u32, receiver: &JavaReceiver) -> bool {
+        let JavaReceiver::Type(path) = receiver else {
+            return false;
+        };
+        if !self
+            .resolve_java_type(source, self.namespace_of(source), path, None)
+            .is_empty()
+        {
+            return false;
+        }
+        path == "java::util::Arrays"
+            || (path == "Arrays"
+                && self.files[self.syms[source as usize].file as usize]
+                    .java
+                    .as_ref()
+                    .is_some_and(|java| {
+                        java.imports
+                            .iter()
+                            .any(|import| import == "java::util::Arrays")
+                            || (java.imports.iter().any(|import| import == "java::util::*")
+                                && !java.imports.iter().any(|import| {
+                                    import.rsplit("::").next() == Some("Arrays")
+                                        || (import.ends_with("::*")
+                                            && !import.starts_with("java::"))
+                                }))
+                    }))
+    }
+
+    fn java_field_targets(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        name: &str,
+        depth: usize,
+    ) -> Vec<u32> {
+        if depth >= 32 {
+            return Vec::new();
+        }
+        let classes = self.java_receiver_classes(source, receiver, depth + 1);
+        let [class] = classes.as_slice() else {
+            return Vec::new();
+        };
+        self.resolve_in_hierarchy(*class, source, name, false)
+            .map(|found| {
+                found
+                    .targets
+                    .into_iter()
+                    .filter(|&target| {
+                        matches!(
+                            self.syms[target as usize].kind.as_str(),
+                            "property" | "constant"
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn java_argument_classes(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        index: usize,
+        depth: usize,
+    ) -> Vec<u32> {
+        self.java_argument_receiver(source, receiver, index, depth + 1)
+            .map(|(owner, argument)| self.java_receiver_classes(owner, &argument, depth + 1))
+            .unwrap_or_default()
+    }
+
+    /// Retain nested generic arguments and their declaring namespace across
+    /// member results. Erasing an outer container loses callback element types.
+    fn java_value_receiver(
+        &self,
+        source: u32,
+        value: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        if depth >= 32 {
+            return None;
+        }
+        let key = (source, value.clone(), depth);
+        if let Some(found) = JAVA_VALUE_CACHE.with(|cache| cache.borrow().get(&key).cloned()) {
+            return found;
+        }
+        let result = self.java_value_receiver_uncached(source, value, depth);
+        JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().insert(key, result.clone()));
+        result
+    }
+
+    fn java_value_receiver_uncached(
+        &self,
+        source: u32,
+        value: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        match value {
+            JavaReceiver::MethodProjection {
+                input,
+                qualifier,
+                name,
+                line,
+            } => {
+                let classes =
+                    self.resolve_java_type(source, self.namespace_of(source), qualifier, None);
+                let static_targets: Vec<_> = self
+                    .java_receiver_members(source, &classes, name, Some(1))
+                    .into_iter()
+                    .filter(|target| {
+                        let symbol = &self.syms[*target as usize];
+                        self.files[symbol.file as usize]
+                            .java
+                            .as_ref()
+                            .is_some_and(|java| java.is_static_method(&symbol.name, symbol.line))
+                    })
+                    .collect();
+                let receiver = if let [_] = static_targets.as_slice() {
+                    JavaReceiver::Invocation {
+                        receiver: Some(Box::new(JavaReceiver::Type(qualifier.clone()))),
+                        name: name.clone(),
+                        line: *line,
+                        arguments: 1,
+                        first_argument: Some(input.clone()),
+                    }
+                } else if static_targets.is_empty() {
+                    let input_classes = self.java_receiver_classes(source, input, depth + 1);
+                    if classes.is_empty() || input_classes != classes {
+                        return None;
+                    }
+                    JavaReceiver::Invocation {
+                        receiver: Some(input.clone()),
+                        name: name.clone(),
+                        line: *line,
+                        arguments: 0,
+                        first_argument: None,
+                    }
+                } else {
+                    return None;
+                };
+                self.java_value_receiver(source, &receiver, depth + 1)
+            }
+            JavaReceiver::CollectedMap {
+                stream,
+                collector,
+                key,
+                value,
+            } => {
+                if self
+                    .java_collection_kind(source, stream, depth + 1)
+                    .as_deref()
+                    != Some("Stream")
+                {
+                    return None;
+                }
+                let JavaReceiver::Type(path) = collector.as_ref() else {
+                    return None;
+                };
+                if !self
+                    .resolve_java_type(source, self.namespace_of(source), path, None)
+                    .is_empty()
+                {
+                    return None;
+                }
+                let java = self.files[self.syms[source as usize].file as usize]
+                    .java
+                    .as_ref()?;
+                let imported = java
+                    .imports
+                    .iter()
+                    .find(|import| import.rsplit("::").next() == Some("Collectors"));
+                let wildcard = java
+                    .imports
+                    .iter()
+                    .any(|import| import == "java::util::stream::*")
+                    && !java
+                        .imports
+                        .iter()
+                        .any(|import| import.ends_with("::*") && !import.starts_with("java::"));
+                if path != "java::util::stream::Collectors"
+                    && !(path == "Collectors"
+                        && imported.map_or(wildcard, |import| {
+                            import == "java::util::stream::Collectors"
+                        }))
+                {
+                    return None;
+                }
+                let projection = |projection: &JavaReceiver| {
+                    self.java_declared_receiver(source, projection, depth + 1)
+                        .map(|(owner, receiver)| {
+                            self.java_qualified_receiver(owner, &receiver, depth + 1)
+                        })
+                };
+                Some((
+                    source,
+                    JavaReceiver::Parameterized {
+                        path: "java::util::Map".to_owned(),
+                        arguments: vec![projection(key), projection(value)],
+                    },
+                ))
+            }
+            JavaReceiver::Callback {
+                receiver,
+                name,
+                line,
+                arguments,
+                parameter,
+                input,
+            } => {
+                let targets = self.java_invocation_targets(
+                    source,
+                    receiver.as_deref(),
+                    name,
+                    *line,
+                    *arguments,
+                    depth + 1,
+                );
+                let [target] = targets.as_slice() else {
+                    return None;
+                };
+                let symbol = &self.syms[*target as usize];
+                let callback = self.files[symbol.file as usize]
+                    .java
+                    .as_ref()?
+                    .callback_parameter(&symbol.name, symbol.line, *parameter)?;
+                let kind = self.java_collection_kind(*target, callback, depth + 1)?;
+                if !matches!(
+                    kind.as_str(),
+                    "Function"
+                        | "Consumer"
+                        | "UnaryOperator"
+                        | "BiFunction"
+                        | "BiConsumer"
+                        | "BinaryOperator"
+                ) || *input
+                    > usize::from(matches!(
+                        kind.as_str(),
+                        "BiFunction" | "BiConsumer" | "BinaryOperator"
+                    ))
+                {
+                    return None;
+                }
+                self.java_argument_receiver(
+                    *target,
+                    callback,
+                    if kind == "BinaryOperator" { 0 } else { *input },
+                    depth + 1,
+                )
+            }
+            JavaReceiver::Field { receiver, name } => {
+                let targets = self.java_field_targets(source, receiver, name, depth + 1);
+                let [target] = targets.as_slice() else {
+                    return None;
+                };
+                let symbol = &self.syms[*target as usize];
+                Some((
+                    *target,
+                    self.files[symbol.file as usize]
+                        .java
+                        .as_ref()?
+                        .member_receiver(&symbol.name, symbol.line)?
+                        .clone(),
+                ))
+            }
+            JavaReceiver::Element {
+                receiver,
+                operation,
+            } => {
+                let kind = self.java_collection_kind(source, receiver, depth + 1)?;
+                let applicable = match operation.as_str() {
+                    "collector-value" | "map-key" | "map-value" => kind == "Map",
+                    "future-element" => kind == "CompletableFuture",
+                    "optional-element" => kind == "Optional",
+                    "stream-element" => matches!(kind.as_str(), "Stream" | "Optional"),
+                    "forEach" | "iterable-element" => matches!(
+                        kind.as_str(),
+                        "List" | "Collection" | "Set" | "Iterable" | "Stream"
+                    ),
+                    _ => false,
+                };
+                if !applicable {
+                    return None;
+                }
+                if matches!(operation.as_str(), "map-key" | "map-value") {
+                    return self.java_argument_receiver(
+                        source,
+                        receiver,
+                        usize::from(operation == "map-value"),
+                        depth + 1,
+                    );
+                }
+                self.java_element_receiver(source, receiver, depth + 1)
+            }
+            JavaReceiver::Invocation {
+                receiver,
+                name,
+                line,
+                arguments,
+                first_argument,
+            } => {
+                let bound = receiver
+                    .as_deref()
+                    .and_then(|receiver| self.java_declared_receiver(source, receiver, depth + 1));
+                if let Some((context, receiver)) = &bound {
+                    let context = *context;
+                    let kind = self.java_collection_kind(context, receiver, depth + 1);
+                    let projected = if name == "stream"
+                        && *arguments == 0
+                        && matches!(kind.as_deref(), Some("List" | "Collection" | "Set"))
+                    {
+                        Some("java::util::stream::Stream")
+                    } else if kind.as_deref() == Some("Stream") {
+                        match name.as_str() {
+                            "filter" | "peek" | "sorted" | "limit" | "skip" | "distinct" => {
+                                Some("java::util::stream::Stream")
+                            }
+                            "findFirst" | "findAny" if *arguments == 0 => {
+                                Some("java::util::Optional")
+                            }
+                            "toList" if *arguments == 0 => Some("java::util::List"),
+                            _ => None,
+                        }
+                    } else if name == "iterator"
+                        && *arguments == 0
+                        && matches!(kind.as_deref(), Some("List" | "Collection" | "Set"))
+                    {
+                        Some("java::util::Iterator")
+                    } else {
+                        None
+                    };
+                    if let Some(path) = projected {
+                        let (owner, element) =
+                            self.java_element_receiver(context, receiver, depth + 1)?;
+                        return Some((
+                            owner,
+                            JavaReceiver::Parameterized {
+                                path: path.to_owned(),
+                                arguments: vec![Some(element)],
+                            },
+                        ));
+                    }
+                    if name == "values" && *arguments == 0 {
+                        let classes = self.java_receiver_classes(context, receiver, depth + 1);
+                        if let [class] = classes.as_slice() {
+                            if self.syms[*class as usize].kind == "enum" {
+                                return Some((
+                                    *class,
+                                    JavaReceiver::Array(Some(
+                                        self.syms[*class as usize].qual.clone(),
+                                    )),
+                                ));
+                            }
+                        }
+                    }
+                    if name == "stream" && *arguments == 1 && self.java_is_arrays(context, receiver)
+                    {
+                        let (owner, argument) = self.java_declared_receiver(
+                            source,
+                            first_argument.as_deref()?,
+                            depth + 1,
+                        )?;
+                        let JavaReceiver::Array(Some(element)) = argument else {
+                            return None;
+                        };
+                        return Some((
+                            owner,
+                            JavaReceiver::Parameterized {
+                                path: "java::util::stream::Stream".to_owned(),
+                                arguments: vec![Some(JavaReceiver::Type(element))],
+                            },
+                        ));
+                    }
+                    if (name == "get"
+                        && matches!(
+                            (kind.as_deref(), *arguments),
+                            (Some("List" | "Map"), 1)
+                                | (
+                                    Some(
+                                        "Optional"
+                                            | "Supplier"
+                                            | "Future"
+                                            | "CompletableFuture"
+                                            | "AtomicReference"
+                                    ),
+                                    0
+                                )
+                        ))
+                        || (name == "join"
+                            && kind.as_deref() == Some("CompletableFuture")
+                            && *arguments == 0)
+                        || (name == "next"
+                            && kind.as_deref() == Some("Iterator")
+                            && *arguments == 0)
+                        || (name == "apply"
+                            && kind.as_deref() == Some("Function")
+                            && *arguments == 1)
+                        || (matches!(name.as_str(), "getKey" | "getValue")
+                            && kind.as_deref() == Some("Entry")
+                            && *arguments == 0)
+                        || (matches!(name.as_str(), "orElse" | "orElseGet" | "orElseThrow")
+                            && kind.as_deref() == Some("Optional"))
+                    {
+                        let index = if name == "getKey" {
+                            0
+                        } else {
+                            usize::from(matches!(
+                                kind.as_deref(),
+                                Some("Map" | "Entry" | "Function")
+                            ))
+                        };
+                        return self.java_argument_receiver(context, receiver, index, depth + 1);
+                    }
+                    if kind.as_deref() == Some("Map")
+                        && *arguments == 0
+                        && matches!(name.as_str(), "values" | "keySet" | "entrySet")
+                    {
+                        let (owner, element) = if name == "entrySet" {
+                            let (owner, map) =
+                                self.java_declared_receiver(context, receiver, depth + 1)?;
+                            let JavaReceiver::Parameterized { arguments, .. } = map else {
+                                return None;
+                            };
+                            (
+                                owner,
+                                JavaReceiver::Parameterized {
+                                    path: "java::util::Map::Entry".to_owned(),
+                                    arguments,
+                                },
+                            )
+                        } else {
+                            self.java_argument_receiver(
+                                context,
+                                receiver,
+                                usize::from(name == "values"),
+                                depth + 1,
+                            )?
+                        };
+                        return Some((
+                            owner,
+                            JavaReceiver::Parameterized {
+                                path: "java::util::Collection".to_owned(),
+                                arguments: vec![Some(element)],
+                            },
+                        ));
+                    }
+                    if matches!(name.as_str(), "of" | "ofNullable") && *arguments == 1 {
+                        if let JavaReceiver::Type(path) = receiver {
+                            let probe = JavaReceiver::Parameterized {
+                                path: path.clone(),
+                                arguments: Vec::new(),
+                            };
+                            if self
+                                .java_collection_kind(context, &probe, depth + 1)
+                                .as_deref()
+                                == Some("Optional")
+                            {
+                                return Some((
+                                    source,
+                                    JavaReceiver::Parameterized {
+                                        path: "java::util::Optional".to_owned(),
+                                        arguments: vec![first_argument.as_deref().cloned()],
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+                let targets = if let Some((context, receiver)) = &bound {
+                    let classes = self.java_receiver_classes(*context, receiver, depth + 1);
+                    let targets =
+                        self.java_receiver_members(source, &classes, name, Some(*arguments));
+                    if targets.is_empty() && *arguments == 0 {
+                        if let [class] = classes.as_slice() {
+                            let symbol = &self.syms[*class as usize];
+                            if let Some((field_line, getter)) = self.files[symbol.file as usize]
+                                .java
+                                .as_ref()
+                                .and_then(|java| {
+                                    java.generated_getter_receiver(&symbol.name, symbol.line, name)
+                                })
+                            {
+                                let field_context = self.files[symbol.file as usize]
+                                    .symbols
+                                    .iter()
+                                    .copied()
+                                    .find(|&candidate| {
+                                        let field = &self.syms[candidate as usize];
+                                        field.line == *field_line
+                                            && matches!(
+                                                field.kind.as_str(),
+                                                "property" | "constant"
+                                            )
+                                            && self.class_scope(candidate) == Some(*class)
+                                    })?;
+                                if let JavaReceiver::Parameter(parameter) = getter {
+                                    let java = self.files[symbol.file as usize].java.as_ref()?;
+                                    let index =
+                                        java.parameter_index(&symbol.name, symbol.line, parameter)?;
+                                    return self.java_argument_receiver(
+                                        *context,
+                                        receiver,
+                                        index,
+                                        depth + 1,
+                                    );
+                                }
+                                return Some((field_context, getter.clone()));
+                            }
+                        }
+                    }
+                    targets
+                } else if receiver.is_none() {
+                    let targets = self.java_invocation_targets(
+                        source,
+                        None,
+                        name,
+                        *line,
+                        *arguments,
+                        depth + 1,
+                    );
+                    if targets.is_empty() && *arguments == 0 {
+                        let explicit = JavaReceiver::Invocation {
+                            receiver: Some(Box::new(JavaReceiver::This)),
+                            name: name.clone(),
+                            line: *line,
+                            arguments: *arguments,
+                            first_argument: first_argument.clone(),
+                        };
+                        return self.java_value_receiver(source, &explicit, depth + 1);
+                    }
+                    targets
+                } else {
+                    Vec::new()
+                };
+                let [target] = targets.as_slice() else {
+                    return None;
+                };
+                let symbol = &self.syms[*target as usize];
+                let java = self.files[symbol.file as usize].java.as_ref()?;
+                if let Some(parameter) = java.return_parameter(&symbol.name, symbol.line) {
+                    if java
+                        .parameter_index(&symbol.name, symbol.line, parameter)
+                        .is_none()
+                    {
+                        let class = self.class_scope(*target)?;
+                        let owner = &self.syms[class as usize];
+                        if let Some(index) =
+                            java.parameter_index(&owner.name, owner.line, parameter)
+                        {
+                            if let Some((context, receiver)) = &bound {
+                                if let Some(value) = self.java_argument_receiver(
+                                    *context,
+                                    receiver,
+                                    index,
+                                    depth + 1,
+                                ) {
+                                    return Some(value);
+                                }
+                            }
+                        }
+                        return java
+                            .type_bound(&owner.name, owner.line, parameter)
+                            .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
+                    }
+                    return java
+                        .type_bound(&symbol.name, symbol.line, parameter)
+                        .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
+                }
+                java.return_receiver(&symbol.name, symbol.line)
+                    .cloned()
+                    .or_else(|| {
+                        java.return_type(&symbol.name, symbol.line)
+                            .map(|path| JavaReceiver::Type(path.to_owned()))
+                    })
+                    .map(|receiver| (*target, receiver))
+            }
+            _ => None,
+        }
+    }
+
+    fn java_declared_receiver(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        if depth >= 32 {
+            return None;
+        }
+        if let Some((owner, value)) = self.java_value_receiver(source, receiver, depth + 1) {
+            self.java_declared_receiver(owner, &value, depth + 1)
+        } else if matches!(
+            receiver,
+            JavaReceiver::Type(_)
+                | JavaReceiver::Parameterized { .. }
+                | JavaReceiver::Array(_)
+                | JavaReceiver::This
+                | JavaReceiver::Super
+        ) {
+            Some((source, receiver.clone()))
+        } else {
+            None
+        }
+    }
+
+    fn java_qualified_receiver(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> JavaReceiver {
+        if depth >= 32 {
+            return JavaReceiver::Unknown;
+        }
+        match receiver {
+            JavaReceiver::Type(path) => {
+                let classes = self.resolve_java_type(source, self.namespace_of(source), path, None);
+                if let [class] = classes.as_slice() {
+                    JavaReceiver::Type(self.syms[*class as usize].qual.clone())
+                } else {
+                    receiver.clone()
+                }
+            }
+            JavaReceiver::Parameterized { path, arguments } => JavaReceiver::Parameterized {
+                path: path.clone(),
+                arguments: arguments
+                    .iter()
+                    .map(|argument| {
+                        argument.as_ref().map(|argument| {
+                            self.java_qualified_receiver(source, argument, depth + 1)
+                        })
+                    })
+                    .collect(),
+            },
+            _ => receiver.clone(),
+        }
+    }
+
+    fn java_argument_receiver(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        index: usize,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        let (owner, value) = self.java_declared_receiver(source, receiver, depth + 1)?;
+        let JavaReceiver::Parameterized { arguments, .. } = value else {
+            return None;
+        };
+        Some((owner, arguments.get(index)?.clone()?))
+    }
+
+    fn java_element_receiver(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        if depth >= 32 {
+            return None;
+        }
+        let kind = self.java_collection_kind(source, receiver, depth + 1)?;
+        if let Some(value) = self.java_argument_receiver(
+            source,
+            receiver,
+            usize::from(matches!(kind.as_str(), "Map" | "Function" | "Entry")),
+            depth + 1,
+        ) {
+            return Some(value);
+        }
+        if let JavaReceiver::Invocation {
+            receiver: Some(receiver),
+            name,
+            ..
+        } = receiver
+        {
+            if matches!(
+                name.as_str(),
+                "stream"
+                    | "filter"
+                    | "peek"
+                    | "sorted"
+                    | "limit"
+                    | "skip"
+                    | "distinct"
+                    | "findFirst"
+                    | "findAny"
+                    | "toList"
+                    | "iterator"
+            ) {
+                return self.java_element_receiver(source, receiver, depth + 1);
+            }
+        }
+        None
+    }
+
+    fn java_array_element_classes(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Vec<u32> {
+        if depth >= 32 {
+            return Vec::new();
+        }
+        match receiver {
+            JavaReceiver::Array(Some(element)) => {
+                self.resolve_java_type(source, self.namespace_of(source), element, None)
+            }
+            JavaReceiver::Invocation {
+                receiver,
+                name,
+                line,
+                arguments,
+                ..
+            } => {
+                if name == "values" && *arguments == 0 {
+                    let classes = receiver
+                        .as_deref()
+                        .map(|receiver| self.java_receiver_classes(source, receiver, depth + 1))
+                        .unwrap_or_else(|| self.class_scope(source).into_iter().collect());
+                    if let [class] = classes.as_slice() {
+                        if self.syms[*class as usize].kind == "enum" {
+                            return classes;
+                        }
+                    }
+                }
+                let targets = self.java_invocation_targets(
+                    source,
+                    receiver.as_deref(),
+                    name,
+                    *line,
+                    *arguments,
+                    depth + 1,
+                );
+                let [target] = targets.as_slice() else {
+                    return Vec::new();
+                };
+                let symbol = &self.syms[*target as usize];
+                self.files[symbol.file as usize]
+                    .java
+                    .as_ref()
+                    .and_then(|java| java.return_receiver(&symbol.name, symbol.line))
+                    .map(|returned| self.java_array_element_classes(*target, returned, depth + 1))
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -2041,11 +3222,26 @@ impl Builder {
         let java = self.files[file as usize].java.as_ref()?;
         let owner = &self.syms[source as usize];
         let call = java.expression_call(&owner.name, owner.line, line, name)?;
-        let Some(call) = call else {
-            return Some(Err(DropReason::ReceiverUnresolved));
+        let calls = match call {
+            Some(call) => std::slice::from_ref(call),
+            None => java.expression_variants(&owner.name, owner.line, line, name),
         };
-        let classes = self.java_receiver_classes(source, &call.receiver, 0);
-        let targets = self.java_receiver_members(source, &classes, name, call.arguments);
+        let mut common = None;
+        for call in calls {
+            let classes = self.java_receiver_classes(source, &call.receiver, 0);
+            let mut targets = self.java_receiver_members(source, &classes, name, call.arguments);
+            targets.sort_unstable();
+            // An unindexed library call cannot erase a separate resolved call.
+            // Distinct indexed targets still exceed the row's line-only identity.
+            if targets.is_empty() {
+                continue;
+            }
+            if common.as_ref().is_some_and(|previous| *previous != targets) {
+                return Some(Err(DropReason::ReceiverUnresolved));
+            }
+            common = Some(targets);
+        }
+        let targets = common.unwrap_or_default();
         Some(match targets.len() {
             0 => Err(DropReason::ReceiverUnresolved),
             1 => {
@@ -2069,6 +3265,126 @@ impl Builder {
         context: Option<&str>,
     ) -> Result<Resolution, DropReason> {
         let node = &self.files[file as usize];
+        if let Some(Some(call)) = node
+            .java
+            .as_ref()
+            .and_then(|java| {
+                let owner = &self.syms[source as usize];
+                java.constructor_call(&owner.name, owner.line, line, name)
+            })
+            .filter(|call| {
+                matches!(
+                    call.as_ref().map(|call| call.receiver.as_str()),
+                    Some("this" | "super")
+                )
+            })
+        {
+            let classes: Vec<_> = self
+                .class_scope(source)
+                .into_iter()
+                .flat_map(|class| {
+                    if call.receiver == "this" {
+                        vec![class]
+                    } else {
+                        self.parents
+                            .get(&self.syms[class as usize].qual)
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                })
+                .collect();
+            let targets: Vec<_> = classes
+                .iter()
+                .flat_map(|class| {
+                    self.java_receiver_members(
+                        source,
+                        &[*class],
+                        &self.syms[*class as usize].name,
+                        call.arguments,
+                    )
+                })
+                .filter(|&target| {
+                    let symbol = &self.syms[target as usize];
+                    self.files[symbol.file as usize]
+                        .java
+                        .as_ref()
+                        .is_some_and(|java| java.is_constructor(&symbol.name, symbol.line))
+                })
+                .collect();
+            return match targets.len() {
+                0 => Err(DropReason::ReceiverUnresolved),
+                1 => Ok(Resolution::new(Confidence::Scoped, targets)),
+                _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
+            };
+        }
+        if let Some(Some(call)) = node.java.as_ref().and_then(|java| {
+            let owner = &self.syms[source as usize];
+            java.constructor_call(&owner.name, owner.line, line, name)
+        }) {
+            let classes =
+                self.resolve_java_type(source, self.namespace_of(source), &call.receiver, None);
+            if let [class] = classes.as_slice() {
+                let mut types = classes.clone();
+                let constructors: Vec<_> = self
+                    .java_receiver_members(
+                        source,
+                        &[*class],
+                        &self.syms[*class as usize].name,
+                        call.arguments,
+                    )
+                    .into_iter()
+                    .filter(|&target| {
+                        let symbol = &self.syms[target as usize];
+                        let owner = &self.syms[source as usize];
+                        self.files[symbol.file as usize]
+                            .java
+                            .as_ref()
+                            .is_some_and(|java| {
+                                node.java.as_ref().is_some_and(|call_java| {
+                                    if !java.is_constructor(&symbol.name, symbol.line) { return false; }
+                                    let compatible = java.constructor_parameters(&symbol.name, symbol.line)
+                                        .zip(call_java.creation_arguments(&owner.name, owner.line, line, name))
+                                        .is_none_or(|(parameters, arguments)| parameters.iter().zip(arguments).all(|(parameter, argument)| {
+                                            let Some(argument) = argument else { return true; };
+                                            if argument == "java::lang::String" {
+                                                if matches!(parameter.as_str(), "int" | "long" | "boolean" | "float" | "double" | "short" | "byte" | "char") {
+                                                    return false;
+                                                }
+                                                if parameter == "String" {
+                                                    return self.resolve_java_type(target, self.namespace_of(target), parameter, None).is_empty()
+                                                        && !java.imports.iter().any(|import| import.ends_with("::String") && import != "java::lang::String");
+                                                }
+                                            }
+                                            if matches!(argument.as_str(), "int" | "long" | "boolean")
+                                                && matches!(parameter.as_str(), "String" | "java::lang::String") {
+                                                return false;
+                                            }
+                                            true
+                                        }));
+                                    compatible && java.accepts_creation(
+                                        &symbol.name,
+                                        symbol.line,
+                                        call_java,
+                                        &owner.name,
+                                        owner.line,
+                                        line,
+                                    )
+                                })
+                            })
+                    })
+                    .collect();
+                if constructors.len() == 1 {
+                    types.extend(constructors);
+                }
+                types.sort_unstable();
+                types.dedup();
+                // A creation uses both its class and its selected constructor.
+                // These are two deterministic dependencies, not overload ambiguity.
+                if !types.is_empty() {
+                    return Ok(Resolution::new(Confidence::Scoped, types));
+                }
+            }
+        }
         if let Some(binding) = node
             .java
             .as_ref()
@@ -2138,7 +3454,12 @@ impl Builder {
         if let Some(resolution) = self.resolve_java_expression_call(file, source, name, line) {
             return resolution;
         }
-        let cands = self.candidates(name, node.family, file);
+        let mut cands = self.candidates(name, node.family, file);
+        if node.java.is_some() {
+            // Callable dependencies require invocation/reference syntax.
+            // A component field read must not invent a call to its getter.
+            cands.retain(|&candidate| self.syms[candidate as usize].kind != "function");
+        }
         if cands.iter().any(|&c| {
             let sym = &self.syms[c as usize];
             sym.file == file && sym.line == line
@@ -2675,6 +3996,12 @@ fn resolve_file(
     if file_node.vendor {
         return out;
     }
+    if let Some(java) = &file_node.java {
+        batch.extend(
+            java.constructor_aliases()
+                .map(|(name, line)| (name.to_owned(), line, None)),
+        );
+    }
     batch.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
     batch.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     for (name, line, context) in batch {
@@ -2683,10 +4010,27 @@ fn resolve_file(
             *out.dropped.entry(DropReason::NoOwner).or_default() += 1;
             continue;
         };
+        JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().clear());
         let outcome = builder
             .resolve_reference(file, source, &name, line, context.as_deref())
             .and_then(|mut resolution| {
                 let owner = &builder.syms[source as usize];
+                if let Some(java) = &file_node.java {
+                    let invocation = java
+                        .expression_call(&owner.name, owner.line, line, &name)
+                        .is_some()
+                        || java
+                            .bare_arguments(&owner.name, owner.line, line, &name)
+                            .is_some()
+                        || java
+                            .constructor_call(&owner.name, owner.line, line, &name)
+                            .is_some();
+                    if !invocation {
+                        resolution
+                            .targets
+                            .retain(|&target| builder.syms[target as usize].kind != "function");
+                    }
+                }
                 let recursive_java_call = owner.kind == "function"
                     && owner.name == name
                     && file_node.java.as_ref().is_some_and(|java| {
@@ -2706,6 +4050,7 @@ fn resolve_file(
                     Ok(resolution)
                 }
             });
+        JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().clear());
         match outcome {
             Err(reason) => *out.dropped.entry(reason).or_default() += 1,
             Ok(resolution) => {

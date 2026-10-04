@@ -135,7 +135,11 @@ public class JavaStructure {
                         emit("constructor", name, namePosition(tree, name, "\\s*[({]"), end(tree));
                     } else {
                         String name = tree.getName().toString();
-                        emit("method", name, namePosition(tree, name, "\\s*\\("), end(tree));
+                        boolean overrides = tree.getModifiers().getAnnotations().stream()
+                            .anyMatch(annotation -> List.of("Override", "java.lang.Override")
+                                .contains(annotation.getAnnotationType().toString()));
+                        emit("method", name, namePosition(tree, name, "\\s*\\("), end(tree),
+                            ",\"overrides\":" + overrides);
                     }
                     return super.visitMethod(tree, unused);
                 }
@@ -159,21 +163,54 @@ public class JavaStructure {
                     // javac synthesizes the enum type at constant constructor
                     // sites. A lexical reference must have an actual source token.
                     if (!name.equals("this") && !name.equals("super") && begin >= 0 && finish >= begin
-                        && source.substring(begin, finish).equals(name)) emit("usage", name, begin);
+                        && source.substring(begin, finish).equals(name)) emitUsage(tree, name, begin);
                     return super.visitIdentifier(tree, unused);
                 }
                 @Override public Void visitMemberSelect(MemberSelectTree tree, Void unused) {
                     String name = tree.getIdentifier().toString();
                     if (!name.equals("class") && !name.equals("this") && !name.equals("super"))
-                        emit("usage", name, end(tree) - name.length());
+                        emitUsage(tree, name, end(tree) - name.length());
                     return super.visitMemberSelect(tree, unused);
                 }
                 @Override public Void visitMemberReference(MemberReferenceTree tree, Void unused) {
                     if (tree.getMode() != MemberReferenceTree.ReferenceMode.NEW) {
                         String name = tree.getName().toString();
-                        emit("usage", name, end(tree) - name.length());
+                        emitUsage(tree, name, end(tree) - name.length());
                     }
                     return super.visitMemberReference(tree, unused);
+                }
+                void emitUsage(Tree tree, String name, int position) {
+                    TreePath parent = getCurrentPath().getParentPath();
+                    Tree reference = tree;
+                    while (parent != null && parent.getLeaf() instanceof ParameterizedTypeTree type
+                        && type.getType() == reference) {
+                        reference = parent.getLeaf();
+                        parent = parent.getParentPath();
+                    }
+                    String syntax = tree instanceof MemberReferenceTree ? "method_reference"
+                        : parent != null && parent.getLeaf() instanceof NewClassTree creation
+                          && creation.getIdentifier() == reference ? "constructor_call"
+                        : parent != null && parent.getLeaf() instanceof MemberReferenceTree member
+                          && member.getMode() == MemberReferenceTree.ReferenceMode.NEW
+                          && member.getQualifierExpression() == reference ? "constructor_reference"
+                        : parent != null && parent.getLeaf() instanceof MethodInvocationTree call
+                          && call.getMethodSelect() == tree ? "call" : "value";
+                    String extra = ",\"usage_kind\":" + quote(syntax);
+                    if (tree instanceof MemberReferenceTree) {
+                        int begin = start(tree);
+                        extra += ",\"reference_line\":" + unit.getLineMap().getLineNumber(begin)
+                            + ",\"reference_column\":" + (begin - source.lastIndexOf('\n', begin - 1));
+                    }
+                    emit("usage", name, position, position, extra);
+                }
+                @Override public Void visitMethodInvocation(MethodInvocationTree tree, Void unused) {
+                    if (tree.getMethodSelect() instanceof IdentifierTree identifier
+                        && (identifier.getName().contentEquals("this") || identifier.getName().contentEquals("super"))) {
+                        int position = start(identifier);
+                        emit("usage", identifier.getName().toString(), position, position,
+                            ",\"usage_kind\":\"constructor_call\"");
+                    }
+                    return super.visitMethodInvocation(tree, unused);
                 }
                 @Override public Void visitVariable(VariableTree tree, Void unused) {
                     if (getCurrentPath().getParentPath().getLeaf() instanceof ClassTree owner

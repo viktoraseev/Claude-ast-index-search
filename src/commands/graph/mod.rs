@@ -519,9 +519,45 @@ fn resolved_dependents_filtered(
         })
         .collect::<Result<_>>()?;
     let known: Vec<i64> = ids.iter().flatten().copied().collect();
-    let edges = db::load_symbol_edges_to(conn, &known, Confidence::Unique.code())?;
+    let edges = db::load_symbol_edges_to(
+        conn,
+        &known,
+        if include_self {
+            Confidence::Ambiguous.code()
+        } else {
+            Confidence::Unique.code()
+        },
+    )?;
+    let mut union_groups: HashMap<(i64, i64, u32), usize> = HashMap::new();
+    if include_self
+        && seeds
+            .iter()
+            .all(|seed| seed.kind == "function" && seed.path.ends_with(".java"))
+        && seeds
+            .first()
+            .is_some_and(|first| seeds.iter().all(|seed| seed.name == first.name))
+    {
+        for edge in &edges {
+            if edge.confidence == Confidence::Ambiguous.code() {
+                *union_groups
+                    .entry((edge.source_id, edge.line, edge.candidates))
+                    .or_default() += 1;
+            }
+        }
+    }
     let mut by_target: HashMap<i64, Vec<i64>> = HashMap::new();
     for edge in &edges {
+        // The CLI unions every declaration with this name. An unresolved
+        // overload still establishes a name-level caller only when its entire
+        // candidate set is inside that union; graph confidence stays ambiguous.
+        if edge.confidence == Confidence::Ambiguous.code()
+            && union_groups
+                .get(&(edge.source_id, edge.line, edge.candidates))
+                .copied()
+                != Some(edge.candidates as usize)
+        {
+            continue;
+        }
         if include_self || edge.source_id != edge.target_id {
             by_target
                 .entry(edge.target_id)

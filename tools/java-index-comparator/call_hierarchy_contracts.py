@@ -6,6 +6,7 @@ Source anchors schedule queries and normalize owner identities; native rows
 never supply expected edges. Deep traversal has separate pending contracts.
 """
 from pathlib import Path
+import json
 import re
 import subprocess
 
@@ -13,8 +14,9 @@ from common import McpRemoteError, ToolError, stable_id
 
 FEATURE = 'call-tree:mcp-direct-callers'
 FEATURES = {FEATURE}
-REASON = ('live MCP direct Java caller owners; union of all same-name JDK source '
-          'method/constructor/accessor anchors; not deep traversal or attached-root equivalence')
+REASON = ('live MCP direct Java caller owners; union of same-name JDK source method/constructor/accessor '
+          'anchors; exact selected-member references normalize overridden-method families and generated accessors; '
+          'not virtual-family, deep traversal or attached-root equivalence')
 CALLABLE_KINDS = {'method', 'constructor', 'accessor'}
 MAX_CALLERS = 100000
 
@@ -39,7 +41,7 @@ CREATE INDEX IF NOT EXISTS call_hierarchy_usage_path ON call_hierarchy_usage_anc
 '''
 
 
-def plan_methods(state, root, source_files, structure):
+def plan_methods(state, root, source_files, structure, *, schedule_checks=True):
     """File-sized parsing and disk-backed identity inventory, idempotent on resume."""
     for source in source_files:
         path = source['path']
@@ -55,6 +57,8 @@ def plan_methods(state, root, source_files, structure):
                  for entry in entries if entry['kind'] == 'usage'))
     with state:
         state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)', (FEATURE, 'implemented', REASON))
+        if not schedule_checks:
+            return
         for row in state.execute('SELECT DISTINCT name FROM call_hierarchy_anchors ORDER BY name'):
             name = row[0]
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
@@ -130,6 +134,7 @@ def accessor_response(fixture, check, anchor, page):
     Resolve a real source usage through MCP, and accept only its exact
     component anchor. A missing anchor remains unsupported, never empty truth.
     """
+    fixture._accessor_reference_anchors = {}
     positions = fixture.state.execute('''SELECT path,line,column FROM call_hierarchy_usage_anchors
         WHERE name=? ORDER BY path,line,column''', (anchor['name'],))
     for count, (path, line, column) in enumerate(positions):
@@ -156,8 +161,111 @@ def accessor_response(fixture, check, anchor, page):
         if selected_path.relative_to(fixture.root).as_posix() == anchor['path'] \
                 and selected.get('line') == anchor['line'] \
                 and selected.get('column') == anchor['column']:
+            fixture._accessor_reference_anchors = {
+                (anchor['name'], anchor['path'], anchor['line'], anchor['column']): (path, line, column)}
             return response, page
     raise UnsupportedHierarchy('implicit accessor has no successful exact MCP usage anchor')
+
+
+def callable_reference_owners(fixture, check, anchor):
+    """Exact MCP selected-callable references normalize hierarchy scope and omissions.
+    Bind the selected declaration, exhaust every page, and classify invocations
+    and their owners independently with JDK syntax.
+    """
+    constructor = anchor['kind'] == 'constructor'
+    method = anchor['kind'] == 'method'
+    usage_anchor = getattr(fixture, '_accessor_reference_anchors', {}).get(
+        (anchor['name'], anchor['path'], anchor['line'], anchor['column']))
+    reference_path, reference_line, reference_column = usage_anchor or (anchor['path'], anchor['line'], anchor['column'])
+    syntax_kinds = {'constructor_call', 'constructor_reference'} if constructor else {'call', 'method_reference'}
+    resolved_kinds = ({'constructor'} if constructor else {'method'} if method else
+                      {'method', 'record component'} if usage_anchor else {'record component'})
+    request = dict(project_path=str(fixture.root), file=reference_path, line=reference_line,
+                   column=reference_column, scope='project_files', includeGenerated=not (constructor or method), pageSize=500)
+    def reference_pages():
+        arguments, cursors, count = request, set(), 0
+        page = fixture.state.execute('SELECT coalesce(max(page)+1,0) FROM pages WHERE check_id=?',
+                                     (check['id'],)).fetchone()[0]
+        while True:
+            response = fixture.client.call('ide_find_references', arguments)
+            fixture.oracle_store.page(check['id'], page, 'ide_find_references', arguments, response)
+            page += 1
+            if not isinstance(response, dict) or any(response.get(flag) for flag in ('stale', 'truncated', 'incomplete')):
+                raise UnsupportedHierarchy('incomplete MCP component references')
+            if arguments is request:
+                resolved = response.get('resolvedSymbol', {})
+                if not isinstance(resolved, dict) or resolved.get('kind') not in resolved_kinds \
+                        or resolved.get('name') != anchor['name'] \
+                        or relative(resolved.get('file'), fixture.root) != anchor['path'] \
+                        or resolved.get('line') != anchor['line']:
+                    raise UnsupportedHierarchy('accessor references resolved a different component')
+            usages = response.get('usages', response.get('references'))
+            if not isinstance(usages, list) or any(not isinstance(usage, dict) for usage in usages):
+                raise UnsupportedHierarchy('unknown MCP component reference shape')
+            count += len(usages)
+            if count > MAX_CALLERS:
+                raise UnsupportedHierarchy('component references exceed bounded contract')
+            yield from usages
+            cursor = response.get('nextCursor')
+            if response.get('hasMore') and not cursor:
+                raise UnsupportedHierarchy('component references require a missing cursor')
+            if not cursor:
+                if response.get('totalIsExact') is not True:
+                    raise UnsupportedHierarchy('component reference total is not exact')
+                return
+            if not isinstance(cursor, str) or cursor in cursors or len(cursors) >= MAX_CALLERS:
+                raise UnsupportedHierarchy('component reference pagination is invalid or unbounded')
+            cursors.add(cursor)
+            arguments = dict(project_path=str(fixture.root), pageSize=500, cursor=cursor)
+    owners = set()
+    for usage in reference_pages():
+        reference_type = usage.get('type')
+        path = relative(usage.get('file'), fixture.root)
+        if not path.endswith('.java'):
+            continue
+        entries = fixture.structure(path)
+        if reference_type == 'REFERENCE':
+            reference_aliases = {entry.get('usage_kind') for entry in entries if entry['kind'] == 'usage'
+                                 and entry.get('usage_kind') == 'method_reference' and entry['name'] == anchor['name']
+                                 and entry.get('reference_line') == usage.get('line')
+                                 and entry.get('reference_column') == usage.get('column')}
+            positional_syntax = {entry.get('usage_kind') for entry in entries if entry['kind'] == 'usage'
+                                 and entry['line'] == usage.get('line') and entry['column'] == usage.get('column')}
+            # Component searches may include a constructor argument or pattern
+            # binding whose local name differs from the component's name.
+            if positional_syntax == {'value'} and not reference_aliases:
+                continue
+            syntax = {entry.get('usage_kind') for entry in entries if entry['kind'] == 'usage'
+                      and (constructor or entry['name'] == anchor['name']) and entry['line'] == usage.get('line')
+                      and entry['column'] == usage.get('column')}
+            if reference_aliases:
+                syntax = reference_aliases
+            if not syntax or not syntax <= syntax_kinds:
+                raise UnsupportedHierarchy('component reference lacks exact independent syntax classification')
+        elif reference_type not in {'METHOD_CALL', 'METHOD_REFERENCE'}:
+            # Component field reads do not call the generated getter.
+            if usage.get('type') in {'READ', 'WRITE', 'READ_WRITE'}:
+                continue
+            raise UnsupportedHierarchy('unknown component reference semantics')
+        line = usage.get('line')
+        if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+            raise UnsupportedHierarchy('invalid component usage line')
+        candidates = [entry for entry in entries
+                      if entry['kind'] in CALLABLE_KINDS and entry['line'] <= line <= entry['end_line']]
+        if not candidates:
+            candidates = [entry for entry in entries if entry['kind'] in {'property', 'constant'}
+                          and entry['line'] <= line <= entry['end_line']]
+        if not candidates:
+            raise UnsupportedHierarchy('accessor reference has no callable source owner')
+        span = min(entry['end_line'] - entry['line'] for entry in candidates)
+        identities = {(path, entry['line'], entry['name']) for entry in candidates
+                      if entry['end_line'] - entry['line'] == span}
+        if len(identities) != 1:
+            raise UnsupportedHierarchy('accessor reference has ambiguous callable source owner')
+        owners.update(identities)
+        if len(owners) > MAX_CALLERS:
+            raise UnsupportedHierarchy('selected-callable owner union exceeds bounded contract')
+    return owners
 
 
 def exercise(fixture, check):
@@ -165,6 +273,7 @@ def exercise(fixture, check):
         fixture.cli('graph', 'build')
         fixture._call_hierarchy_graph_ready = True
     expected, queries, declarations = set(), 0, 0
+    narrowed_overrides = 0
     for anchor in fixture.state.execute(
         'SELECT * FROM call_hierarchy_anchors WHERE name=? ORDER BY path,line,column,kind',
         (check['subject'],)):
@@ -172,7 +281,16 @@ def exercise(fixture, check):
                        column=anchor['column'], direction='callers', depth=1,
                        scope='project_files', includeGenerated=anchor['kind'] == 'accessor')
         if anchor['kind'] == 'accessor':
-            response, queries = accessor_response(fixture, check, anchor, queries)
+            try:
+                response, queries = accessor_response(fixture, check, anchor, queries)
+            except UnsupportedHierarchy:
+                expected.update(callable_reference_owners(fixture, check, anchor))
+                if len(expected) > MAX_CALLERS:
+                    raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
+                queries = fixture.state.execute('SELECT count(*) FROM pages WHERE check_id=?',
+                                                (check['id'],)).fetchone()[0]
+                declarations += 1
+                continue
         else:
             response = fixture.client.call('ide_call_hierarchy', request)
             fixture.oracle_store.page(check['id'], queries, 'ide_call_hierarchy', request, response)
@@ -188,16 +306,34 @@ def exercise(fixture, check):
             raise UnsupportedHierarchy('MCP selected a different call hierarchy declaration')
         if len(response['calls']) > MAX_CALLERS:
             raise UnsupportedHierarchy('MCP direct callers exceed bounded contract')
+        narrow_override = anchor['kind'] == 'method' and any(
+            entry['kind'] == 'method' and entry['name'] == anchor['name']
+            and entry['line'] == anchor['line'] and entry['column'] == anchor['column']
+            and entry.get('overrides') is True for entry in fixture.structure(anchor['path']))
         for node in response['calls']:
             if not isinstance(node, dict) or node.get('children'):
                 raise UnsupportedHierarchy('MCP direct caller node has unknown/deeper shape')
             identity = owner(fixture, node)
-            if identity is not None:
+            if identity is not None and not narrow_override:
                 expected.add(identity)
             if len(expected) > MAX_CALLERS:
                 raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
+        if anchor['kind'] in {'constructor', 'accessor'} or narrow_override:
+            expected.update(callable_reference_owners(fixture, check, anchor))
+            if len(expected) > MAX_CALLERS:
+                raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
+            queries = fixture.state.execute('SELECT count(*) FROM pages WHERE check_id=?',
+                                            (check['id'],)).fetchone()[0]
+            narrowed_overrides += int(narrow_override)
     if not declarations:
         raise UnsupportedHierarchy('call hierarchy check has no independently scheduled declarations')
     actual = native_callers(fixture, check)
-    return {'source': REASON, 'queries': queries, 'declarations': declarations, 'items': sorted(expected)}, \
+    reference_count = fixture.state.execute("SELECT count(*) FROM pages WHERE check_id=? AND tool='ide_find_references'",
+                                            (check['id'],)).fetchone()[0]
+    source = REASON if not reference_count else (REASON + '; MCP selected-callable '
+        'reference locations with independent JDK invocation classification and callable ownership; '
+        'supplements hierarchy, not call-hierarchy-only equivalence')
+    if narrowed_overrides:
+        source += '; overridden-method family hierarchy normalized to exact MCP selected-member references; not virtual-dispatch family equivalence'
+    return {'source': source, 'queries': queries, 'declarations': declarations, 'items': sorted(expected)}, \
            {'items': sorted(actual)}, expected, actual

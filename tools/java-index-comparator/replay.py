@@ -10,6 +10,7 @@ from build_index import build_ast_index, capture_binary, freeze_binary
 from common import StreamableHttpMcpClient, ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot, stable_id
 import mobile_contracts
 import text_snapshot
+import call_hierarchy_contracts
 
 
 class StoredOracle:
@@ -71,7 +72,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
     archive = None
     try:
         metadata = dict(source.execute("SELECT key,value FROM metadata"))
-        snapshot, _ = source_snapshot(root)
+        snapshot, source_files = source_snapshot(root)
         inventory_hash = mobile_contracts.inventory_snapshot(root)
         if str(root) != metadata.get("project_root") or snapshot != metadata.get("snapshot_sha256"):
             raise ToolError("replay target differs from the captured source snapshot")
@@ -118,6 +119,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
             refreshed = 0
             snapshot_copied = False
             fixture = None
+            hierarchy_ready = False
             has_text_snapshot = source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='text_snapshot_dependencies'").fetchone()
             for check in problem_batch(source, limit):
                 existing = state.execute("SELECT status FROM checks WHERE id=?", (check["id"],)).fetchone()
@@ -141,6 +143,10 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     fixture.batch_text = batch_text
                     if fixture._text_snapshot is not None:
                         fixture._text_snapshot.client = oracle
+                if check['feature'] in call_hierarchy_contracts.FEATURES and not hierarchy_ready:
+                    call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure,
+                                                          schedule_checks=False)
+                    hierarchy_ready = True
                 fixture.evaluate(check)
                 try:
                     oracle.assert_consumed()
@@ -153,7 +159,13 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     # beyond a formerly unsupported response. Recollect the same
                     # feature/subject live; retain the original evidence unchanged.
                     refreshed_oracle = ArchiveOracle(archive, check['id'], live) if archive is not None else live
-                    Fixture(root, binary, database, state, refreshed_oracle, schedule_followups=False).evaluate(check)
+                    refreshed_fixture = Fixture(root, binary, database, state, refreshed_oracle, schedule_followups=False)
+                    # The replay pins its source/index/binary for the whole batch.
+                    # Changing only the oracle must not rebuild the same graph.
+                    if check['feature'] in call_hierarchy_contracts.FEATURES \
+                            and getattr(fixture, '_call_hierarchy_graph_ready', False):
+                        refreshed_fixture._call_hierarchy_graph_ready = True
+                    refreshed_fixture.evaluate(check)
                     refreshed += 1
             if source_snapshot(root)[0] != snapshot or mobile_contracts.inventory_snapshot(root) != inventory_hash or file_sha256(binary) != binary_hash:
                 raise ToolError("sources or binary changed during replay; verification is invalid")

@@ -71,6 +71,44 @@ class ReplayTests(unittest.TestCase):
                                     (subject, subject, verdict))
         self.assertEqual([row["id"] for row in problem_batch(self.source, 1)], ["case", "unknown", "broken"])
 
+    def test_call_hierarchy_replay_replans_source_anchors_without_new_checks(self):
+        from common import stable_id
+        from audit import Fixture
+        import call_hierarchy_contracts
+        import json
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts/tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=artifacts) as directory:
+            root = Path(directory) / 'project'
+            root.mkdir()
+            (root / '.git').mkdir()
+            (root / 'A.java').write_text('class A {\n int leaf() { return 1; }\n int entry() { return leaf(); }\n}\n')
+            binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+            evidence = Path(directory) / 'evidence.sqlite'
+            state = connect(evidence)
+            try:
+                state.executescript(SCHEMA)
+                fixture = Fixture(root, binary, Path(directory) / 'index.sqlite', state, None)
+                fixture.text_cli('rebuild', '--force')
+                anchor = next(entry for entry in fixture.structure('A.java') if entry.get('name') == 'leaf')
+                with state:
+                    state.executemany('INSERT INTO metadata VALUES (?,?)', {
+                        'project_root': str(root), 'snapshot_sha256': source_snapshot(root)[0], 'audit_scope': 'java',
+                    }.items())
+                    state.execute("INSERT INTO checks(id,feature,subject,status,verdict) VALUES ('calls',?,'leaf','complete','fail')",
+                                  (call_hierarchy_contracts.FEATURE,))
+                    request = dict(project_path=str(root), file='A.java', line=anchor['line'], column=anchor['column'],
+                                   direction='callers', depth=1, scope='project_files', includeGenerated=False)
+                    response = {'element': {'file': 'A.java', 'line': anchor['line']},
+                                'calls': [{'file': 'A.java', 'line': 3, 'children': []}]}
+                    state.execute('INSERT INTO pages VALUES (?,?,?,?,?)',
+                                  ('calls', 0, canonical_json(request), canonical_json(response), 'ide_call_hierarchy'))
+            finally:
+                state.close()
+            result = replay(evidence, root, binary, Path(directory) / 'replays')
+            self.assertTrue(result['verified'], result['counts'])
+            self.assertEqual(result['counts'], {'pass': 1})
+
     def test_replay_executes_fixture_and_does_not_reuse_old_actual_results(self):
         output = self.directory / "replays"
         with patch("replay.build_ast_index"), patch("audit.Fixture.cli", return_value={"items": [{"name": "A", "path": "A.java", "line": 1}]}) as cli:

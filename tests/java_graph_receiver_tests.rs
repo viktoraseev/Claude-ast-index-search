@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
-fn run(root: &Path, cache: &Path, arguments: &[&str]) -> Output {
+fn command(root: &Path, cache: &Path, arguments: &[&str]) -> Command {
     let binary = std::env::var_os("AST_INDEX_TEST_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_ast-index")));
@@ -16,22 +16,328 @@ fn run(root: &Path, cache: &Path, arguments: &[&str]) -> Output {
             command.env_remove(key);
         }
     }
-    let output = command
+    command
         .current_dir(root)
         .env("AST_INDEX_ROOT", root)
         .env("AST_INDEX_CACHE_DIR", cache)
         .env("AST_INDEX_DISABLE_GC", "1")
         .env("AST_INDEX_THREADS", "2")
         .env("NO_COLOR", "1")
-        .args(arguments)
-        .output()
-        .unwrap();
+        .args(arguments);
+    command
+}
+
+fn run(root: &Path, cache: &Path, arguments: &[&str]) -> Output {
+    let output = command(root, cache, arguments).output().unwrap();
     assert!(
         output.status.success(),
         "Java graph fixture command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     output
+}
+
+#[test]
+fn graph_resolution_of_an_unknown_stream_pipeline_is_bounded() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let root = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    let pipeline = ".map(item -> item)".repeat(10);
+    fs::write(root.path().join("Probe.java"), format!(
+        "class Probe {{ void use(java.util.stream.Stream<String> values) {{ values{pipeline}.forEach(item -> item.toString()); }} }}"
+    )).unwrap();
+    run(root.path(), cache.path(), &["rebuild", "--force"]);
+    let stdout = fs::File::create(root.path().join("stdout.log")).unwrap();
+    let stderr = fs::File::create(root.path().join("stderr.log")).unwrap();
+    let mut child = command(root.path(), cache.path(), &["graph", "build"])
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("unknown Java stream pipeline exceeded bounded graph-resolution deadline");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn check_direct_callers(source: &str, query: &str, callers: &[(&str, usize)]) {
+    check_direct_callers_in_files(source, query, callers, &[]);
+}
+
+fn check_direct_callers_in_files(
+    source: &str,
+    query: &str,
+    callers: &[(&str, usize)],
+    extra: &[(&str, &str)],
+) {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(project.path().join("Probe.java"), source).unwrap();
+    for (path, content) in extra {
+        fs::write(project.path().join(path), content).unwrap();
+    }
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["call-tree", query, "--depth", "1"],
+    );
+    let mut expected = format!("Call tree for '{query}':\n  {query}\n");
+    for (name, line) in callers {
+        expected.push_str(&format!("    ← {name} (Probe.java:{line})\n"));
+    }
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+}
+
+#[test]
+fn constructor_invocations_survive_a_fresh_graph() {
+    check_direct_callers(
+        "class Item {\n Item(int value) {}\n}\nclass Probe {\n Item create() { return new Item(1); }\n}\n",
+        "Item", &[("create", 5)],
+    );
+}
+
+#[test]
+fn a_method_named_like_its_class_is_not_a_constructor() {
+    check_direct_callers(
+        "class Item {\n void Item() {}\n}\nclass Probe {\n Item create() { return new Item(); }\n java.util.function.Supplier<Item> reference() { return Item::new; }\n}\n",
+        "Item", &[],
+    );
+}
+
+#[test]
+fn implicit_record_accessor_return_type_binds_chained_calls() {
+    check_direct_callers(
+        "class Item {\n int leaf() { return 1; }\n}\nrecord Box(Item item) {}\nclass Probe {\n int read(Box box) { return box.item().leaf(); }\n}\n",
+        "leaf", &[("read", 6)],
+    );
+}
+
+#[test]
+fn lambda_capture_callers_keep_enclosing_method_ownership() {
+    check_direct_callers(
+        "class Item {\n int leaf() { return 1; }\n}\nclass Probe {\n Runnable use(Item value) { return () -> value.leaf(); }\n}\n",
+        "leaf", &[("use", 5)],
+    );
+}
+
+#[test]
+fn compact_record_constructors_use_component_arity() {
+    check_direct_callers(
+        "record Item(int value) {\n Item { if (value < 0) throw new IllegalArgumentException(); }\n}\nclass Probe {\n Item create() { return new Item(1); }\n}\n",
+        "Item", &[("create", 5)],
+    );
+}
+
+#[test]
+fn record_component_fields_bind_receiver_calls_without_calling_the_accessor() {
+    let source = "class Item {\n int leaf() { return 1; }\n}\nrecord Box(Item item) {\n int read() { return item.leaf(); }\n}\n";
+    check_direct_callers(source, "leaf", &[("read", 5)]);
+    check_direct_callers(source, "item", &[]);
+}
+
+#[test]
+fn a_qualified_field_read_cannot_call_a_same_name_method() {
+    check_direct_callers(
+        "class Item {\n static int value;\n static int value() { return 1; }\n}\nclass Probe {\n int read() { return Item.value; }\n}\n",
+        "value", &[],
+    );
+}
+
+#[test]
+fn lambda_value_reads_cannot_borrow_a_same_name_method() {
+    check_direct_callers_in_files(
+        "class Probe {\n boolean value() { return true; }\n void use() { java.util.List.of(true).forEach(value -> { if (value) {} }); }\n}\n",
+        "value", &[], &[("Item.java", "class Item { static boolean value; }\n")],
+    );
+}
+
+#[test]
+fn lombok_generated_getter_results_keep_the_declared_field_type() {
+    check_direct_callers(
+        "import lombok.Getter;\nclass Item {\n int leaf() { return 1; }\n}\n@Getter class Box {\n private Item item;\n}\nclass Probe {\n int read(Box box) { return box.getItem().leaf(); }\n}\n",
+        "leaf", &[("read", 9)],
+    );
+}
+
+#[test]
+fn unrelated_getter_annotations_and_explicit_overrides_cannot_invent_return_types() {
+    check_direct_callers(
+        "@interface Getter {}\nclass Item {\n public String toString() { return \"item\"; }\n}\n@Getter abstract class Box implements javax.swing.ComboBoxEditor {\n Item item;\n}\nclass Probe {\n String use(Box box) { return box.getItem().toString(); }\n}\n",
+        "toString", &[],
+    );
+    for annotation in ["@Getter", "@lombok.Getter"] {
+        check_direct_callers(
+            &format!("@interface Getter {{}}\nclass Item {{\n public String toString() {{ return \"item\"; }}\n}}\n{annotation} class Box {{\n Item item;\n Object getItem() {{ return null; }}\n}}\nclass Probe {{\n String use(Box box) {{ return box.getItem().toString(); }}\n}}\n"),
+            "toString", &[],
+        );
+    }
+}
+
+#[test]
+fn implicit_canonical_constructor_does_not_borrow_an_explicit_record_overload() {
+    check_direct_callers(
+        "record Item(String value) {\n Item(int value) { this(String.valueOf(value)); }\n}\nclass Probe {\n Item canonical() { return new Item(\"x\"); }\n Item overloaded() { return new Item(1); }\n}\n",
+        "Item", &[("overloaded", 6)],
+    );
+}
+
+#[test]
+fn constructor_delegation_and_references_have_callable_edges() {
+    check_direct_callers(
+        "class Item {\n Item(int value) {}\n}\nclass Child extends Item {\n Child() { super(1); }\n}\nclass Probe {\n java.util.function.IntFunction<Item> reference() { return Item::new; }\n}\n",
+        "Item", &[("Child", 5), ("reference", 8)],
+    );
+}
+
+#[test]
+fn name_only_call_tree_unions_overloads_without_resolving_the_graph_ambiguity() {
+    check_direct_callers(
+        "class Probe {\n int leaf(int value) { return value; }\n int leaf(String value) { return value.length(); }\n int use() { return leaf(1); }\n}\n",
+        "leaf", &[("use", 4)],
+    );
+}
+
+#[test]
+fn inferred_local_and_foreach_receivers_keep_their_declared_project_type() {
+    check_direct_callers(
+        "class Item {\n int leaf() { return 1; }\n}\nclass Probe {\n Item make() { return new Item(); }\n int inferred() { var item = make(); return item.leaf(); }\n int loop(java.util.List<Item> items) { for (Item item : items) return item.leaf(); return 0; }\n}\n",
+        "leaf", &[("inferred", 6), ("loop", 7)],
+    );
+}
+
+#[test]
+fn array_suffix_parameters_cannot_borrow_the_element_classes_method() {
+    check_direct_callers(
+        "class Item {\n public String toString() { return \"item\"; }\n}\nclass Probe {\n String use(Item values[]) { return values.toString(); }\n}\n",
+        "toString", &[],
+    );
+}
+
+#[test]
+fn java_collection_elements_and_stream_lambda_parameters_bind_real_callers() {
+    check_direct_callers(
+        "import java.util.List;\nclass Item {\n int leaf() { return 1; }\n}\nrecord Box(List<Item> items) {}\nclass Probe {\n int indexed(Box box) { return box.items().get(0).leaf(); }\n void streamed(Box box) { box.items().stream().filter(item -> item.leaf() > 0).forEach(item -> item.leaf()); }\n}\n",
+        "leaf", &[("indexed", 7), ("streamed", 8)],
+    );
+}
+
+#[test]
+fn a_project_collection_name_cannot_invent_a_library_element_type() {
+    check_direct_callers(
+        "class Item {\n public String toString() { return \"item\"; }\n}\nclass List<T> {\n Object get(int index) { return null; }\n}\nclass Probe {\n void use(List<Item> items) { items.get(0).toString(); }\n}\n",
+        "toString", &[],
+    );
+}
+
+#[test]
+fn enum_array_streams_bind_inferred_lambda_receivers() {
+    check_direct_callers(
+        "import java.util.Arrays;\nenum Item {\n ONE;\n int leaf() { return 1; }\n}\nclass Probe {\n void use() { Arrays.stream(Item.values()).forEach(item -> item.leaf()); }\n}\n",
+        "leaf", &[("use", 7)],
+    );
+}
+
+#[test]
+fn a_fresh_graph_retains_constructor_calls_from_field_initializers() {
+    check_direct_callers(
+        "class Item {\n Item() {}\n}\nclass Probe {\n final Item item = new Item();\n}\n",
+        "Item",
+        &[("item", 5)],
+    );
+}
+
+#[test]
+fn future_results_and_nested_fields_bind_their_source_declared_types() {
+    check_direct_callers(
+        "import java.util.concurrent.*;\nclass Item {\n int leaf() { return 1; }\n}\nclass Api {\n CompletableFuture<Item> fetch() { return CompletableFuture.completedFuture(new Item()); }\n Item item;\n}\nclass Probe {\n int future(Api api) { return api.fetch().join().leaf(); }\n int field(Api api) { return api.item.leaf(); }\n}\n",
+        "leaf", &[("future", 10), ("field", 11)],
+    );
+}
+
+#[test]
+fn generic_record_results_bind_the_receiver_type_argument() {
+    check_direct_callers(
+        "class Item {\n int leaf() { return 1; }\n}\nrecord Pair<L,R>(L left, R right) {}\nclass Probe {\n int use(Pair<String,Item> pair) { return pair.right().leaf(); }\n}\n",
+        "leaf", &[("use", 6)],
+    );
+}
+
+#[test]
+fn generic_record_returns_cannot_borrow_a_class_named_like_the_type_parameter() {
+    check_direct_callers(
+        "class T {\n public String toString() { return \"t\"; }\n}\nrecord Box<T>(T value) {}\nclass Probe {\n String use(Box<Object> box) { return box.value().toString(); }\n}\n",
+        "toString", &[],
+    );
+}
+
+#[test]
+fn optional_future_map_and_inferred_loop_elements_keep_their_declared_types() {
+    check_direct_callers(
+        "import java.util.*;\nimport java.util.concurrent.*;\nclass Item {\n int leaf() { return 1; }\n}\nclass Probe {\n void optional(Optional<Item> value) { value.ifPresent(item -> item.leaf()); }\n void future(CompletableFuture<Item> value) { value.thenAccept(item -> item.leaf()); }\n void map(Map<String,Item> values) { values.values().forEach(item -> item.leaf()); }\n int loop(List<Item> values) { for (var item : values) return item.leaf(); return 0; }\n}\n",
+        "leaf", &[("optional", 7), ("future", 8), ("map", 9), ("loop", 10)],
+    );
+}
+
+#[test]
+fn atomic_reference_get_returns_the_declared_element() {
+    check_direct_callers(
+        "import java.util.concurrent.atomic.*;\nclass Item {\n int leaf() { return 1; }\n}\nclass Probe {\n int use(AtomicReference<Item> value) { return value.get().leaf(); }\n}\n",
+        "leaf", &[("use", 6)],
+    );
+}
+
+#[test]
+fn superclass_and_bounded_type_parameter_calls_keep_the_declared_member() {
+    check_direct_callers(
+        "class Item {\n int leaf() { return 1; }\n}\nclass Probe extends Item {\n int inherited() { return super.leaf(); }\n <T extends Item> int bounded(T item) { return item.leaf(); }\n}\n",
+        "leaf", &[("inherited", 5), ("bounded", 6)],
+    );
+}
+
+#[test]
+fn future_callback_result_parameters_are_distinct_from_errors() {
+    check_direct_callers(
+        "import java.util.concurrent.CompletableFuture;\nclass Item {\n int leaf() { return 1; }\n}\nclass Probe {\n void use(CompletableFuture<Item> value) { value.whenComplete((item, error) -> item.leaf()); }\n void async(CompletableFuture<Item> value) { value.thenAcceptAsync(item -> item.leaf()); }\n}\n",
+        "leaf", &[("use", 6), ("async", 7)],
+    );
+    check_direct_callers(
+        "import java.util.concurrent.CompletableFuture;\nclass Item {\n public String toString() { return \"item\"; }\n}\nclass Probe {\n void use(CompletableFuture<Item> value) { value.whenComplete((item, error) -> error.toString()); }\n}\n",
+        "toString", &[],
+    );
+}
+
+#[test]
+fn nested_future_optional_and_map_entry_results_keep_element_types() {
+    check_direct_callers(
+        "import java.util.*;\nimport java.util.concurrent.*;\nclass Item {\n int leaf() { return 1; }\n}\nclass Probe {\n void future(CompletableFuture<List<Item>> value) { value.thenAccept(items -> items.forEach(item -> item.leaf())); }\n void optional(List<Item> items) { Optional.ofNullable(items).orElse(List.of()).stream().forEach(item -> item.leaf()); }\n void entries(Map<String,Item> items) { items.entrySet().stream().forEach(entry -> entry.getValue().leaf()); }\n int entry(Map.Entry<String,Item> item) { return item.getValue().leaf(); }\n}\n",
+        "leaf", &[("future", 7), ("optional", 8), ("entries", 9), ("entry", 10)],
+    );
+}
+
+#[test]
+fn same_line_chains_can_bind_when_every_expression_has_the_same_target() {
+    check_direct_callers(
+        "class Item {\n int leaf() { return 1; }\n}\nclass Box {\n Item first() { return null; }\n Item second() { return null; }\n}\nclass Probe {\n int use(Box box) { return box.first().leaf() + box.second().leaf(); }\n}\n",
+        "leaf", &[("use", 9)],
+    );
 }
 
 fn check_receiver(method: &str, expected_file: &str) {
@@ -740,5 +1046,212 @@ fn typed_record_receiver_keeps_only_its_accessor_function() {
         "record Rec(String getName) {}\nclass Probe {\n String library(Rec receiver) { return receiver.getName(); }\n}\n",
         "Probe.library",
         1,
+    );
+}
+
+#[test]
+fn enclosing_instance_fields_bind_nested_method_and_constructor_calls() {
+    check_direct_callers(
+        r#"class Item {
+ int leaf() { return 1; }
+}
+class Probe {
+ Item value;
+ class Nested {
+  Nested() { value.leaf(); }
+  int read() { return value.leaf(); }
+ }
+}
+"#,
+        "leaf",
+        &[("Nested", 7), ("read", 8)],
+    );
+}
+
+#[test]
+fn declared_function_input_binds_a_bare_invocation_lambda() {
+    check_direct_callers(
+        r#"class Item {
+ int leaf() { return 1; }
+}
+class Probe {
+ Item transform(java.util.function.Function<Item,Item> operation) { return null; }
+ Item read() { return transform(item -> { item.leaf(); return item; }); }
+}
+"#,
+        "leaf",
+        &[("read", 6)],
+    );
+}
+
+#[test]
+fn collectors_map_values_and_merge_inputs_keep_stream_element_types() {
+    check_direct_callers(
+        r#"import java.util.*;
+import java.util.stream.*;
+record Item(int key) { int leaf() { return 1; } }
+class Probe {
+ void collect(List<Item> items) {
+  var values = items.stream().collect(Collectors.toMap(Item::key, item -> item));
+  values.values().forEach(item -> item.leaf());
+ }
+ void merge(List<Item> items) {
+  items.stream().collect(Collectors.toMap(Item::key, item -> item, (left, right) -> { left.leaf(); return right; }));
+ }
+}
+"#,
+        "leaf",
+        &[("collect", 5), ("merge", 9)],
+    );
+}
+
+#[test]
+fn generated_getters_substitute_the_receivers_generic_argument() {
+    check_direct_callers(
+        r#"import lombok.Getter;
+record Item(int leaf) {}
+@Getter class Box<T> {
+ T value;
+}
+class Probe {
+ @Getter Box<Item> box;
+ int read() { return getBox().getValue().leaf(); }
+}
+"#,
+        "leaf",
+        &[("read", 8)],
+    );
+}
+
+#[test]
+fn enclosing_fields_cannot_cross_a_static_or_inherited_shadow_boundary() {
+    for declaration in ["static class Nested", "class Nested extends LibraryBase"] {
+        check_direct_callers(
+            &format!(
+                "class Item {{
+ int leaf() {{ return 1; }}
+}}
+class Probe {{
+ Item value;
+ {declaration} {{
+  int read() {{ return value.leaf(); }}
+ }}
+}}
+"
+            ),
+            "leaf",
+            &[],
+        );
+    }
+}
+
+#[test]
+fn an_external_same_name_call_does_not_erase_a_resolved_project_call_on_the_same_line() {
+    check_direct_callers(
+        r#"import java.util.Optional;
+class Item {
+ boolean isEmpty() { return false; }
+}
+class Probe {
+ boolean read(Optional<Item> value) { return value.isEmpty() || value.get().isEmpty(); }
+}
+"#,
+        "isEmpty",
+        &[("read", 6)],
+    );
+}
+
+#[test]
+fn switch_pattern_bindings_keep_the_record_receivers_type() {
+    check_direct_callers(
+        r#"record Item(int leaf) {}
+class Probe {
+ int read(Object value) { return switch (value) { case Item item -> item.leaf(); default -> 0; }; }
+}
+"#,
+        "leaf",
+        &[("read", 3)],
+    );
+}
+
+#[test]
+fn generated_getter_type_arguments_keep_their_declaring_nested_scope() {
+    check_direct_callers_in_files(
+        r#"class Probe {
+ int read(Holder holder) { return holder.getBox().getValue().leaf(); }
+}
+"#,
+        "leaf",
+        &[("read", 2)],
+        &[(
+            "Holder.java",
+            r#"import lombok.Getter;
+@Getter class Box<T> { T value; }
+@Getter class Holder {
+ record Item(int leaf) {}
+ Box<Item> box;
+}
+"#,
+        )],
+    );
+}
+
+#[test]
+fn map_for_each_keeps_key_and_value_callback_types_distinct() {
+    check_direct_callers(
+        r#"import java.util.Map;
+record Item(int leaf) {}
+class Probe {
+ void read(Map<String,Item> items) { items.forEach((key, value) -> value.leaf()); }
+ void wrong(Map<Item,String> items) { items.forEach((key, value) -> value.leaf()); }
+}
+"#,
+        "leaf",
+        &[("read", 4)],
+    );
+}
+
+#[test]
+fn future_stream_collectors_keep_mapped_value_types_in_map_callbacks() {
+    check_direct_callers(
+        r#"import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.*;
+record Item(int leaf) {}
+record Input(Item item) {}
+class Probe {
+ CompletableFuture<List<Input>> load() { return null; }
+ void read() {
+  load().thenApply(inputs -> {
+   var values = inputs.stream().collect(Collectors.toMap(input -> new Item(0), Input::item));
+   values.forEach((key, value) -> value.leaf());
+   return values;
+  });
+ }
+}
+"#,
+        "leaf",
+        &[("read", 8)],
+    );
+}
+
+#[test]
+fn map_collector_static_factory_references_keep_the_returned_record_type() {
+    check_direct_callers(
+        r#"import java.util.*;
+import java.util.stream.*;
+record Input(int key) {}
+record Item(int leaf) {
+ static Item from(Input input) { return new Item(input.key()); }
+}
+class Probe {
+ void read(List<Input> inputs) {
+  var values = inputs.stream().collect(Collectors.toMap(Input::key, Item::from));
+  values.forEach((key, value) -> value.leaf());
+ }
+}
+"#,
+        "leaf",
+        &[("read", 8)],
     );
 }
