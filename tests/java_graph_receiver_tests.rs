@@ -224,6 +224,164 @@ fn check_direct_callers(source: &str, query: &str, callers: &[(&str, usize)]) {
     check_direct_callers_in_files(source, query, callers, &[]);
 }
 
+#[test]
+fn enum_method_references_use_functional_arity_before_overload_union() {
+    check_direct_callers(
+        r#"import java.util.function.*;
+record Item(int leaf) {
+ int leaf(int left, int right) { return left + right; }
+ int direct() { return leaf(1, 2); }
+}
+enum Probe {
+ GET(Item::leaf);
+ Probe(ToIntFunction<Item> callback) {}
+}
+"#,
+        "leaf",
+        &[("direct", 4), ("GET", 7)],
+    );
+    check_direct_callers(
+        r#"import java.util.function.*;
+import lombok.Getter;
+@Getter class Item {
+ private int value;
+ int getValue(int left, int right) { return left + right; }
+ int direct() { return getValue(1, 2); }
+}
+enum Probe {
+ GET(Item::getValue);
+ Probe(ToIntFunction<Item> callback) {}
+}
+"#,
+        "getValue",
+        &[("direct", 6)],
+    );
+    check_direct_callers(
+        r#"import java.util.function.*;
+import java.util.List;
+import lombok.Getter;
+@Getter class Item {
+ private List<String> value;
+ static List<String> getValue(List<Item> items) { return List.of(); }
+ List<String> direct(List<Item> items) { return getValue(items); }
+}
+enum Probe {
+ GET(Item::getValue);
+ Probe(Function<Item,List<String>> callback) {}
+}
+"#,
+        "getValue",
+        &[("direct", 7)],
+    );
+}
+
+#[test]
+fn contextual_method_references_keep_bound_unbound_and_static_overloads() {
+    check_direct_callers(
+        r#"import java.util.function.*;
+class Item {
+ int leaf() { return 0; }
+ int leaf(int value) { return value; }
+ static int leaf(int left, int right) { return left + right; }
+}
+class Probe {
+ ToIntFunction<Item> unbound = Item::leaf;
+ IntSupplier bound = new Item()::leaf;
+ IntBinaryOperator staticCall = Item::leaf;
+}
+"#,
+        "leaf",
+        &[("unbound", 8), ("bound", 9), ("staticCall", 10)],
+    );
+}
+
+#[test]
+fn method_reference_edges_select_compatible_overload_lines() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(
+        project.path().join("Probe.java"),
+        r#"import java.util.function.*;
+record Item(int leaf) {
+ int leaf(int value) { return value; }
+ static int staticLeaf(int left, int right) { return left + right; }
+}
+enum Probe {
+ GET(Item::leaf),
+ ONE(Item::leaf, true);
+ Probe(ToIntFunction<Item> callback) {}
+ Probe(ToIntBiFunction<Item,Integer> callback, boolean other) {}
+}
+class Use {
+ IntSupplier bound = new Item(0)::leaf;
+ ToIntFunction<Item> unbound = Item::leaf;
+ IntBinaryOperator staticCall = Item::staticLeaf;
+ ToIntFunction<Item> returned() { return Item::leaf; }
+ Object cast = (ToIntFunction<Item>) Item::leaf;
+}
+"#,
+    )
+    .unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    for (owner, name, line) in [
+        ("GET", "leaf", 2),
+        ("ONE", "leaf", 3),
+        ("bound", "leaf", 2),
+        ("unbound", "leaf", 2),
+        ("staticCall", "staticLeaf", 4),
+        ("returned", "leaf", 2),
+        ("cast", "leaf", 2),
+    ] {
+        let output = run(
+            project.path(),
+            cache.path(),
+            &[
+                "--format",
+                "json",
+                "graph",
+                "dependencies",
+                owner,
+                "--include-ambiguous",
+            ],
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let targets: Vec<_> = report["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["other"]["name"] == name)
+            .map(|item| {
+                (
+                    item["other"]["line"].as_u64().unwrap(),
+                    item["confidence"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(targets, [(line, "local")], "{owner}: {report:#}");
+    }
+}
+
+#[test]
+fn a_project_functional_interface_cannot_be_narrowed_as_a_jdk_interface() {
+    check_direct_callers(
+        r#"interface ToIntFunction<T> { int apply(T item, int left, int right); }
+class Item {
+ int leaf(int left, int right) { return left + right; }
+}
+enum Probe {
+ GET(Item::leaf);
+ Probe(ToIntFunction<Item> callback) {}
+}
+"#,
+        "leaf",
+        &[("GET", 6)],
+    );
+}
+
 fn check_direct_callers_in_files(
     source: &str,
     query: &str,

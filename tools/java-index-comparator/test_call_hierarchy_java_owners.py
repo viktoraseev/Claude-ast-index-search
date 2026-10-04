@@ -68,6 +68,37 @@ class JavaCallerOwnerTests(unittest.TestCase):
         self.assertEqual(json.loads(result['expected_json'])['items'],
                          [['Probe.java', 2, 'FIRST'], ['Probe.java', 3, 'SECOND']])
 
+    def test_generated_getter_reference_cannot_call_a_different_source_overload(self):
+        (self.root / 'Probe.java').write_text('import lombok.Getter;\n'
+            'import java.util.function.ToIntFunction;\n'
+            '@Getter class Probe {\n private int value;\n'
+            ' int getValue(int left, int right) { return left + right; }\n'
+            ' int direct() { return getValue(1, 2); }\n}\n'
+            'enum Use {\n GET(Probe::getValue);\n'
+            ' Use(ToIntFunction<Probe> callback) {}\n}\n')
+        self.fixture.text_cli('rebuild', '--force')
+        self.plan()
+        def response(tool, request):
+            if tool == 'ide_call_hierarchy':
+                return {'element': {'file': 'Probe.java', 'line': 5},
+                        'calls': [{'file': 'Probe.java', 'line': 6, 'children': []}]}
+            self.assertEqual(tool, 'ide_find_references')
+            return {'resolvedSymbol': {'kind': 'method', 'name': 'getValue',
+                                      'file': 'Probe.java', 'line': 5},
+                    'usages': [{'file': 'Probe.java', 'line': 6, 'type': 'METHOD_CALL'}],
+                    'totalIsExact': True, 'hasMore': False}
+        self.oracle.call.side_effect = response
+        result = self.check_name('getValue')
+        self.assertEqual(result['verdict'], 'pass', result['error'])
+        self.assertEqual(json.loads(result['actual_json'])['items'], [['Probe.java', 6, 'direct']])
+        # This remains applicable even though its generated overload has no
+        # independent source method anchor. Missing the real caller must fail.
+        self.assertEqual(self.state.execute('SELECT status FROM coverage WHERE feature=?',
+                                           (contracts.FEATURE,)).fetchone()[0], 'implemented')
+        from unittest.mock import patch
+        with patch.object(contracts, 'native_callers', return_value=set()):
+            self.assertEqual(self.check_name('getValue')['verdict'], 'fail')
+
 
 if __name__ == '__main__':
     unittest.main()

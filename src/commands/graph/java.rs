@@ -38,6 +38,7 @@ pub(super) struct JavaSource {
     constructors: HashMap<(String, i64, i64, String), Option<ConstructorCall>>,
     constructor_types: HashMap<(String, i64), Vec<String>>,
     callback_parameters: HashMap<(String, i64), Vec<Option<JavaReceiver>>>,
+    reference_parameters: HashMap<(String, i64), Vec<Option<JavaReceiver>>>,
     static_methods: HashSet<(String, i64)>,
     constructor_declarations: HashSet<(String, i64)>,
     canonical_types: HashMap<String, Vec<String>>,
@@ -106,6 +107,8 @@ pub(super) struct ExpressionCall {
     pub receiver: JavaReceiver,
     /// A method reference has no invocation argument list.
     pub arguments: Option<usize>,
+    pub reference_context: Option<JavaReceiver>,
+    pub reference_is_type: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -695,6 +698,82 @@ fn argument_count(node: Node<'_>) -> Option<usize> {
         .filter(|argument| !argument.is_extra())
         .count();
     Some(count)
+}
+
+/// Check explicit target types without guessing an overloaded invocation's SAM.
+fn method_reference_context(node: Node<'_>, source: &str) -> Option<JavaReceiver> {
+    let mut expression = node;
+    loop {
+        let parent = expression.parent()?;
+        match parent.kind() {
+            "parenthesized_expression" => expression = parent,
+            "variable_declarator" => {
+                let declaration = parent.parent()?;
+                let ty = declaration.child_by_field_name("type")?;
+                return generic_receiver(ty, declaration, source)
+                    .or_else(|| type_name(ty, source).map(JavaReceiver::Type));
+            }
+            "cast_expression" => {
+                let ty = parent.child_by_field_name("type")?;
+                return generic_receiver(ty, parent, source)
+                    .or_else(|| type_name(ty, source).map(JavaReceiver::Type));
+            }
+            "return_statement" => {
+                let owner = callable(parent)?;
+                let ty = owner.child_by_field_name("type")?;
+                return generic_receiver(ty, owner, source)
+                    .or_else(|| type_name(ty, source).map(JavaReceiver::Type));
+            }
+            "argument_list" => {
+                let constant = parent.parent()?;
+                if constant.kind() != "enum_constant" {
+                    return None;
+                }
+                let mut cursor = parent.walk();
+                let arguments: Vec<_> = parent
+                    .named_children(&mut cursor)
+                    .filter(|child| !child.is_extra())
+                    .collect();
+                let index = arguments
+                    .iter()
+                    .position(|child| child.id() == expression.id())?;
+                let body = constant.parent()?;
+                let mut cursor = body.walk();
+                let mut context = None;
+                for constructor in body
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "enum_body_declarations")
+                    .flat_map(|declarations| {
+                        let mut cursor = declarations.walk();
+                        declarations.named_children(&mut cursor).collect::<Vec<_>>()
+                    })
+                    .filter(|child| child.kind() == "constructor_declaration")
+                {
+                    let parameters = constructor.child_by_field_name("parameters")?;
+                    let mut cursor = parameters.walk();
+                    let parameters: Vec<_> = parameters
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "formal_parameter")
+                        .collect();
+                    if parameters.len() != arguments.len() {
+                        continue;
+                    }
+                    let ty = parameters[index].child_by_field_name("type")?;
+                    let candidate = generic_receiver(ty, constructor, source)
+                        .or_else(|| type_name(ty, source).map(JavaReceiver::Type))?;
+                    if context
+                        .as_ref()
+                        .is_some_and(|previous| *previous != candidate)
+                    {
+                        return None;
+                    }
+                    context = Some(candidate);
+                }
+                return context;
+            }
+            _ => return None,
+        }
+    }
 }
 
 fn class_literal_arguments(node: Node<'_>, source: &str) -> Vec<Option<String>> {
@@ -2011,6 +2090,20 @@ impl JavaSource {
                         result.static_methods.insert(key.clone());
                     }
                     let mut cursor = parameters.walk();
+                    result.reference_parameters.insert(
+                        key.clone(),
+                        parameters
+                            .named_children(&mut cursor)
+                            .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
+                            .map(|p| {
+                                p.child_by_field_name("type").and_then(|ty| {
+                                    generic_receiver_at(ty, node, source, 0, true)
+                                        .or_else(|| type_name(ty, source).map(JavaReceiver::Type))
+                                })
+                            })
+                            .collect(),
+                    );
+                    let mut cursor = parameters.walk();
                     result.callback_parameters.insert(
                         key.clone(),
                         parameters
@@ -2216,6 +2309,30 @@ impl JavaSource {
                     } else {
                         argument_count(node)
                     },
+                    reference_context: reference
+                        .then(|| method_reference_context(node, source))
+                        .flatten(),
+                    reference_is_type: reference
+                        && (matches!(
+                            object.kind(),
+                            "type_identifier" | "scoped_type_identifier" | "generic_type"
+                        ) || (object.kind() == "identifier"
+                            && variable_type(
+                                object,
+                                text(object, source),
+                                false,
+                                &scopes,
+                                source,
+                            )
+                            .is_none()
+                            && variable_inferred(
+                                object,
+                                text(object, source),
+                                false,
+                                &scopes,
+                                source,
+                            )
+                            .is_none())),
                 });
                 if let Some(call) = &call {
                     let variants = result.expression_variants.entry(key.clone()).or_default();
@@ -2400,6 +2517,18 @@ impl JavaSource {
 
     pub fn callback_parameter(&self, name: &str, line: i64, index: usize) -> Option<&JavaReceiver> {
         self.callback_parameters
+            .get(&(name.to_owned(), line))?
+            .get(index)?
+            .as_ref()
+    }
+
+    pub fn reference_parameter(
+        &self,
+        name: &str,
+        line: i64,
+        index: usize,
+    ) -> Option<&JavaReceiver> {
+        self.reference_parameters
             .get(&(name.to_owned(), line))?
             .get(index)?
             .as_ref()

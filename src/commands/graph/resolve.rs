@@ -3444,6 +3444,41 @@ impl Builder {
         for call in calls {
             let classes = self.java_receiver_classes(source, &call.receiver, 0);
             let mut targets = self.java_receiver_members(source, &classes, name, call.arguments);
+            if let Some(context) = &call.reference_context {
+                if let Some(inputs) = self.java_functional_arity(source, context) {
+                    targets.retain(|&target| {
+                        let symbol = &self.syms[target as usize];
+                        let Some(java) = &self.files[symbol.file as usize].java else {
+                            return false;
+                        };
+                        let unbound = call.reference_is_type
+                            && !java.is_static_method(&symbol.name, symbol.line);
+                        inputs
+                            .checked_sub(usize::from(unbound))
+                            .is_some_and(|arguments| {
+                                java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                                    && (0..arguments).all(|index| {
+                                        let Some(input) = Self::java_functional_input(
+                                            context,
+                                            index + usize::from(unbound),
+                                        ) else {
+                                            return true;
+                                        };
+                                        let Some(parameter) = java.reference_parameter(
+                                            &symbol.name,
+                                            symbol.line,
+                                            index,
+                                        ) else {
+                                            return true;
+                                        };
+                                        self.java_reference_input_compatible(
+                                            source, input, target, parameter,
+                                        )
+                                    })
+                            })
+                    });
+                }
+            }
             targets.sort_unstable();
             // An unindexed library call cannot erase a separate resolved call.
             // Distinct indexed targets still exceed the row's line-only identity.
@@ -3468,6 +3503,110 @@ impl Builder {
             }
             _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
         })
+    }
+
+    /// Check negative assignability only when a source class has no parents.
+    /// Unknown library ancestry, generic bounds and boxing stay unresolved.
+    fn java_reference_input_compatible(
+        &self,
+        source: u32,
+        input: &JavaReceiver,
+        target: u32,
+        parameter: &JavaReceiver,
+    ) -> bool {
+        let input_classes = self.java_receiver_classes(source, input, 0);
+        let [input_class] = input_classes.as_slice() else {
+            return true;
+        };
+        let input_symbol = &self.syms[*input_class as usize];
+        let no_parents = input_symbol.kind == "class"
+            && self.files[input_symbol.file as usize]
+                .java
+                .as_ref()
+                .and_then(|java| java.parent_types(&input_symbol.name, input_symbol.line))
+                .is_some_and(|parents| parents.is_empty());
+        if !no_parents {
+            return true;
+        }
+        let parameter_classes = self.java_receiver_classes(target, parameter, 0);
+        if !parameter_classes.is_empty() {
+            return parameter_classes.contains(input_class)
+                || parameter_classes
+                    .iter()
+                    .any(|&class| self.syms[class as usize].qual == "java::lang::Object");
+        }
+        // A parentless project class cannot be a JDK collection. This avoids
+        // attaching an instance getter reference to a static List overload.
+        self.java_collection_kind(target, parameter, 0).is_none()
+    }
+
+    fn java_functional_input(context: &JavaReceiver, index: usize) -> Option<&JavaReceiver> {
+        let JavaReceiver::Parameterized { path, arguments } = context else {
+            return None;
+        };
+        let name = path.rsplit("::").next()?;
+        let generic_index = match name {
+            "BinaryOperator" => 0,
+            "Function" | "Consumer" | "Predicate" | "UnaryOperator" | "ToIntFunction"
+            | "ToLongFunction" | "ToDoubleFunction" | "BiFunction" | "BiConsumer"
+            | "BiPredicate" | "ToIntBiFunction" | "ToLongBiFunction" | "ToDoubleBiFunction" => {
+                index
+            }
+            "ObjIntConsumer" | "ObjLongConsumer" | "ObjDoubleConsumer" if index == 0 => 0,
+            // Primitive-specialized functions carry only a generic result type.
+            _ => return None,
+        };
+        arguments.get(generic_index)?.as_ref()
+    }
+
+    fn java_functional_arity(&self, source: u32, context: &JavaReceiver) -> Option<usize> {
+        let path = match context {
+            JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => path,
+            _ => return None,
+        };
+        let name = path.rsplit("::").next()?;
+        let inputs = match name {
+            "Supplier" | "IntSupplier" | "LongSupplier" | "DoubleSupplier" | "BooleanSupplier" => 0,
+            "Function"
+            | "Consumer"
+            | "Predicate"
+            | "UnaryOperator"
+            | "ToIntFunction"
+            | "ToLongFunction"
+            | "ToDoubleFunction"
+            | "IntFunction"
+            | "LongFunction"
+            | "DoubleFunction"
+            | "IntConsumer"
+            | "LongConsumer"
+            | "DoubleConsumer"
+            | "IntPredicate"
+            | "LongPredicate"
+            | "DoublePredicate"
+            | "IntUnaryOperator"
+            | "LongUnaryOperator"
+            | "DoubleUnaryOperator" => 1,
+            "BiFunction"
+            | "BiConsumer"
+            | "BiPredicate"
+            | "BinaryOperator"
+            | "ToIntBiFunction"
+            | "ToLongBiFunction"
+            | "ToDoubleBiFunction"
+            | "IntBinaryOperator"
+            | "LongBinaryOperator"
+            | "DoubleBinaryOperator"
+            | "ObjIntConsumer"
+            | "ObjLongConsumer"
+            | "ObjDoubleConsumer" => 2,
+            _ => return None,
+        };
+        self.java_is_factory(
+            source,
+            &JavaReceiver::Type(path.clone()),
+            &format!("java::util::function::{name}"),
+        )
+        .then_some(inputs)
     }
 
     fn resolve_reference(
