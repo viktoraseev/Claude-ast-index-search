@@ -98,6 +98,88 @@ fn local_receiver_uses_its_declared_type_instead_of_same_name_methods() {
     check_receiver("fixture.B.useLocal", "A.java");
 }
 
+#[test]
+fn bare_call_confidence_keeps_local_and_cross_file_inherited_edges_distinct() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(
+        project.path().join("Base.java"),
+        "class Base {\n int inherited() { return 1; }\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.path().join("Probe.java"),
+        r#"class Probe extends Base {
+ int leaf() { return 1; }
+ int leaf(int value) { return value; }
+ int left() { return leaf(); }
+ int right() { return leaf(); }
+ int entry() { return left() + right(); }
+ int external() { return inherited(); }
+ class Inner {
+  int enclosing() { return leaf(); }
+ }
+}
+"#,
+    )
+    .unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    for (seed, target, path, line, confidence) in [
+        ("Probe.left", "leaf", "Probe.java", 2, "local"),
+        ("Probe.Inner.enclosing", "leaf", "Probe.java", 2, "local"),
+        ("Probe.external", "inherited", "Base.java", 2, "scoped"),
+    ] {
+        let output = run(
+            project.path(),
+            cache.path(),
+            &["--format", "json", "graph", "dependencies", seed],
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rows = report["items"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{seed}");
+        assert_eq!(rows[0]["other"]["name"], target);
+        assert_eq!(rows[0]["other"]["path"], path);
+        assert_eq!(rows[0]["other"]["line"], line);
+        assert_eq!(rows[0]["confidence"], confidence, "{seed}");
+    }
+    for (start, end) in [("Probe.entry", "Probe.leaf"), ("Probe.leaf", "Probe.entry")] {
+        for cap in ["0", "1", "3"] {
+            let output = run(
+                project.path(),
+                cache.path(),
+                &[
+                    "--format",
+                    "json",
+                    "graph",
+                    "path",
+                    start,
+                    end,
+                    "--max-paths",
+                    cap,
+                ],
+            );
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["shortest_paths"], 2);
+            assert_eq!(report["pagination"]["total"], 2);
+            let rows = report["items"].as_array().unwrap();
+            assert_eq!(rows.len(), cap.parse::<usize>().unwrap().min(2));
+            for row in rows {
+                let hops = row.as_array().unwrap();
+                assert_eq!(hops.len(), 3);
+                assert_eq!(hops[0]["symbol"]["name"], "entry");
+                assert_eq!(hops[0]["edge"], "local");
+                assert_eq!(hops[1]["edge"], "local");
+                assert_eq!(hops[2]["symbol"]["name"], "leaf");
+                assert!(hops[2].get("edge").is_none());
+            }
+        }
+    }
+}
+
 fn check_imported_receiver(imports: &str, declared: &str) {
     check_imported_receiver_arguments(imports, declared, "");
 }
@@ -453,4 +535,184 @@ fn own_member_shadows_an_external_static_import() {
         &["Probe.java"],
         " static Object identity() { return null; }\n",
     );
+}
+
+fn check_bare_receiver_scope(same_file: bool, superclass: &str, expected: &[&str]) {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    let decoy = "class Decoy {\n String getName() { return \"project\"; }\n}\n";
+    let probe = format!(
+        "class Probe extends {superclass} {{\n String library() {{ return getName(); }}\n}}\n"
+    );
+    fs::write(
+        project.path().join("Probe.java"),
+        if same_file {
+            format!("{decoy}{probe}")
+        } else {
+            probe
+        },
+    )
+    .unwrap();
+    if !same_file {
+        fs::write(project.path().join("Decoy.java"), decoy).unwrap();
+    }
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["--format", "json", "graph", "dependencies", "Probe.library"],
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual: Vec<_> = document["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["other"]["name"] == "getName")
+        .map(|row| row["other"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn bare_external_inherited_call_does_not_borrow_another_files_method() {
+    check_bare_receiver_scope(false, "Thread", &[]);
+}
+
+#[test]
+fn bare_external_inherited_call_does_not_borrow_a_sibling_class_method() {
+    check_bare_receiver_scope(true, "Thread", &[]);
+}
+
+#[test]
+fn bare_project_inherited_call_keeps_its_real_member() {
+    check_bare_receiver_scope(false, "Decoy", &["Decoy.java"]);
+}
+
+fn check_bare_scope_source(source: &str, seed: &str, expected_line: u64) {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(project.path().join("Probe.java"), source).unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["--format", "json", "graph", "dependencies", seed],
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual: Vec<_> = document["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["other"]["name"] == "getName")
+        .map(|row| {
+            (
+                row["other"]["path"].as_str().unwrap(),
+                row["other"]["line"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(actual, [("Probe.java", expected_line)]);
+}
+
+#[test]
+fn bare_call_keeps_its_enclosing_classes_member() {
+    check_bare_scope_source("class Outer {\n String getName() { return \"outer\"; }\n class Inner {\n  String library() { return getName(); }\n }\n}\n", "Outer.Inner.library", 2);
+}
+
+#[test]
+fn bare_call_keeps_its_implicit_record_accessor() {
+    check_bare_scope_source(
+        "record Probe(String getName) {\n String library() { return getName(); }\n}\n",
+        "Probe.library",
+        1,
+    );
+}
+
+#[test]
+fn bare_call_keeps_its_explicit_record_accessor() {
+    check_bare_scope_source(
+        "record Probe(String getName) {\n public String getName() { return getName; }\n String library() { return getName(); }\n}\n",
+        "Probe.library",
+        2,
+    );
+}
+
+#[test]
+fn bare_call_keeps_implicit_record_accessor_beside_parameterized_overload() {
+    check_bare_scope_source(
+        "record Probe(String getName) {\n String getName(String suffix) { return getName + suffix; }\n String library() { return getName(); }\n}\n",
+        "Probe.library",
+        1,
+    );
+}
+
+fn check_expression_receiver(source: &str, expected: &[&str]) {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(
+        project.path().join("Decoy.java"),
+        "class Decoy {\n String getName() { return \"project\"; }\n}\n",
+    )
+    .unwrap();
+    fs::write(project.path().join("Probe.java"), source).unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["--format", "json", "graph", "dependencies", "Probe.use"],
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual: Vec<_> = report["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["other"]["name"] == "getName")
+        .map(|row| row["other"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn chained_external_call_does_not_borrow_a_project_method() {
+    check_expression_receiver(
+        "class Probe {\n String use() { return Thread.currentThread().getName(); }\n}\n",
+        &[],
+    );
+}
+
+#[test]
+fn external_bound_method_reference_does_not_borrow_a_project_method() {
+    check_expression_receiver("class Probe {\n java.util.function.Supplier<String> use(Thread receiver) { return receiver::getName; }\n}\n", &[]);
+}
+
+#[test]
+fn chained_project_factory_keeps_its_real_member() {
+    check_expression_receiver("class Probe {\n Decoy make() { return new Decoy(); }\n String use() { return make().getName(); }\n}\n", &["Decoy.java"]);
+}
+
+#[test]
+fn chained_project_static_factory_keeps_its_real_member() {
+    check_expression_receiver("class Provider {\n static Decoy make() { return new Decoy(); }\n}\nclass Probe {\n String use() { return Provider.make().getName(); }\n}\n", &["Decoy.java"]);
+}
+
+#[test]
+fn project_bound_method_reference_keeps_its_real_member() {
+    check_expression_receiver("class Probe {\n java.util.function.Supplier<String> use(Decoy receiver) { return receiver::getName; }\n}\n", &["Decoy.java"]);
+}
+
+#[test]
+fn project_unbound_method_reference_keeps_its_real_member() {
+    check_expression_receiver("class Probe {\n java.util.function.Function<Decoy,String> use() { return Decoy::getName; }\n}\n", &["Decoy.java"]);
 }

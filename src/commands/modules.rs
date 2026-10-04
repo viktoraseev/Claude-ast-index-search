@@ -15,12 +15,88 @@ use anyhow::Result;
 use colored::Colorize;
 use rusqlite::{params, Connection};
 
+use super::Pagination;
 use crate::db;
 use crate::indexer;
 
+/// Render an empty module result without mixing status prose into JSON.
+fn print_empty_module_result(
+    command: &str,
+    subject: &str,
+    limit: usize,
+    reason: &str,
+) -> Result<()> {
+    let mut result = serde_json::json!({
+        "schema_version": 2, "items": [], "empty_reason": reason
+    });
+    if command == "module" {
+        result["pattern"] = subject.into();
+        result["pagination"] = serde_json::to_value(Pagination::new(0, 0, limit))?;
+    } else {
+        result["module"] = subject.into();
+        result["count"] = 0.into();
+    }
+    if command == "unused-deps" {
+        result["summary"] = serde_json::json!({
+            "unused": 0, "exported": 0, "used": 0, "total": 0,
+            "direct": 0, "transitive": 0, "xml": 0, "resources": 0
+        });
+    }
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// Check both module name and path aliases used by dependency navigation.
+fn module_exists(conn: &Connection, module: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM modules WHERE name=?1 OR path=?1)",
+        params![module],
+        |row| row.get(0),
+    )?)
+}
+
+fn print_module_edges(
+    conn: &Connection,
+    module: &str,
+    edges: &[(String, String, String)],
+    empty_reason: &str,
+) -> Result<()> {
+    let reason = if !module_exists(conn, module)? {
+        Some("missing_module")
+    } else if edges.is_empty() {
+        Some(empty_reason)
+    } else {
+        None
+    };
+    let items: Vec<_> = edges
+        .iter()
+        .map(|(name, path, kind)| serde_json::json!({"name": name, "path": path, "kind": kind}))
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": 2, "module": module, "items": items,
+            "count": items.len(), "empty_reason": reason
+        }))?
+    );
+    Ok(())
+}
+
 /// Find modules by pattern
 pub fn cmd_module(root: &Path, pattern: &str, limit: usize) -> Result<()> {
+    cmd_module_with_format(root, pattern, limit, "text")
+}
+
+pub fn cmd_module_with_format(
+    root: &Path,
+    pattern: &str,
+    limit: usize,
+    format: &str,
+) -> Result<()> {
     if !db::db_exists(root) {
+        if format == "json" {
+            return print_empty_module_result("module", pattern, limit, "no_index");
+        }
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
@@ -33,14 +109,35 @@ pub fn cmd_module(root: &Path, pattern: &str, limit: usize) -> Result<()> {
     let mut stmt = conn.prepare(
         "SELECT name, path FROM modules WHERE name LIKE ?1 ORDER BY name, path LIMIT ?2",
     )?;
-    let pattern = format!("%{}%", pattern);
+    let sql_pattern = format!("%{}%", pattern);
     let modules: Vec<(String, String)> = stmt
-        .query_map(rusqlite::params![pattern, limit as i64], |row| {
+        .query_map(rusqlite::params![sql_pattern, limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<Result<_, _>>()?;
 
-    println!("{}", format!("Modules matching '{}':", pattern).bold());
+    if format == "json" {
+        let total: usize = conn.query_row(
+            "SELECT count(*) FROM modules WHERE name LIKE ?1",
+            params![sql_pattern],
+            |row| row.get(0),
+        )?;
+        let items: Vec<_> = modules
+            .iter()
+            .map(|(name, path)| serde_json::json!({"name": name, "path": path}))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 2, "pattern": pattern, "items": items,
+                "pagination": Pagination::new(total, items.len(), limit),
+                "empty_reason": if total == 0 { Some("no_matches") } else { None }
+            }))?
+        );
+        return Ok(());
+    }
+
+    println!("{}", format!("Modules matching '{}':", sql_pattern).bold());
 
     for (name, path) in &modules {
         println!("  {}: {}", name.cyan(), path);
@@ -55,7 +152,14 @@ pub fn cmd_module(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
 /// Show module dependencies
 pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
+    cmd_deps_with_format(root, module, "text")
+}
+
+pub fn cmd_deps_with_format(root: &Path, module: &str, format: &str) -> Result<()> {
     if !db::db_exists(root) {
+        if format == "json" {
+            return print_empty_module_result("deps", module, 0, "no_index");
+        }
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
@@ -69,6 +173,9 @@ pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     if db::count_module_deps(&conn)? == 0
         && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
     {
+        if format == "json" {
+            return print_empty_module_result("deps", module, 0, "not_indexed");
+        }
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
@@ -77,6 +184,10 @@ pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
     }
 
     let deps = indexer::get_module_deps(&conn, module)?;
+
+    if format == "json" {
+        return print_module_edges(&conn, module, &deps, "no_dependencies");
+    }
 
     println!(
         "{}",
@@ -124,7 +235,14 @@ pub fn cmd_deps(root: &Path, module: &str) -> Result<()> {
 
 /// Show modules that depend on a module
 pub fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
+    cmd_dependents_with_format(root, module, "text")
+}
+
+pub fn cmd_dependents_with_format(root: &Path, module: &str, format: &str) -> Result<()> {
     if !db::db_exists(root) {
+        if format == "json" {
+            return print_empty_module_result("dependents", module, 0, "no_index");
+        }
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
@@ -138,6 +256,9 @@ pub fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     if db::count_module_deps(&conn)? == 0
         && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
     {
+        if format == "json" {
+            return print_empty_module_result("dependents", module, 0, "not_indexed");
+        }
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' to index them.".yellow()
@@ -146,6 +267,10 @@ pub fn cmd_dependents(root: &Path, module: &str) -> Result<()> {
     }
 
     let dependents = indexer::get_module_dependents(&conn, module)?;
+
+    if format == "json" {
+        return print_module_edges(&conn, module, &dependents, "no_dependents");
+    }
 
     println!(
         "{}",
@@ -200,7 +325,30 @@ pub fn cmd_unused_deps(
     check_xml: bool,
     check_resources: bool,
 ) -> Result<()> {
+    cmd_unused_deps_with_format(
+        root,
+        module,
+        verbose,
+        check_transitive,
+        check_xml,
+        check_resources,
+        "text",
+    )
+}
+
+pub fn cmd_unused_deps_with_format(
+    root: &Path,
+    module: &str,
+    verbose: bool,
+    check_transitive: bool,
+    check_xml: bool,
+    check_resources: bool,
+    format: &str,
+) -> Result<()> {
     if !db::db_exists(root) {
+        if format == "json" {
+            return print_empty_module_result("unused-deps", module, 0, "no_index");
+        }
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
@@ -214,6 +362,9 @@ pub fn cmd_unused_deps(
     if db::count_module_deps(&conn)? == 0
         && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
     {
+        if format == "json" {
+            return print_empty_module_result("unused-deps", module, 0, "not_indexed");
+        }
         println!(
             "{}",
             "Module dependencies not indexed. Run 'ast-index rebuild' first.".yellow()
@@ -233,6 +384,9 @@ pub fn cmd_unused_deps(
     let (module_id, module_path) = match module_info {
         Some((id, p)) => (id, p),
         None => {
+            if format == "json" {
+                return print_empty_module_result("unused-deps", module, 0, "missing_module");
+            }
             println!(
                 "{}",
                 format!("Module '{}' not found in index.", module).red()
@@ -245,6 +399,9 @@ pub fn cmd_unused_deps(
     let deps = indexer::get_module_deps(&conn, module)?;
 
     if deps.is_empty() {
+        if format == "json" {
+            return print_empty_module_result("unused-deps", module, 0, "no_dependencies");
+        }
         println!(
             "{}",
             format!("Module '{}' has no dependencies.", module).yellow()
@@ -252,30 +409,32 @@ pub fn cmd_unused_deps(
         return Ok(());
     }
 
-    println!(
-        "{}",
-        format!("Analyzing {} dependencies of '{}'...", deps.len(), module).bold()
-    );
-    if check_transitive || check_xml || check_resources {
-        let checks: Vec<&str> = [
-            if check_transitive {
-                Some("transitive")
-            } else {
-                None
-            },
-            if check_xml { Some("XML") } else { None },
-            if check_resources {
-                Some("resources")
-            } else {
-                None
-            },
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        println!("  Checking: direct imports + {}\n", checks.join(", "));
-    } else {
-        println!("  Checking: direct imports only (strict mode)\n");
+    if format != "json" {
+        println!(
+            "{}",
+            format!("Analyzing {} dependencies of '{}'...", deps.len(), module).bold()
+        );
+        if check_transitive || check_xml || check_resources {
+            let checks: Vec<&str> = [
+                if check_transitive {
+                    Some("transitive")
+                } else {
+                    None
+                },
+                if check_xml { Some("XML") } else { None },
+                if check_resources {
+                    Some("resources")
+                } else {
+                    None
+                },
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            println!("  Checking: direct imports + {}\n", checks.join(", "));
+        } else {
+            println!("  Checking: direct imports only (strict mode)\n");
+        }
     }
 
     // Results tracking
@@ -516,6 +675,64 @@ pub fn cmd_unused_deps(
         dep_usages.insert(dep_name.clone(), usage);
     }
 
+    if format == "json" {
+        let mut items = Vec::with_capacity(deps.len());
+        for (name, path, kind) in &deps {
+            let usage = &dep_usages[name];
+            let category = if usage.direct_count > 0 {
+                "direct"
+            } else if usage.transitive_count > 0 {
+                "transitive"
+            } else if usage.xml_count > 0 {
+                "xml"
+            } else if usage.resource_count > 0 {
+                "resources"
+            } else if kind == "api" {
+                "exported"
+            } else {
+                "unused"
+            };
+            let mut item = serde_json::json!({
+                "name": name, "path": path, "kind": kind, "category": category,
+                "usage": {"direct": usage.direct_count, "transitive": usage.transitive_count,
+                          "xml": usage.xml_count, "resources": usage.resource_count}
+            });
+            if verbose {
+                let consumers = if category == "exported" {
+                    exported_consumers(&conn, name, module)?
+                } else {
+                    Vec::new()
+                };
+                item["examples"] = serde_json::json!({
+                    "direct": usage.direct_symbols,
+                    "transitive": usage.transitive_via.iter().map(|(via, symbols)| {
+                        serde_json::json!({"module": via, "symbols": symbols})
+                    }).collect::<Vec<_>>(),
+                    "xml": usage.xml_usages.iter().map(|(class, line)| {
+                        serde_json::json!({"class": class, "line": line})
+                    }).collect::<Vec<_>>(),
+                    "resources": usage.resource_usages.iter().map(|(name, usage_type)| {
+                        serde_json::json!({"name": name, "usage_type": usage_type})
+                    }).collect::<Vec<_>>(),
+                    "consumers": consumers
+                });
+            }
+            items.push(item);
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 2, "module": module, "items": items, "count": deps.len(),
+                "empty_reason": null,
+                "summary": {"unused": unused.len(), "exported": exported.len(),
+                    "used": used_direct.len() + used_transitive.len() + used_xml.len() + used_resources.len(),
+                    "total": deps.len(), "direct": used_direct.len(), "transitive": used_transitive.len(),
+                    "xml": used_xml.len(), "resources": used_resources.len()}
+            }))?
+        );
+        return Ok(());
+    }
+
     // Output results
     if verbose {
         println!("{}", "=== Direct Usage ===".cyan().bold());
@@ -591,17 +808,7 @@ pub fn cmd_unused_deps(
             println!("  {} {} (api)", "⚡".yellow(), name);
             if verbose {
                 // Find consumers who use this exported dep
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT m.name FROM module_deps md
-                     JOIN modules m ON md.module_id = m.id
-                     JOIN modules dep ON md.dep_module_id = dep.id
-                     WHERE dep.name = ?1 AND m.name != ?2
-                     LIMIT 5",
-                )?;
-                let consumers: Vec<String> = stmt
-                    .query_map(params![name, module], |row| row.get(0))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+                let consumers = exported_consumers(&conn, name, module)?;
                 if !consumers.is_empty() {
                     println!("    └─ used by: {}", consumers.join(", "));
                 }
@@ -656,6 +863,19 @@ pub fn cmd_unused_deps(
     }
 
     Ok(())
+}
+
+/// Keep consumer examples bounded and stable in both renderers.
+fn exported_consumers(conn: &Connection, name: &str, module: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT m.name FROM module_deps md
+         JOIN modules m ON md.module_id = m.id
+         JOIN modules dep ON md.dep_module_id = dep.id
+         WHERE dep.name = ?1 AND m.name != ?2
+         ORDER BY m.name LIMIT 5",
+    )?;
+    let rows = stmt.query_map(params![name, module], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Files belong to their deepest indexed module directory. Literal prefix

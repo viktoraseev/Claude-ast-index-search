@@ -64,6 +64,8 @@ import format_contracts
 import file_view_contracts
 import file_scope_contracts
 import navigation_scope_contracts
+import module_format_contracts
+import call_hierarchy_contracts
 
 
 SCHEMA = """
@@ -93,7 +95,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -126,7 +128,7 @@ def next_check(state: sqlite3.Connection):
 
 class InvocationOracle:
     READ_ONLY = {"ide_find_class", "ide_find_symbol", "ide_find_file", "ide_find_references",
-                 "ide_find_implementations", "ide_type_hierarchy", "ide_search_text"}
+                 "ide_find_implementations", "ide_type_hierarchy", "ide_search_text", "ide_call_hierarchy"}
 
     def __init__(self, client: Any, state: sqlite3.Connection, *, metrics=None,
                  max_entries=256, max_bytes=16 * 1024 * 1024):
@@ -513,6 +515,7 @@ class Fixture:
         self._file_view_results = None
         self._file_scope_results = None
         self._navigation_scope_results = None
+        self._module_format_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
         self._rank_results = None
@@ -612,6 +615,12 @@ class Fixture:
             return run_command([str(self.binary), *arguments], self.root, self.environment)
         finally:
             self.metrics.record('cli.' + arguments[0], time.perf_counter() - started)
+
+    def call_hierarchy_check(self, check: sqlite3.Row):
+        try:
+            return call_hierarchy_contracts.exercise(self, check)
+        except call_hierarchy_contracts.UnsupportedHierarchy as error:
+            raise Unsupported(str(error)) from error
 
     def paginated(self, check_id: str, tool: str, arguments: dict[str, Any], field: str) -> list[dict[str, Any]]:
         items = []
@@ -1771,6 +1780,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def module_format_check(self, check: sqlite3.Row):
+        if self._module_format_results is None:
+            self._module_format_results = module_format_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._module_format_results)
+        return {'source': module_format_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def file_view_check(self, check: sqlite3.Row):
         if self._file_view_results is None:
             self._file_view_results = file_view_contracts.exercise(self.binary, self.database.parent)
@@ -1880,6 +1897,10 @@ class Fixture:
                 handler = self.type_binding_check
             if check['feature'] in format_contracts.FEATURES:
                 handler = self.format_check
+            if check['feature'] in module_format_contracts.FEATURES:
+                handler = self.module_format_check
+            if check['feature'] in call_hierarchy_contracts.FEATURES:
+                handler = self.call_hierarchy_check
             if check['feature'] in file_view_contracts.FEATURES:
                 handler = self.file_view_check
             if check['feature'] in file_scope_contracts.FEATURES:
@@ -1977,6 +1998,8 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(file_view_contracts.FEATURES)
     features.update(file_scope_contracts.FEATURES)
     features.update(navigation_scope_contracts.FEATURES)
+    features.update(module_format_contracts.FEATURES)
+    features.update(call_hierarchy_contracts.FEATURES)
     return features
 
 
@@ -2118,6 +2141,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     file_view_contracts.plan_views(state, root)
     file_scope_contracts.plan_scope(state, root)
     navigation_scope_contracts.plan_scope(state, root)
+    module_format_contracts.plan_formats(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -2173,7 +2197,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         server = client.initialize()
         tools = client.tools()
         required = {"ide_find_class", "ide_find_symbol", "ide_find_file", "ide_find_references",
-                    "ide_find_implementations", "ide_type_hierarchy", "ide_search_text"}
+                    "ide_find_implementations", "ide_type_hierarchy", "ide_search_text", "ide_call_hierarchy"}
         missing = required - tools.keys()
         if missing:
             raise Unsupported("Index MCP Server lacks tools required by live contracts: " + ", ".join(sorted(missing)))
@@ -2190,6 +2214,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
                           batch_text=text_mode == 'batch', symbol_initials={name[0] for name in candidates})
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
         plan(state, source_files, help_text, candidates, root, java_only=True)
+        call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure)
         limit = arguments.case_limit
         processed = 0
         problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]

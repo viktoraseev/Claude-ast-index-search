@@ -89,7 +89,8 @@ def diagram(result, format):
         ids = {name: f'n{i}' for i, name in enumerate(nodes)}
         lines += ([f'  {ids[n]}[{n}]' for n in nodes] if mermaid else
                   [f'  "{n}";' for n in sorted(nodes)])
-        lines += ([f'  {ids[a]} -->|{k}| {ids[b]}' for a, b, k in edges] if mermaid else
+        lines += ([f'  {ids[a]} --> {ids[b]}' if k == 'implementation' else
+                   f'  {ids[a]} -->|{k}| {ids[b]}' for a, b, k in edges] if mermaid else
                   [f'  "{a}" -> "{b}" [label="{k}"];' for a, b, k in edges])
     return '\n'.join([*lines, '```' if mermaid else '}']) + '\n'
 

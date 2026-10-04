@@ -12,7 +12,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::java::JavaSource;
+use super::java::{JavaReceiver, JavaSource};
 use super::metrics::compute_metrics;
 use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
@@ -1898,6 +1898,167 @@ impl Builder {
         })
     }
 
+    fn resolve_java_bare_call(
+        &self,
+        file: u32,
+        source: u32,
+        name: &str,
+        line: i64,
+    ) -> Option<Result<Resolution, DropReason>> {
+        let java = self.files[file as usize].java.as_ref()?;
+        let owner = &self.syms[source as usize];
+        let Some(arguments) = java.bare_arguments(&owner.name, owner.line, line, name)? else {
+            return Some(Err(DropReason::ReceiverUnresolved));
+        };
+        let mut scope = self.class_scope(source);
+        while let Some(class) = scope {
+            if let Some(found) = self.resolve_in_hierarchy(class, source, name, false) {
+                let targets: Vec<_> = found
+                    .targets
+                    .into_iter()
+                    .filter(|&target| {
+                        let symbol = &self.syms[target as usize];
+                        symbol.kind == "function"
+                            && self.files[symbol.file as usize]
+                                .java
+                                .as_ref()
+                                .is_some_and(|java| {
+                                    java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                                })
+                    })
+                    .collect();
+                return Some(match targets.len() {
+                    0 => Err(DropReason::ReceiverUnresolved),
+                    1 => {
+                        // Scope and arity establish the target before assigning
+                        // confidence. A same-file definition remains local;
+                        // inherited definitions in other files are scoped.
+                        let confidence = if self.syms[targets[0] as usize].file == file {
+                            Confidence::Local
+                        } else {
+                            Confidence::Scoped
+                        };
+                        Ok(Resolution::new(confidence, targets))
+                    }
+                    _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
+                });
+            }
+            scope = self.syms[class as usize].container;
+        }
+        // Java has no globally callable functions. Ordinary type imports or
+        // a unique name elsewhere do not bind an implicit receiver method.
+        Some(Err(DropReason::ReceiverUnresolved))
+    }
+
+    fn java_receiver_members(
+        &self,
+        source: u32,
+        classes: &[u32],
+        name: &str,
+        arguments: Option<usize>,
+    ) -> Vec<u32> {
+        let [class] = classes else {
+            return Vec::new();
+        };
+        let Some(found) = self.resolve_in_hierarchy(*class, source, name, false) else {
+            return Vec::new();
+        };
+        found
+            .targets
+            .into_iter()
+            .filter(|&target| {
+                let symbol = &self.syms[target as usize];
+                symbol.kind == "function"
+                    && arguments.is_none_or(|count| {
+                        self.files[symbol.file as usize]
+                            .java
+                            .as_ref()
+                            .is_some_and(|java| {
+                                java.accepts_arguments(&symbol.name, symbol.line, count)
+                            })
+                    })
+            })
+            .collect()
+    }
+
+    fn java_receiver_classes(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Vec<u32> {
+        if depth >= 16 {
+            return Vec::new();
+        }
+        match receiver {
+            JavaReceiver::Unknown => Vec::new(),
+            JavaReceiver::Type(path) => {
+                self.resolve_java_type(source, self.namespace_of(source), path, None)
+            }
+            JavaReceiver::This => self.class_scope(source).into_iter().collect(),
+            JavaReceiver::Invocation {
+                receiver,
+                name,
+                line,
+                arguments,
+            } => {
+                let targets = if let Some(receiver) = receiver {
+                    let classes = self.java_receiver_classes(source, receiver, depth + 1);
+                    self.java_receiver_members(source, &classes, name, Some(*arguments))
+                } else {
+                    let file = self.syms[source as usize].file;
+                    self.resolve_java_static_call(file, source, name, *line)
+                        .or_else(|| self.resolve_java_bare_call(file, source, name, *line))
+                        .and_then(Result::ok)
+                        .map(|found| found.targets)
+                        .unwrap_or_default()
+                };
+                // Do not guess an overload's result from the first declaration.
+                let [target] = targets.as_slice() else {
+                    return Vec::new();
+                };
+                let symbol = &self.syms[*target as usize];
+                let Some(path) = self.files[symbol.file as usize]
+                    .java
+                    .as_ref()
+                    .and_then(|java| java.return_type(&symbol.name, symbol.line))
+                else {
+                    return Vec::new();
+                };
+                self.resolve_java_type(*target, self.namespace_of(*target), path, None)
+            }
+        }
+    }
+
+    fn resolve_java_expression_call(
+        &self,
+        file: u32,
+        source: u32,
+        name: &str,
+        line: i64,
+    ) -> Option<Result<Resolution, DropReason>> {
+        let java = self.files[file as usize].java.as_ref()?;
+        let owner = &self.syms[source as usize];
+        let call = java.expression_call(&owner.name, owner.line, line, name)?;
+        let Some(call) = call else {
+            return Some(Err(DropReason::ReceiverUnresolved));
+        };
+        let classes = self.java_receiver_classes(source, &call.receiver, 0);
+        let targets = self.java_receiver_members(source, &classes, name, call.arguments);
+        Some(match targets.len() {
+            0 => Err(DropReason::ReceiverUnresolved),
+            1 => {
+                let confidence = if self.syms[targets[0] as usize].file == file {
+                    Confidence::Local
+                } else {
+                    Confidence::Scoped
+                };
+                Ok(Resolution::new(confidence, targets))
+            }
+            _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
+        })
+    }
+
     fn resolve_reference(
         &self,
         file: u32,
@@ -1969,6 +2130,12 @@ impl Builder {
                     _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
                 };
             }
+        }
+        if let Some(resolution) = self.resolve_java_bare_call(file, source, name, line) {
+            return resolution;
+        }
+        if let Some(resolution) = self.resolve_java_expression_call(file, source, name, line) {
+            return resolution;
         }
         let cands = self.candidates(name, node.family, file);
         if cands.iter().any(|&c| {

@@ -26,6 +26,28 @@ pub(super) struct JavaSource {
     direct_calls: HashMap<(String, i64, i64, String), Option<usize>>,
     bare_calls: HashMap<(String, i64, i64, String), Option<usize>>,
     parameters: HashMap<(String, i64), Option<(usize, bool)>>,
+    returns: HashMap<(String, i64), Option<String>>,
+    expressions: HashMap<(String, i64, i64, String), Option<ExpressionCall>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum JavaReceiver {
+    Type(String),
+    This,
+    Invocation {
+        receiver: Option<Box<JavaReceiver>>,
+        name: String,
+        line: i64,
+        arguments: usize,
+    },
+    Unknown,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ExpressionCall {
+    pub receiver: JavaReceiver,
+    /// A method reference has no invocation argument list.
+    pub arguments: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -195,6 +217,103 @@ fn type_parameter(mut owner: Node<'_>, name: &str, source: &str) -> bool {
     }
 }
 
+fn argument_count(node: Node<'_>) -> Option<usize> {
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let count = arguments
+        .named_children(&mut cursor)
+        .filter(|argument| !argument.is_extra())
+        .count();
+    Some(count)
+}
+
+fn expression_receiver(
+    node: Node<'_>,
+    owner: Node<'_>,
+    source: &str,
+    scopes: &VariableScopes,
+    depth: usize,
+) -> JavaReceiver {
+    if depth >= 16 || node.has_error() {
+        return JavaReceiver::Unknown;
+    }
+    let typed = |name: Option<String>| {
+        name.filter(|name| {
+            !type_parameter(owner, name.split("::").next().unwrap_or_default(), source)
+        })
+        .map(JavaReceiver::Type)
+        .unwrap_or(JavaReceiver::Unknown)
+    };
+    match node.kind() {
+        "this" => JavaReceiver::This,
+        "identifier" => {
+            if let Some(parameters) = owner.child_by_field_name("parameters") {
+                let mut cursor = parameters.walk();
+                for parameter in parameters.named_children(&mut cursor) {
+                    if parameter
+                        .child_by_field_name("name")
+                        .is_some_and(|name| text(name, source) == text(node, source))
+                    {
+                        return typed(
+                            parameter
+                                .child_by_field_name("type")
+                                .and_then(|ty| type_name(ty, source)),
+                        );
+                    }
+                }
+            }
+            match variable_type(node, text(node, source), false, scopes) {
+                Some(binding) => typed(binding.map(str::to_owned)),
+                None => typed(Some(text(node, source).to_owned())),
+            }
+        }
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => {
+            typed(type_name(node, source))
+        }
+        "field_access"
+            if node
+                .child_by_field_name("object")
+                .is_some_and(|base| base.kind() == "this") =>
+        {
+            let binding = node
+                .child_by_field_name("field")
+                .and_then(|field| variable_type(node, text(field, source), true, scopes))
+                .flatten();
+            typed(binding.map(str::to_owned))
+        }
+        "object_creation_expression" | "cast_expression" => typed(
+            node.child_by_field_name("type")
+                .and_then(|ty| type_name(ty, source)),
+        ),
+        "parenthesized_expression" => node
+            .named_child(0)
+            .map(|child| expression_receiver(child, owner, source, scopes, depth + 1))
+            .unwrap_or(JavaReceiver::Unknown),
+        "method_invocation" => {
+            let (Some(name), Some(arguments)) =
+                (node.child_by_field_name("name"), argument_count(node))
+            else {
+                return JavaReceiver::Unknown;
+            };
+            JavaReceiver::Invocation {
+                receiver: node.child_by_field_name("object").map(|object| {
+                    Box::new(expression_receiver(
+                        object,
+                        owner,
+                        source,
+                        scopes,
+                        depth + 1,
+                    ))
+                }),
+                name: text(name, source).to_owned(),
+                line: name.start_position().row as i64 + 1,
+                arguments,
+            }
+        }
+        _ => JavaReceiver::Unknown,
+    }
+}
+
 impl JavaSource {
     pub fn parse(source: &str) -> Result<Self> {
         let tree = parse_tree(source, &LANGUAGE)?;
@@ -356,10 +475,70 @@ impl JavaSource {
         result.types.retain(|key, _| type_sites.contains(key));
         let mut tracked = HashSet::new();
         walk_tree_preorder(&tree.root_node(), |node| {
+            if node.kind() == "record_declaration" {
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    let mut cursor = parameters.walk();
+                    for component in parameters.named_children(&mut cursor) {
+                        let Some(name) = component.child_by_field_name("name") else {
+                            continue;
+                        };
+                        let explicit = node.child_by_field_name("body").is_some_and(|body| {
+                            let mut cursor = body.walk();
+                            let explicit = body.named_children(&mut cursor).any(|method| {
+                                method.kind() == "method_declaration"
+                                    && method.child_by_field_name("name").is_some_and(|other| {
+                                        text(other, source) == text(name, source)
+                                    })
+                                    && method.child_by_field_name("parameters").is_some_and(
+                                        |parameters| {
+                                            let mut cursor = parameters.walk();
+                                            let has_parameters = parameters
+                                                .named_children(&mut cursor)
+                                                .any(|parameter| {
+                                                    matches!(
+                                                        parameter.kind(),
+                                                        "formal_parameter" | "spread_parameter"
+                                                    )
+                                                });
+                                            !has_parameters
+                                        },
+                                    )
+                            });
+                            explicit
+                        });
+                        if !explicit {
+                            result
+                                .parameters
+                                .entry((
+                                    text(name, source).to_owned(),
+                                    name.start_position().row as i64 + 1,
+                                ))
+                                .and_modify(|previous| *previous = None)
+                                .or_insert(Some((0, false)));
+                        }
+                    }
+                }
+            }
             if matches!(
                 node.kind(),
                 "method_declaration" | "constructor_declaration"
             ) {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let declared = node
+                        .child_by_field_name("type")
+                        .and_then(|ty| type_name(ty, source))
+                        .filter(|ty| {
+                            !type_parameter(node, ty.split("::").next().unwrap_or_default(), source)
+                        });
+                    result
+                        .returns
+                        .entry((
+                            text(name, source).to_owned(),
+                            name.start_position().row as i64 + 1,
+                        ))
+                        .and_modify(|previous| *previous = None)
+                        .or_insert(declared);
+                }
                 if let (Some(name), Some(parameters)) = (
                     node.child_by_field_name("name"),
                     node.child_by_field_name("parameters"),
@@ -384,16 +563,21 @@ impl JavaSource {
                         .or_insert(Some((count, variadic)));
                 }
             }
-            if node.kind() != "method_invocation" || node.has_error() {
+            if !matches!(node.kind(), "method_invocation" | "method_reference") || node.has_error()
+            {
                 return WalkControl::Continue;
             }
             let Some(owner) = callable(node) else {
                 return WalkControl::Continue;
             };
-            let (Some(owner_name), Some(name)) = (
-                owner.child_by_field_name("name"),
-                node.child_by_field_name("name"),
-            ) else {
+            let reference = node.kind() == "method_reference";
+            let name = if reference {
+                node.named_child(node.named_child_count().saturating_sub(1) as u32)
+                    .filter(|name| name.kind() == "identifier")
+            } else {
+                node.child_by_field_name("name")
+            };
+            let (Some(owner_name), Some(name)) = (owner.child_by_field_name("name"), name) else {
                 return WalkControl::Continue;
             };
             let key = (
@@ -402,6 +586,33 @@ impl JavaSource {
                 name.start_position().row as i64 + 1,
                 text(name, source).to_owned(),
             );
+            let object = if reference {
+                node.named_child(0)
+            } else {
+                node.child_by_field_name("object")
+            };
+            if let Some(object) = object {
+                let call = Some(ExpressionCall {
+                    receiver: expression_receiver(object, owner, source, &scopes, 0),
+                    arguments: if reference {
+                        None
+                    } else {
+                        argument_count(node)
+                    },
+                });
+                result
+                    .expressions
+                    .entry(key.clone())
+                    .and_modify(|previous| {
+                        if *previous != call {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(call);
+            }
+            if reference {
+                return WalkControl::Continue;
+            }
             if node.child_by_field_name("object").is_none() {
                 let arguments = node.child_by_field_name("arguments").map(|arguments| {
                     let mut cursor = arguments.walk();
@@ -534,6 +745,23 @@ impl JavaSource {
         self.parents
             .get(&(name.to_owned(), line))
             .map(Vec::as_slice)
+    }
+
+    pub fn expression_call(
+        &self,
+        owner: &str,
+        owner_line: i64,
+        line: i64,
+        name: &str,
+    ) -> Option<&Option<ExpressionCall>> {
+        self.expressions
+            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+    }
+
+    pub fn return_type(&self, name: &str, line: i64) -> Option<&str> {
+        self.returns
+            .get(&(name.to_owned(), line))
+            .and_then(|ty| ty.as_deref())
     }
 
     pub fn type_reference(&self, line: i64, name: &str) -> Option<&Option<String>> {

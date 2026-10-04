@@ -1054,6 +1054,15 @@ enum GraphAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Reject unsupported diagram formats before cache discovery or mutation.
+    if matches!(cli.format.as_str(), "mermaid" | "dot")
+        && !matches!(&cli.command, Commands::ModuleRoute { .. })
+    {
+        return Err(anyhow::anyhow!(
+            "--format {} is supported only by 'module-route'; use text or json for this command",
+            cli.format
+        ));
+    }
     // Export the chosen output format so deeply-nested helpers (PathResolver,
     // formatters in subagents) can branch on text vs JSON without us
     // threading `format` through every signature.
@@ -1506,10 +1515,14 @@ fn main() -> Result<()> {
         }
         // Module commands
         Commands::Module { pattern, limit } => {
-            commands::modules::cmd_module(&root, &pattern, limit)
+            commands::modules::cmd_module_with_format(&root, &pattern, limit, format)
         }
-        Commands::Deps { module } => commands::modules::cmd_deps(&root, &module),
-        Commands::Dependents { module } => commands::modules::cmd_dependents(&root, &module),
+        Commands::Deps { module } => {
+            commands::modules::cmd_deps_with_format(&root, &module, format)
+        }
+        Commands::Dependents { module } => {
+            commands::modules::cmd_dependents_with_format(&root, &module, format)
+        }
         Commands::ModuleRoute {
             from,
             to,
@@ -1532,13 +1545,14 @@ fn main() -> Result<()> {
             let check_transitive = !no_transitive && !strict;
             let check_xml = !no_xml && !strict;
             let check_resources = !no_resources && !strict;
-            commands::modules::cmd_unused_deps(
+            commands::modules::cmd_unused_deps_with_format(
                 &root,
                 &module,
                 verbose,
                 check_transitive,
                 check_xml,
                 check_resources,
+                format,
             )
         }
         // File commands

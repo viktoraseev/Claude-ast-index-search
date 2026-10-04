@@ -42,6 +42,11 @@ fn historical_public_function_signatures_remain_source_compatible() {
     let _: fn(&Path) -> bool = commands::is_no_ignore_enabled;
     let _: fn(&Path) -> bool = commands::is_experimental_fast_rebuild_enabled;
     let _: fn(&Path) -> anyhow::Result<File> = db::acquire_rebuild_lock;
+    let _: fn(&Path, &str, usize) -> anyhow::Result<()> = commands::modules::cmd_module;
+    let _: fn(&Path, &str) -> anyhow::Result<()> = commands::modules::cmd_deps;
+    let _: fn(&Path, &str) -> anyhow::Result<()> = commands::modules::cmd_dependents;
+    let _: fn(&Path, &str, bool, bool, bool, bool) -> anyhow::Result<()> =
+        commands::modules::cmd_unused_deps;
 
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("project");
