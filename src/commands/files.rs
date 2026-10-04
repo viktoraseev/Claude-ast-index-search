@@ -16,8 +16,107 @@ use rusqlite::OptionalExtension;
 
 use crate::db::SymbolKind;
 
-use super::{relative_path, search_files};
+use super::{relative_path, search_files, PathResolver};
 use crate::db;
+
+/// Selected source roots, including source-only use before the first rebuild.
+fn source_roots(root: &Path) -> Result<(Vec<PathBuf>, Option<PathResolver>)> {
+    let Some(_lease) = db::acquire_project_lease_if_initialized(root)? else {
+        let roots = if std::env::var_os("AST_INDEX_SUBTREE").is_some() {
+            vec![]
+        } else {
+            vec![root.to_path_buf()]
+        };
+        return Ok((roots, None));
+    };
+    let conn = db::open_db_leased(root)?;
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
+    Ok((resolver.grep_roots(), Some(resolver)))
+}
+
+/// Resolve a single file in the selected roots. Keep primary-root precedence
+/// for an unqualified path; an attached-only collision requires disambiguation.
+fn source_file(root: &Path, file: &str) -> Result<Option<PathBuf>> {
+    let (roots, resolver) = source_roots(root)?;
+    let scoped = std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_some()
+        || std::env::var_os("AST_INDEX_SUBTREE").is_some();
+    let allowed = |path: &Path| {
+        !scoped
+            || resolver.as_ref().map_or_else(
+                || roots.iter().any(|r| path.starts_with(r)),
+                |r| r.source_path_matches_filter(path),
+            )
+    };
+    if Path::new(file).is_absolute() {
+        return Ok(std::fs::canonicalize(file)
+            .ok()
+            .filter(|p| p.is_file() && allowed(p)));
+    }
+    let mut files = Vec::new();
+    for base in &roots {
+        if let Ok(path) = std::fs::canonicalize(base.join(file)) {
+            if path.is_file() && allowed(&path) {
+                if base == root {
+                    return Ok(Some(path));
+                }
+                if !files.contains(&path) {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    if files.len() > 1 {
+        anyhow::bail!("Ambiguous file path: {file}. Use --subtree NAME or an absolute path.");
+    }
+    Ok(files.pop())
+}
+
+/// Existing module selectors under every selected root, with canonical path
+/// boundaries so `views` cannot accidentally include `views-extra`.
+fn module_directories(root: &Path, selector: &str) -> Result<(Vec<PathBuf>, Option<PathResolver>)> {
+    let (roots, resolver) = source_roots(root)?;
+    let resolve = |selector: &str| {
+        let mut paths = Vec::new();
+        for base in &roots {
+            // A literal existing path wins over dotted module-name conversion.
+            let path = base.join(selector);
+            let path = if path.exists() || !selector.contains('.') {
+                path
+            } else {
+                base.join(selector.replace('.', "/"))
+            };
+            if let Ok(path) = std::fs::canonicalize(path) {
+                let allowed = roots.iter().any(|r| path.starts_with(r))
+                    && resolver
+                        .as_ref()
+                        .map_or(true, |r| r.source_path_matches_filter(&path));
+                if allowed && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+        paths
+    };
+    let mut paths = resolve(selector);
+    if paths.is_empty() {
+        if let Some(_lease) = db::acquire_project_lease_if_initialized(root)? {
+            let conn = db::open_db_leased(root)?;
+            let path: Option<String> = conn
+                .query_row(
+                    "SELECT path FROM modules WHERE name = ?1",
+                    [selector],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(path) = path {
+                // Module metadata stores primary-relative paths. A module
+                // alias must not select a same-path directory in another root.
+                paths = resolve(&root.join(path).to_string_lossy());
+            }
+        }
+    }
+    Ok((paths, resolver))
+}
 
 fn print_minified_notice() {
     println!(
@@ -190,19 +289,13 @@ fn print_outline_json(file: &str, rows: &[OutlineRow], skipped: Option<OutlineSk
 /// is set: thousands of column rows would bury the tables.
 pub fn cmd_outline(root: &Path, file: &str, full: bool, format: &str) -> Result<()> {
     let json = format == "json";
-    let file_path = if file.starts_with('/') {
-        PathBuf::from(file)
-    } else {
-        root.join(file)
-    };
-
-    if !file_path.exists() {
+    let Some(file_path) = source_file(root, file)? else {
         if json {
             return print_outline_json(file, &[], Some(OutlineSkip::NotFound));
         }
         println!("{}", format!("File not found: {}", file).red());
         return Ok(());
-    }
+    };
 
     let header = format!("Outline of {}:", file);
     if crate::minified::skip(&file_path, None) {
@@ -288,19 +381,13 @@ pub fn cmd_imports(root: &Path, file: &str) -> Result<()> {
 
 /// Show imports as text or a structured file document.
 pub fn cmd_imports_with_format(root: &Path, file: &str, format: &str) -> Result<()> {
-    let file_path = if file.starts_with('/') {
-        PathBuf::from(file)
-    } else {
-        root.join(file)
-    };
-
-    if !file_path.exists() {
+    let Some(file_path) = source_file(root, file)? else {
         if format == "json" {
             return print_imports_json(file, &[], Some("not_found"));
         }
         println!("{}", format!("File not found: {}", file).red());
         return Ok(());
-    }
+    };
 
     let header = format!("Imports in {}:", file);
     if crate::minified::skip(&file_path, None) {
@@ -463,51 +550,28 @@ pub fn cmd_api_with_format(
     limit: usize,
     format: &str,
 ) -> Result<()> {
-    let mut module_dir = root.join(module_path);
-
-    // If path not found, try converting dots to slashes (module name → path)
-    if !module_dir.exists() && module_path.contains('.') {
-        let converted = module_path.replace('.', "/");
-        let alt = root.join(&converted);
-        if alt.exists() {
-            module_dir = alt;
-        }
-    }
-
-    // Also try looking up module path from DB
-    if !module_dir.exists() {
-        if let Some(_cache_lease) = crate::db::acquire_project_lease_if_initialized(root)? {
-            let conn = crate::db::open_db_leased(root)?;
-            let db_path: Option<String> = conn
-                .query_row(
-                    "SELECT path FROM modules WHERE name = ?1",
-                    rusqlite::params![module_path],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(p) = db_path {
-                let alt = root.join(&p);
-                if alt.exists() {
-                    module_dir = alt;
-                }
-            }
-        }
-    }
-
-    if !module_dir.exists() {
+    let (module_dirs, resolver) = module_directories(root, module_path)?;
+    let Some(module_dir) = module_dirs.first() else {
         if format == "json" {
             return print_api_json(module_path, &[], Some("not_found"));
         }
         println!("{}", format!("Module not found: {}", module_path).red());
         return Ok(());
-    }
+    };
 
     // Java visibility depends on enclosing types and implicit interface members.
     // Parse each Java file once; declaration-looking comments are not API.
     let mut items: Vec<(String, usize, String)> = vec![];
     if limit > 0 {
-        for path in super::project_source_files(root, &["java"])? {
-            if !path.starts_with(&module_dir) {
+        let mut paths = super::project_source_files(root, &["java"])?;
+        paths.dedup();
+        for path in paths {
+            let path = std::fs::canonicalize(path)?;
+            if !module_dirs.iter().any(|dir| path.starts_with(dir))
+                || resolver
+                    .as_ref()
+                    .is_some_and(|r| !r.source_path_matches_filter(&path))
+            {
                 continue;
             }
             let source = std::fs::read_to_string(&path)?;
@@ -517,7 +581,11 @@ pub fn cmd_api_with_format(
             let lines: Vec<_> = source.lines().collect();
             for line in crate::parsers::treesitter::java::public_api_lines(&source)? {
                 let content = lines[line - 1].trim().chars().take(100).collect();
-                items.push((relative_path(root, &path), line, content));
+                let display = resolver.as_ref().map_or_else(
+                    || relative_path(root, &path),
+                    |resolver| super::display_path(resolver, root, &path),
+                );
+                items.push((display, line, content));
                 if items.len() == limit {
                     break;
                 }
@@ -530,7 +598,7 @@ pub fn cmd_api_with_format(
 
     let pattern = r"(public\s+)?(class|interface|object|fun)\s+\w+";
 
-    search_files(&module_dir, pattern, &["kt"], |path, line_num, line| {
+    search_files(module_dir, pattern, &["kt"], |path, line_num, line| {
         if items.len() >= limit {
             return;
         }
@@ -546,7 +614,7 @@ pub fn cmd_api_with_format(
     })?;
 
     if items.len() < limit {
-        items.extend(swift_public_api(root, &module_dir, limit - items.len())?);
+        items.extend(swift_public_api(root, module_dir, limit - items.len())?);
     }
 
     if format == "json" {

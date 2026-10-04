@@ -47,7 +47,7 @@ fn check_receiver(method: &str, expected_file: &str) {
     .unwrap();
     fs::write(
         project.path().join("B.java"),
-        "package fixture;\nclass B {\n    int leaf() { return 2; }\n    int useA(A receiver) { return receiver.leaf(); }\n    int useB(B receiver) { return receiver.leaf(); }\n}\n",
+        "package fixture;\nclass B {\n    int leaf() { return 2; }\n    int useA(A receiver) { return receiver.leaf(); }\n    int useB(B receiver) { return receiver.leaf(); }\n    A fieldReceiver;\n    int useField() { return fieldReceiver.leaf(); }\n    int useLocal() { A receiver = new A(); return receiver.leaf(); }\n}\n",
     )
     .unwrap();
     run(project.path(), cache.path(), &["rebuild", "--force"]);
@@ -86,6 +86,16 @@ fn parameter_receiver_does_not_borrow_the_callers_same_name_method() {
 #[test]
 fn parameter_receiver_can_select_the_callers_own_class() {
     check_receiver("fixture.B.useB", "B.java");
+}
+
+#[test]
+fn field_receiver_uses_its_declared_type_instead_of_same_name_methods() {
+    check_receiver("fixture.B.useField", "A.java");
+}
+
+#[test]
+fn local_receiver_uses_its_declared_type_instead_of_same_name_methods() {
+    check_receiver("fixture.B.useLocal", "A.java");
 }
 
 fn check_imported_receiver(imports: &str, declared: &str) {

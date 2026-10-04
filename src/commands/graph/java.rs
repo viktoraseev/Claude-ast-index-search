@@ -25,6 +25,110 @@ pub(super) struct ParameterCall {
     pub arguments: usize,
 }
 
+struct VariableBinding {
+    position: usize,
+    field: bool,
+    declared: Option<String>,
+}
+
+type VariableScopes = HashMap<usize, HashMap<String, Vec<VariableBinding>>>;
+
+/// Temporary per-file lexical inventory, discarded after deriving calls.
+/// Index scopes once instead of rescanning every declaration for each call.
+fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
+    let mut scopes = VariableScopes::new();
+    walk_tree_preorder(&root, |declaration| {
+        let field = declaration.kind() == "field_declaration";
+        if !field && declaration.kind() != "local_variable_declaration" {
+            return WalkControl::Continue;
+        }
+        let Some(declared_type) = declaration.child_by_field_name("type") else {
+            return WalkControl::Continue;
+        };
+        let mut scope = declaration.parent();
+        let scope_id = loop {
+            let Some(node) = scope else {
+                return WalkControl::Continue;
+            };
+            let class_body = matches!(node.kind(), "class_body" | "interface_body" | "enum_body");
+            let local_scope = matches!(
+                node.kind(),
+                "block" | "constructor_body" | "for_statement" | "switch_block"
+            );
+            if (field && class_body) || (!field && local_scope) {
+                break node.id();
+            }
+            if !field && class_body {
+                return WalkControl::Continue;
+            }
+            scope = node.parent();
+        };
+        let mut cursor = declaration.walk();
+        for variable in declaration.named_children(&mut cursor) {
+            if variable.kind() != "variable_declarator" {
+                continue;
+            }
+            let Some(name) = variable.child_by_field_name("name") else {
+                continue;
+            };
+            let mut cursor = variable.walk();
+            let array_suffix = variable
+                .named_children(&mut cursor)
+                .any(|child| child.kind() == "dimensions");
+            let declared = if array_suffix
+                || text(declared_type, source) == "var"
+                || declared_type.has_error()
+            {
+                None
+            } else {
+                type_name(declared_type, source)
+            };
+            scopes
+                .entry(scope_id)
+                .or_default()
+                .entry(text(name, source).to_owned())
+                .or_default()
+                .push(VariableBinding {
+                    position: name.start_byte(),
+                    field,
+                    declared,
+                });
+        }
+        WalkControl::Continue
+    });
+    scopes
+}
+
+fn variable_type<'a>(
+    call: Node<'_>,
+    name: &str,
+    fields_only: bool,
+    scopes: &'a VariableScopes,
+) -> Option<Option<&'a str>> {
+    let mut ancestor = call.parent();
+    while let Some(node) = ancestor {
+        if let Some(bindings) = scopes.get(&node.id()).and_then(|scope| scope.get(name)) {
+            if let Some(binding) = bindings
+                .iter()
+                .filter(|binding| {
+                    (!fields_only || binding.field)
+                        && (binding.field || binding.position < call.start_byte())
+                })
+                .max_by_key(|binding| binding.position)
+            {
+                return Some(binding.declared.as_deref());
+            }
+        }
+        // Outer/inherited instance fields need an explicit capture/hierarchy
+        // contract. Never borrow an enclosing class's field by name alone.
+        if matches!(node.kind(), "class_body" | "interface_body" | "enum_body") {
+            break;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
@@ -85,6 +189,7 @@ fn type_parameter(mut owner: Node<'_>, name: &str, source: &str) -> bool {
 impl JavaSource {
     pub fn parse(source: &str) -> Result<Self> {
         let tree = parse_tree(source, &LANGUAGE)?;
+        let scopes = variable_scopes(tree.root_node(), source);
         let mut result = Self::default();
         let mut cursor = tree.root_node().walk();
         for declaration in tree.root_node().named_children(&mut cursor) {
@@ -164,47 +269,73 @@ impl JavaSource {
                 name.start_position().row as i64 + 1,
                 text(name, source).to_owned(),
             );
-            let mut known_parameter = false;
-            let inferred = node
-                .child_by_field_name("object")
-                .filter(|object| object.kind() == "identifier")
-                .and_then(|object| {
-                    let parameters = owner.child_by_field_name("parameters")?;
-                    let mut cursor = parameters.walk();
-                    for parameter in parameters.named_children(&mut cursor) {
-                        if parameter.kind() != "formal_parameter" {
-                            continue;
-                        }
-                        let Some(binding) = parameter.child_by_field_name("name") else {
-                            continue;
-                        };
-                        if text(binding, source) == text(object, source) {
-                            known_parameter = true;
-                            let mut cursor = parameter.walk();
-                            if parameter
-                                .named_children(&mut cursor)
-                                .any(|child| child.kind() == "dimensions")
-                            {
-                                return None;
+            let mut known_binding = false;
+            let inferred = node.child_by_field_name("object").and_then(|object| {
+                let (receiver, fields_only) = match object.kind() {
+                    "identifier" => (text(object, source), false),
+                    "field_access"
+                        if object
+                            .child_by_field_name("object")
+                            .is_some_and(|base| base.kind() == "this") =>
+                    {
+                        (text(object.child_by_field_name("field")?, source), true)
+                    }
+                    _ => return None,
+                };
+                if !fields_only {
+                    if let Some(parameters) = owner.child_by_field_name("parameters") {
+                        let mut cursor = parameters.walk();
+                        for parameter in parameters.named_children(&mut cursor) {
+                            if parameter.kind() != "formal_parameter" {
+                                continue;
                             }
-                            let name = type_name(parameter.child_by_field_name("type")?, source)?;
-                            if type_parameter(owner, name.split("::").next()?, source) {
-                                return None;
-                            }
-                            let arguments = node.child_by_field_name("arguments")?;
-                            let mut cursor = arguments.walk();
-                            return Some(ParameterCall {
-                                receiver: name,
-                                arguments: arguments
+                            let Some(binding) = parameter.child_by_field_name("name") else {
+                                continue;
+                            };
+                            if text(binding, source) == receiver {
+                                known_binding = true;
+                                let mut cursor = parameter.walk();
+                                if parameter
                                     .named_children(&mut cursor)
-                                    .filter(|argument| !argument.is_extra())
-                                    .count(),
-                            });
+                                    .any(|child| child.kind() == "dimensions")
+                                {
+                                    return None;
+                                }
+                                let name =
+                                    type_name(parameter.child_by_field_name("type")?, source)?;
+                                if type_parameter(owner, name.split("::").next()?, source) {
+                                    return None;
+                                }
+                                let arguments = node.child_by_field_name("arguments")?;
+                                let mut cursor = arguments.walk();
+                                return Some(ParameterCall {
+                                    receiver: name,
+                                    arguments: arguments
+                                        .named_children(&mut cursor)
+                                        .filter(|argument| !argument.is_extra())
+                                        .count(),
+                                });
+                            }
                         }
                     }
-                    None
-                });
-            if known_parameter {
+                }
+                let declared = variable_type(node, receiver, fields_only, &scopes)?;
+                known_binding = true;
+                let declared = declared?;
+                if type_parameter(owner, declared.split("::").next()?, source) {
+                    return None;
+                }
+                let arguments = node.child_by_field_name("arguments")?;
+                let mut cursor = arguments.walk();
+                Some(ParameterCall {
+                    receiver: declared.to_owned(),
+                    arguments: arguments
+                        .named_children(&mut cursor)
+                        .filter(|argument| !argument.is_extra())
+                        .count(),
+                })
+            });
+            if known_binding {
                 tracked.insert(key.clone());
             }
             result
@@ -218,7 +349,7 @@ impl JavaSource {
                 .or_insert(inferred);
             WalkControl::Continue
         });
-        // Retain unknown parameter types and collisions as negative evidence.
+        // Retain unknown binding types and collisions as negative evidence.
         // Removing them would revive an unrelated name-based fallback.
         result.invocations.retain(|key, _| tracked.contains(key));
         Ok(result)
@@ -261,6 +392,40 @@ impl JavaSource {
 #[cfg(test)]
 mod tests {
     use super::JavaSource;
+
+    #[test]
+    fn fields_and_locals_respect_declaration_order_and_scope() {
+        let java = JavaSource::parse("class Probe {\n A receiver;\n void field() { receiver.leaf(); }\n void local() { B receiver = new B(); receiver.leaf(); }\n void before() { receiver.leaf(); B receiver = new B(); }\n void sibling() {\n  { B receiver = new B(); receiver.leaf(); }\n  receiver.leaf();\n }\n}\n").unwrap();
+        assert_eq!(java.receiver_type("field", 3, 3, "leaf"), Some("A"));
+        assert_eq!(java.receiver_type("local", 4, 4, "leaf"), Some("B"));
+        assert_eq!(java.receiver_type("before", 5, 5, "leaf"), Some("A"));
+        assert_eq!(java.receiver_type("sibling", 6, 7, "leaf"), Some("B"));
+        assert_eq!(java.receiver_type("sibling", 6, 8, "leaf"), Some("A"));
+    }
+
+    #[test]
+    fn this_field_does_not_borrow_a_parameter_or_local_binding() {
+        let java = JavaSource::parse("class Probe {\n A receiver;\n void parameter(B receiver) { receiver.leaf(); }\n void explicit(B receiver) { this.receiver.leaf(); }\n void local() { B receiver = new B(); this.receiver.leaf(); }\n}\n").unwrap();
+        assert_eq!(java.receiver_type("parameter", 3, 3, "leaf"), Some("B"));
+        assert_eq!(java.receiver_type("explicit", 4, 4, "leaf"), Some("A"));
+        assert_eq!(java.receiver_type("local", 5, 5, "leaf"), Some("A"));
+    }
+
+    #[test]
+    fn array_and_inferred_bindings_remain_unresolved() {
+        let java = JavaSource::parse("class Probe {\n A receiver[];\n void field() { receiver.leaf(); }\n void local() { A receiver[] = null; receiver.leaf(); }\n void inferred() { var receiver = factory(); receiver.leaf(); }\n}\n").unwrap();
+        assert_eq!(java.receiver_type("field", 3, 3, "leaf"), None);
+        assert_eq!(java.receiver_type("local", 4, 4, "leaf"), None);
+        assert_eq!(java.receiver_type("inferred", 5, 5, "leaf"), None);
+        assert!(java
+            .parameter_call("field", 3, 3, "leaf")
+            .unwrap()
+            .is_none());
+        assert!(java
+            .parameter_call("inferred", 5, 5, "leaf")
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn explicit_parameters_keep_the_callable_and_reference_identity() {

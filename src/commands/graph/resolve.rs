@@ -1674,7 +1674,7 @@ impl Builder {
             .ok_or(DropReason::ReceiverUnresolved)
     }
 
-    /// Explicit Java parameter types narrow a receiver to its declaration
+    /// Explicit Java binding types narrow a receiver to its declaration
     /// scope before name-based fallback. Unknown/ambiguous types are not
     /// guessed from the one method that happens to exist elsewhere.
     fn resolve_java_parameter_call(

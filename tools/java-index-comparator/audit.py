@@ -61,6 +61,7 @@ import java_dependency_contracts
 import android_dependency_contracts
 import format_contracts
 import file_view_contracts
+import file_scope_contracts
 
 
 SCHEMA = """
@@ -507,6 +508,7 @@ class Fixture:
         self._receiver_results = None
         self._format_results = None
         self._file_view_results = None
+        self._file_scope_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
         self._rank_results = None
@@ -1765,6 +1767,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def file_scope_check(self, check: sqlite3.Row):
+        if self._file_scope_results is None:
+            self._file_scope_results = file_scope_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._file_scope_results)
+        return {'source': file_scope_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def stack_check(self, check: sqlite3.Row):
         expected, actual = stack_contracts.exercise(self.binary, self.database.parent)
         return {'source': stack_contracts.REASON, 'samples': expected}, actual, \
@@ -1850,6 +1860,8 @@ class Fixture:
                 handler = self.format_check
             if check['feature'] in file_view_contracts.FEATURES:
                 handler = self.file_view_check
+            if check['feature'] in file_scope_contracts.FEATURES:
+                handler = self.file_scope_check
             if check['feature'] in stack_contracts.FEATURES:
                 handler = self.stack_check
             if check['feature'] in android_contracts.FEATURES:
@@ -1938,6 +1950,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(android_dependency_contracts.FEATURES)
     features.update(format_contracts.FEATURES)
     features.update(file_view_contracts.FEATURES)
+    features.update(file_scope_contracts.FEATURES)
     return features
 
 
@@ -2076,6 +2089,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     android_dependency_contracts.plan_dependencies(state, root)
     format_contracts.plan_formats(state, root)
     file_view_contracts.plan_views(state, root)
+    file_scope_contracts.plan_scope(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

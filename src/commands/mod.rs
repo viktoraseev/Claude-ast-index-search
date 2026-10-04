@@ -250,6 +250,16 @@ impl PathResolver {
         true
     }
 
+    /// Scope an existing canonical source path by its most specific owning
+    /// root. Forced nested attachments must not leak into `--local` views.
+    pub(crate) fn source_path_matches_filter(&self, path: &Path) -> bool {
+        let owner = std::iter::once((&self.primary_key, &self.primary))
+            .chain(self.extra.iter().map(|(key, path)| (key, path)))
+            .filter(|(_, root)| path.starts_with(root))
+            .max_by_key(|(_, root)| root.components().count());
+        owner.is_some_and(|(key, _)| self.matches_filter(Some(key)))
+    }
+
     /// Format a path for human-readable output: prefixes `[name] ` when the
     /// file belongs to a named subtree, otherwise returns the resolved
     /// absolute path unchanged. Use for text output; structured JSON output
