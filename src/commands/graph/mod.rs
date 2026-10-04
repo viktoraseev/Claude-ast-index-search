@@ -32,6 +32,7 @@
 //! index and flags a stale graph instead of answering from outdated edges
 //! silently.
 
+mod java;
 mod metrics;
 mod resolve;
 mod rust;

@@ -18,9 +18,10 @@ FEATURES = ({'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle'} 
 REASON = ('independent source/state: disposable Java qualified graph seeds, local invocation '
           'edges, traversal caps, graph freshness, rational stationary metrics, ranked '
           'pages, shortest-path pagination and traversal/metrics/top text rendering; not MCP equivalence')
-PENDING_REASON = ('Java import/package/receiver/overload resolution, attached-root traversal, '
+PENDING_REASON = ('Java type-reference import binding, local/field/generic receiver and overload type resolution, attached-root traversal, '
                   'ambiguity budgets, ambiguous/attached-root rendering and overlapping path seeds remain unresolved; '
-                  'graph subcontracts cover disposable local Java invocations, traversal pages/rendering and metrics/top only')
+                  'separate source contracts cover local invocations and explicit parameter binding/arity/guards, '
+                  'traversal pages/rendering and metrics/top; not full MCP equivalence')
 SOURCE = '''package fixture.{package};
 class Probe {{
     int leaf() {{ return 1; }}

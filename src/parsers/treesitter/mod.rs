@@ -136,7 +136,7 @@ pub fn get_treesitter_parser(file_type: FileType) -> Option<&'static dyn Languag
 }
 
 /// Helper: parse source code with a tree-sitter language
-fn parse_tree(content: &str, language: &Language) -> Result<Tree> {
+pub(crate) fn parse_tree(content: &str, language: &Language) -> Result<Tree> {
     forget_line_starts();
     PARSER.with(|p| {
         let mut parser = p.borrow_mut();

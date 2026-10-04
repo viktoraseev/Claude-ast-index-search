@@ -12,6 +12,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use super::java::JavaSource;
 use super::metrics::compute_metrics;
 use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
@@ -244,6 +245,7 @@ fn parse_module_imports(
 enum ParsedSource {
     Js(ModuleImports, Vec<ImportTarget>),
     Rust(FileUses),
+    Java(JavaSource),
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +573,7 @@ struct FileNode {
     /// names to the module, so a name that is neither defined in the file nor
     /// imported cannot denote another file's definition.
     module: Option<ModuleImports>,
+    java: Option<JavaSource>,
     /// Rust only: the crate ([`RustIndex::crates`]) and the module path the
     /// file is (`commands::graph` for `src/commands/graph/mod.rs`). Its
     /// top-level definitions live in that namespace.
@@ -681,12 +684,17 @@ impl Builder {
             .par_iter()
             .map(|row| {
                 let family = language_family(&row.path);
-                if !matches!(family, "js" | "rust") || db::is_third_party_path(&row.path) {
+                if (!matches!(family, "js" | "rust") && !row.path.ends_with(".java"))
+                    || db::is_third_party_path(&row.path)
+                {
                     return None;
                 }
                 let content =
                     std::fs::read_to_string(absolute_file_path(root, &row.root_path, &row.path))
                         .ok()?;
+                if row.path.ends_with(".java") {
+                    return JavaSource::parse(&content).ok().map(ParsedSource::Java);
+                }
                 if family == "rust" {
                     return parse_uses(&content).map(ParsedSource::Rust);
                 }
@@ -704,13 +712,14 @@ impl Builder {
             file_index.insert(row.id, index);
             let family = language_family(&row.path);
             let vendor = db::is_third_party_path(&row.path);
-            let (module, imports) = match parsed {
-                Some(ParsedSource::Js(module, imports)) => (Some(module), imports),
+            let (module, imports, java) = match parsed {
+                Some(ParsedSource::Js(module, imports)) => (Some(module), imports, None),
                 Some(ParsedSource::Rust(uses)) => {
                     rust_uses.push((index, uses));
-                    (None, Vec::new())
+                    (None, Vec::new(), None)
                 }
-                None => (None, Vec::new()),
+                Some(ParsedSource::Java(java)) => (None, Vec::new(), Some(java)),
+                None => (None, Vec::new(), None),
             };
             let (rust_crate, namespace) = if family == "rust" && !vendor {
                 let location = module_location(&row.path);
@@ -731,6 +740,8 @@ impl Builder {
                     rust.modules.insert((id, prefix.clone()));
                 }
                 (Some(id), location.module)
+            } else if let Some(java) = &java {
+                (None, java.package.clone())
             } else {
                 (None, String::new())
             };
@@ -744,6 +755,7 @@ impl Builder {
                 symbols: Vec::new(),
                 imports,
                 module,
+                java,
                 rust_crate,
                 namespace,
             });
@@ -1662,6 +1674,117 @@ impl Builder {
             .ok_or(DropReason::ReceiverUnresolved)
     }
 
+    /// Explicit Java parameter types narrow a receiver to its declaration
+    /// scope before name-based fallback. Unknown/ambiguous types are not
+    /// guessed from the one method that happens to exist elsewhere.
+    fn resolve_java_parameter_call(
+        &self,
+        file: u32,
+        source: u32,
+        name: &str,
+        line: i64,
+    ) -> Option<Result<Resolution, DropReason>> {
+        let java = self.files[file as usize].java.as_ref()?;
+        let owner = &self.syms[source as usize];
+        let call = java.parameter_call(&owner.name, owner.line, line, name)?;
+        let Some(call) = call else {
+            return Some(Err(DropReason::ReceiverUnresolved));
+        };
+        let declared = call.receiver.as_str();
+        let lookup = |qualified: &str| -> Vec<u32> {
+            self.by_qual
+                .get(qualified)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&candidate| {
+                    is_container_kind(&self.syms[candidate as usize].kind)
+                        && self.family_of(candidate) == "jvm"
+                        && self.visible_from(file, candidate)
+                })
+                .collect()
+        };
+        let resolve = |classes: Vec<u32>| -> Result<Resolution, DropReason> {
+            let [class] = classes.as_slice() else {
+                return Err(DropReason::ReceiverUnresolved);
+            };
+            let resolution = self
+                .resolve_in_hierarchy(*class, source, name, false)
+                .ok_or(DropReason::ReceiverUnresolved)?;
+            let targets: Vec<u32> = resolution
+                .targets
+                .into_iter()
+                .filter(|&candidate| {
+                    let symbol = &self.syms[candidate as usize];
+                    self.files[symbol.file as usize]
+                        .java
+                        .as_ref()
+                        .is_some_and(|syntax| {
+                            syntax.accepts_arguments(&symbol.name, symbol.line, call.arguments)
+                        })
+                })
+                .collect();
+            match targets.len() {
+                0 => Err(DropReason::ReceiverUnresolved),
+                1 => Ok(Resolution::new(Confidence::Scoped, targets)),
+                _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
+            }
+        };
+        // Enclosing/nested types shadow imports. Do not broaden named-package
+        // lookup into inaccessible classes in the default package.
+        let mut namespace = self.namespace_of(source);
+        while namespace != java.package {
+            let classes = lookup(&join_path(namespace, &[declared]));
+            if !classes.is_empty() {
+                return Some(resolve(classes));
+            }
+            let Some((parent, _)) = namespace.rsplit_once("::") else {
+                break;
+            };
+            namespace = parent;
+        }
+        let (head, tail) = declared.split_once("::").unwrap_or((declared, ""));
+        let mut imported = Vec::new();
+        let mut explicit_import = false;
+        for binding in &java.imports {
+            if binding.rsplit("::").next() == Some(head) {
+                explicit_import = true;
+                let qualified = if tail.is_empty() {
+                    binding.clone()
+                } else {
+                    join_path(binding, &[tail])
+                };
+                imported.extend(lookup(&qualified));
+            }
+        }
+        imported.sort_unstable();
+        imported.dedup();
+        // An external explicit import still binds the name. Its absence
+        // from this index does not make a same-package class the receiver.
+        if explicit_import {
+            return Some(resolve(imported));
+        }
+        let classes = lookup(&join_path(&java.package, &[declared]));
+        if !classes.is_empty() {
+            return Some(resolve(classes));
+        }
+        if declared.contains("::") {
+            let classes = lookup(declared);
+            if !classes.is_empty() {
+                return Some(resolve(classes));
+            }
+        }
+        let mut on_demand = lookup(&join_path("java::lang", &[declared]));
+        for binding in &java.imports {
+            if let Some(package) = binding.strip_suffix("::*") {
+                on_demand.extend(lookup(&join_path(package, &[declared])));
+            }
+        }
+        on_demand.sort_unstable();
+        on_demand.dedup();
+        Some(resolve(on_demand))
+    }
+
     fn resolve_reference(
         &self,
         file: u32,
@@ -1678,6 +1801,9 @@ impl Builder {
             Usage::Label => return Err(DropReason::Label),
             Usage::Prose => return Err(DropReason::Prose),
             _ => {}
+        }
+        if let Some(resolution) = self.resolve_java_parameter_call(file, source, name, line) {
+            return resolution;
         }
         let cands = self.candidates(name, node.family, file);
         if cands.iter().any(|&c| {

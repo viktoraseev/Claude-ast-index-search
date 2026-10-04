@@ -1170,12 +1170,13 @@ fn apply_rwr(
         })?;
     for (i, sym) in seeds.iter().enumerate() {
         let sid = g.intern(sym);
-        // A seed the graph resolves no edge to — calls through a receiver of
-        // unknown type in Java, Swift, Go — keeps the name-matched callers.
+        // A fresh graph's empty Java caller set must stay empty: a name
+        // fallback would borrow calls dispatched to another receiver type.
+        // Other language families retain their existing lexical fallback.
         let resolved = graph_dependents
             .as_ref()
             .map(|dependents| dependents[i].clone())
-            .filter(|dependents| !dependents.is_empty());
+            .filter(|dependents| sym.path.ends_with(".java") || !dependents.is_empty());
         let callers: Vec<SearchResult> = match resolved {
             Some(dependents) => dependents,
             None => {
