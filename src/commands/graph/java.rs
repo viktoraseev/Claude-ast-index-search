@@ -13,9 +13,16 @@ static LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_java::LANGUAG
 pub(super) struct JavaSource {
     pub package: String,
     pub imports: Vec<String>,
+    /// Reference rows carry a line and name, not a byte position. Colliding
+    /// paths or value/type uses on one line remain explicit negative evidence.
+    types: HashMap<(i64, String), Option<String>>,
+    /// Graph binding needs the full syntax path; legacy inheritance rows may
+    /// contain only its short name.
+    parents: HashMap<(String, i64), Vec<String>>,
     /// Callable identity, reference line and name; None means colliding or
     /// unsupported invocations. Never confidently choose the first on a line.
     invocations: HashMap<(String, i64, i64, String), Option<ParameterCall>>,
+    direct_calls: HashMap<(String, i64, i64, String), Option<usize>>,
     parameters: HashMap<(String, i64), Option<(usize, bool)>>,
 }
 
@@ -221,6 +228,126 @@ impl JavaSource {
                 _ => {}
             }
         }
+        let mut type_sites = HashSet::new();
+        walk_tree_preorder(&tree.root_node(), |node| {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut parents = Vec::new();
+                    let mut cursor = node.walk();
+                    for branch in node.named_children(&mut cursor) {
+                        if matches!(
+                            branch.kind(),
+                            "superclass" | "super_interfaces" | "extends_interfaces"
+                        ) {
+                            walk_tree_preorder(&branch, |parent| {
+                                if matches!(
+                                    parent.kind(),
+                                    "type_identifier" | "scoped_type_identifier" | "generic_type"
+                                ) {
+                                    if let Some(path) = type_name(parent, source) {
+                                        parents.push(path);
+                                    }
+                                    return WalkControl::SkipChildren;
+                                }
+                                WalkControl::Continue
+                            });
+                        }
+                    }
+                    result.parents.insert(
+                        (
+                            text(name, source).to_owned(),
+                            name.start_position().row as i64 + 1,
+                        ),
+                        parents,
+                    );
+                }
+            }
+            if matches!(
+                node.kind(),
+                "package_declaration"
+                    | "import_declaration"
+                    | "line_comment"
+                    | "block_comment"
+                    | "string_literal"
+                    | "character_literal"
+            ) {
+                return WalkControl::SkipChildren;
+            }
+            if !matches!(node.kind(), "identifier" | "type_identifier") {
+                return WalkControl::Continue;
+            }
+            let parent = node.parent();
+            let declaration_name = parent.is_some_and(|parent| {
+                (parent.kind().ends_with("_declaration")
+                    || matches!(
+                        parent.kind(),
+                        "variable_declarator"
+                            | "formal_parameter"
+                            | "spread_parameter"
+                            | "catch_formal_parameter"
+                            | "type_parameter"
+                            | "enum_constant"
+                            | "enhanced_for_statement"
+                            | "type_pattern"
+                            | "instanceof_expression"
+                    ))
+                    && parent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| name.id() == node.id())
+            });
+            if declaration_name {
+                return WalkControl::Continue;
+            }
+            let annotation = parent
+                .is_some_and(|parent| matches!(parent.kind(), "annotation" | "marker_annotation"));
+            let typed = node.kind() == "type_identifier" || annotation;
+            let key = (
+                node.start_position().row as i64 + 1,
+                text(node, source).to_owned(),
+            );
+            let binding = if typed {
+                type_sites.insert(key.clone());
+                let mut path = node;
+                while let Some(parent) = path.parent() {
+                    if parent.kind() != "scoped_type_identifier"
+                        || !parent
+                            .named_child(parent.named_child_count().saturating_sub(1) as u32)
+                            .is_some_and(|name| name.id() == path.id())
+                    {
+                        break;
+                    }
+                    path = parent;
+                }
+                type_name(path, source).filter(|name| {
+                    !path.has_error()
+                        && !type_parameter(
+                            node,
+                            name.split("::").next().unwrap_or_default(),
+                            source,
+                        )
+                })
+            } else {
+                None
+            };
+            result
+                .types
+                .entry(key)
+                .and_modify(|previous| {
+                    if *previous != binding {
+                        *previous = None;
+                    }
+                })
+                .or_insert(binding);
+            WalkControl::Continue
+        });
+        result.types.retain(|key, _| type_sites.contains(key));
         let mut tracked = HashSet::new();
         walk_tree_preorder(&tree.root_node(), |node| {
             if matches!(
@@ -269,6 +396,30 @@ impl JavaSource {
                 name.start_position().row as i64 + 1,
                 text(name, source).to_owned(),
             );
+            if text(owner_name, source) == text(name, source) {
+                let direct_call = node
+                    .child_by_field_name("object")
+                    .is_none_or(|object| object.kind() == "this")
+                    .then(|| {
+                        node.child_by_field_name("arguments").map(|arguments| {
+                            let mut cursor = arguments.walk();
+                            arguments
+                                .named_children(&mut cursor)
+                                .filter(|argument| !argument.is_extra())
+                                .count()
+                        })
+                    })
+                    .flatten();
+                result
+                    .direct_calls
+                    .entry(key.clone())
+                    .and_modify(|previous| {
+                        if *previous != direct_call {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(direct_call);
+            }
             let mut known_binding = false;
             let inferred = node.child_by_field_name("object").and_then(|object| {
                 let (receiver, fields_only) = match object.kind() {
@@ -355,6 +506,16 @@ impl JavaSource {
         Ok(result)
     }
 
+    pub fn parent_types(&self, name: &str, line: i64) -> Option<&[String]> {
+        self.parents
+            .get(&(name.to_owned(), line))
+            .map(Vec::as_slice)
+    }
+
+    pub fn type_reference(&self, line: i64, name: &str) -> Option<&Option<String>> {
+        self.types.get(&(line, name.to_owned()))
+    }
+
     pub fn parameter_call(
         &self,
         owner: &str,
@@ -364,6 +525,13 @@ impl JavaSource {
     ) -> Option<&Option<ParameterCall>> {
         self.invocations
             .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+    }
+
+    pub fn recursive_arguments(&self, owner: &str, owner_line: i64, line: i64) -> Option<usize> {
+        self.direct_calls
+            .get(&(owner.to_owned(), owner_line, line, owner.to_owned()))
+            .copied()
+            .flatten()
     }
 
     pub fn accepts_arguments(&self, name: &str, line: i64, arguments: usize) -> bool {
@@ -392,6 +560,73 @@ impl JavaSource {
 #[cfg(test)]
 mod tests {
     use super::JavaSource;
+
+    #[test]
+    fn parent_paths_preserve_qualifiers_nesting_and_generic_erasure() {
+        let java = JavaSource::parse(
+            r#"class Child extends fixture.a.Leaf<String> implements fixture.b.Face, Outer.Inner {}
+interface Face extends fixture.a.Base<String>, Other {}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            java.parent_types("Child", 1).unwrap(),
+            ["fixture::a::Leaf", "fixture::b::Face", "Outer::Inner"]
+        );
+        assert_eq!(
+            java.parent_types("Face", 2).unwrap(),
+            ["fixture::a::Base", "Other"]
+        );
+    }
+
+    #[test]
+    fn type_references_preserve_qualified_paths_and_generic_shadows() {
+        let java = JavaSource::parse(
+            r#"class Probe<Leaf> {
+ fixture.a.Leaf qualified;
+ Leaf generic;
+ Outer.Inner nested;
+ java.util.List<fixture.a.Leaf[]> arguments;
+}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            java.type_reference(2, "Leaf"),
+            Some(&Some("fixture::a::Leaf".to_owned()))
+        );
+        assert_eq!(java.type_reference(3, "Leaf"), Some(&None));
+        assert_eq!(
+            java.type_reference(4, "Outer"),
+            Some(&Some("Outer".to_owned()))
+        );
+        assert_eq!(
+            java.type_reference(4, "Inner"),
+            Some(&Some("Outer::Inner".to_owned()))
+        );
+        assert_eq!(
+            java.type_reference(5, "List"),
+            Some(&Some("java::util::List".to_owned()))
+        );
+        assert_eq!(
+            java.type_reference(5, "Leaf"),
+            Some(&Some("fixture::a::Leaf".to_owned()))
+        );
+    }
+
+    #[test]
+    fn type_rows_keep_same_line_path_and_value_collisions_unresolved() {
+        let java = JavaSource::parse(
+            r#"class Probe {
+ void collision(A value, other.A another) {}
+ void value(A input) { Object A = null; consume(A); }
+ void repeated(A first, A second) {}
+}"#,
+        )
+        .unwrap();
+        assert_eq!(java.type_reference(2, "A"), Some(&None));
+        assert_eq!(java.type_reference(3, "A"), Some(&None));
+        assert_eq!(java.type_reference(4, "A"), Some(&Some("A".to_owned())));
+    }
 
     #[test]
     fn fields_and_locals_respect_declaration_order_and_scope() {

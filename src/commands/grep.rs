@@ -15,7 +15,7 @@
 //! - flows: Find Flow declarations
 //! - previews: Find @Preview functions
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -733,6 +733,70 @@ fn find_caller_functions(
     // references, and attributes calls even when declarations share a line.
     // Parse one file at a time; retain at most `limit` owners per requested name.
     let mut java_callers: Vec<CallerSites> = vec![Vec::new(); function_names.len()];
+    let mut graph_answered = vec![false; function_names.len()];
+    if let Some(conn) = conn {
+        let state = db::symbol_graph_state(conn)?;
+        if state.built && !state.stale {
+            let resolver = PathResolver::from_conn(root, conn).with_decoration(false);
+            let selected: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
+            let absolute = |path: &str, root_path: Option<&str>| {
+                let path = PathBuf::from(resolver.resolve_with_root_raw(path, root_path));
+                if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                }
+            };
+            for ((name, sites), answered) in function_names
+                .iter()
+                .zip(java_callers.iter_mut())
+                .zip(graph_answered.iter_mut())
+            {
+                // A receiver spelling (p.leaf, this.leaf) selects syntax
+                // occurrences, not the declaration name stored in the graph.
+                if name.contains('.') {
+                    continue;
+                }
+                let targets: Vec<db::SearchResult> = db::find_graph_symbols_by_name(conn, name)?
+                    .into_iter()
+                    .filter(|symbol| symbol.kind == "function" && symbol.path.ends_with(".java"))
+                    .map(|symbol| db::SearchResult {
+                        name: symbol.name,
+                        qualified_name: symbol.qualified_name,
+                        kind: symbol.kind,
+                        line: symbol.line,
+                        end_line: symbol.end_line,
+                        signature: None,
+                        path: symbol.path,
+                        root_path: symbol.root_path,
+                    })
+                    .collect();
+                if let Some(callers) =
+                    super::graph::resolved_callers_of_filtered(conn, &targets, limit, |source| {
+                        let path = absolute(&source.path, source.root_path.as_deref());
+                        source.kind == "function"
+                            && source.path.ends_with(".java")
+                            && selected.contains(path.as_path())
+                            && in_file
+                                .is_none_or(|filter| relative_path(root, &path).contains(filter))
+                    })?
+                {
+                    for source in callers.into_iter().flatten() {
+                        let path = absolute(&source.path, source.root_path.as_deref());
+                        sites.push((
+                            source.name,
+                            relative_path(root, &path),
+                            source.line as usize,
+                        ));
+                    }
+                    sites.sort_by(|a, b| (&a.1, a.2, &a.0).cmp(&(&b.1, b.2, &b.0)));
+                    sites.dedup();
+                    sites.truncate(limit);
+                    *answered = true;
+                }
+            }
+        }
+    }
     let mut other_files = Vec::new();
     for path in files {
         if !path
@@ -740,6 +804,12 @@ fn find_caller_functions(
             .is_some_and(|extension| extension == "java")
         {
             other_files.push(path.clone());
+            continue;
+        }
+        // A fresh graph is authoritative about resolved Java calls, even
+        // when the set is empty. A lexical fallback would invent a caller
+        // dispatched to an external or different receiver type.
+        if graph_answered.iter().all(|answered| *answered) {
             continue;
         }
         let rel = relative_path(root, path);
@@ -752,7 +822,11 @@ fn find_caller_functions(
         let content = read_java_syntax_source(path, crate::indexer::max_file_size_bytes())?;
         let owners =
             crate::parsers::treesitter::java::invocation_callers(&content, function_names, limit)?;
-        for (sites, owners) in java_callers.iter_mut().zip(owners) {
+        for ((sites, owners), answered) in java_callers.iter_mut().zip(owners).zip(&graph_answered)
+        {
+            if *answered {
+                continue;
+            }
             let remaining = limit.saturating_sub(sites.len());
             sites.extend(
                 owners

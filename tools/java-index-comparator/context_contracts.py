@@ -11,7 +11,7 @@ REASON = ('independent source/state: disposable Java invocations, caller ownersh
           'depth/filter/limits and exploration source/outline/scoped neighbours; not MCP equivalence')
 PENDING = {
     'call-tree:semantic-resolution': 'Name-based caller expansion does not establish Java receiver/overload dispatch, colliding same-name/same-line owners or attached-root scope; separate source/MCP contract required',
-    'explore:semantic-resolution': 'Java local/field/generic receiver and overload type dispatch, same-name overloads sharing a line, type-reference binding and attached-root neighbour resolution remain unresolved; separate explicit parameter/arity and fresh-graph empty caller contracts do not establish compiler-wide dispatch or MCP equivalence',
+    'explore:semantic-resolution': 'Java local/field/generic receiver and overload type dispatch, same-name overloads sharing a line, type-reference visibility/static imports/local-class shadows and attached-root neighbour resolution remain unresolved; separate syntax type binding/guards, explicit parameter/arity and fresh-graph empty caller contracts do not establish compiler-wide dispatch or MCP equivalence',
 }
 
 
@@ -145,6 +145,16 @@ class Foreign extends Probe {
         for built in (False, True):
             if built:
                 runner.command('graph', 'build')
+            tree(f'qualified-spelling:graph:{built}', ['p.build', '--depth', '2'],
+                 "Call tree for 'p.build':\n  p.build\n    ← start (a/Entry.java:3)\n")
+            tree(f'qualified-filter-before-limit:graph:{built}',
+                 ['p.build', '--depth', '1', '--limit', '1', '--in-file', 'Entry'],
+                 "Call tree for 'p.build':\n  p.build\n    ← start (a/Entry.java:3)\n")
+            tree(f'qualified-empty-filter:graph:{built}', ['p.build', '--in-file', 'absent'],
+                 "Call tree for 'p.build':\n  p.build\n")
+            tree(f'recursive-same-line:graph:{built}', ['recursive', '--depth', '2'],
+                 "Call tree for 'recursive':\n  recursive\n"
+                 "    ← recursive (a/Probe.java:9) (expanded above)\n")
             doc = explore('scoped-inheritance', 'Probe', flags=('--rwr',), cwd=runner.root / 'a')
             record('explore', f'scoped-inheritance:{built}', True,
                    any(r['path'] == 'a/LocalChild.java' and r['link'] == 'subclass' for r in doc['neighbours']))

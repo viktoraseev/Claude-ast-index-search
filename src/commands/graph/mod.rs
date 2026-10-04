@@ -471,6 +471,27 @@ pub(crate) fn resolved_dependents_of_filtered(
     limit: usize,
     keep: impl Fn(&GraphSymbolInfo) -> bool,
 ) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
+    resolved_dependents_filtered(conn, seeds, limit, false, keep)
+}
+
+/// Call trees include recursive calls; neighbour expansion deliberately does
+/// not. Keep the difference explicit rather than changing every graph consumer.
+pub(crate) fn resolved_callers_of_filtered(
+    conn: &Connection,
+    seeds: &[db::SearchResult],
+    limit: usize,
+    keep: impl Fn(&GraphSymbolInfo) -> bool,
+) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
+    resolved_dependents_filtered(conn, seeds, limit, true, keep)
+}
+
+fn resolved_dependents_filtered(
+    conn: &Connection,
+    seeds: &[db::SearchResult],
+    limit: usize,
+    include_self: bool,
+    keep: impl Fn(&GraphSymbolInfo) -> bool,
+) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
     let state = db::symbol_graph_state(conn)?;
     if !state.built || state.stale {
         return Ok(None);
@@ -491,7 +512,7 @@ pub(crate) fn resolved_dependents_of_filtered(
     let edges = db::load_symbol_edges_to(conn, &known, Confidence::Unique.code())?;
     let mut by_target: HashMap<i64, Vec<i64>> = HashMap::new();
     for edge in &edges {
-        if edge.source_id != edge.target_id {
+        if include_self || edge.source_id != edge.target_id {
             by_target
                 .entry(edge.target_id)
                 .or_default()

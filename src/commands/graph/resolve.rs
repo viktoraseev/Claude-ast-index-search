@@ -977,6 +977,7 @@ impl Builder {
             .collect();
         // (class, parent name, namespace the name is written in, superclass?)
         let mut links: Vec<(u32, String, String, bool)> = Vec::new();
+        let mut java_children = HashSet::new();
         for (child_id, parent_name) in db::load_inheritance_rows(conn)? {
             let Some(&child) = id_index.get(&child_id) else {
                 continue;
@@ -988,7 +989,21 @@ impl Builder {
                 .container
                 .map(|c| self.syms[c as usize].qual.clone())
                 .unwrap_or_else(|| self.files[child_sym.file as usize].namespace.clone());
-            links.push((child, parent_name, namespace, true));
+            if let Some(parents) = self.files[child_sym.file as usize]
+                .java
+                .as_ref()
+                .and_then(|java| java.parent_types(&child_sym.name, child_sym.line))
+            {
+                if java_children.insert(child) {
+                    links.extend(
+                        parents
+                            .iter()
+                            .map(|path| (child, path.clone(), namespace.clone(), true)),
+                    );
+                }
+            } else {
+                links.push((child, parent_name, namespace, true));
+            }
         }
         for sym in &self.syms {
             if sym.kind != "annotation" {
@@ -1015,7 +1030,12 @@ impl Builder {
                     .trim_start_matches("::")
                     .split("::")
                     .all(|segment| segment.chars().next().is_some_and(char::is_uppercase));
-            if !is_constant_path {
+            if !is_constant_path
+                && !(self.files[self.syms[child as usize].file as usize]
+                    .java
+                    .is_some()
+                    && !path.is_empty())
+            {
                 continue;
             }
             let types = self.resolve_type(child, &namespace, path, Some(child));
@@ -1324,6 +1344,12 @@ impl Builder {
         path: &str,
         exclude: Option<u32>,
     ) -> Vec<u32> {
+        if self.files[self.syms[scope as usize].file as usize]
+            .java
+            .is_some()
+        {
+            return self.resolve_java_type(scope, namespace, &path.replace('.', "::"), exclude);
+        }
         let absolute = path.starts_with("::");
         let rel = path.trim_start_matches("::");
         let name = rel.rsplit("::").next().unwrap_or(rel);
@@ -1690,20 +1716,6 @@ impl Builder {
         let Some(call) = call else {
             return Some(Err(DropReason::ReceiverUnresolved));
         };
-        let declared = call.receiver.as_str();
-        let lookup = |qualified: &str| -> Vec<u32> {
-            self.by_qual
-                .get(qualified)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|&candidate| {
-                    is_container_kind(&self.syms[candidate as usize].kind)
-                        && self.family_of(candidate) == "jvm"
-                        && self.visible_from(file, candidate)
-                })
-                .collect()
-        };
         let resolve = |classes: Vec<u32>| -> Result<Resolution, DropReason> {
             let [class] = classes.as_slice() else {
                 return Err(DropReason::ReceiverUnresolved);
@@ -1730,13 +1742,48 @@ impl Builder {
                 _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
             }
         };
+        Some(resolve(self.resolve_java_type(
+            source,
+            self.namespace_of(source),
+            &call.receiver,
+            None,
+        )))
+    }
+
+    /// Java syntax name binding, shared by type references and receiver calls.
+    /// An explicit external import binds even when no indexed declaration exists.
+    fn resolve_java_type(
+        &self,
+        source: u32,
+        namespace: &str,
+        declared: &str,
+        exclude: Option<u32>,
+    ) -> Vec<u32> {
+        let file = self.syms[source as usize].file;
+        let Some(java) = self.files[file as usize].java.as_ref() else {
+            return Vec::new();
+        };
+        let lookup = |qualified: &str| -> Vec<u32> {
+            self.by_qual
+                .get(qualified)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&candidate| {
+                    Some(candidate) != exclude
+                        && is_container_kind(&self.syms[candidate as usize].kind)
+                        && self.family_of(candidate) == "jvm"
+                        && self.visible_from(file, candidate)
+                })
+                .collect()
+        };
         // Enclosing/nested types shadow imports. Do not broaden named-package
         // lookup into inaccessible classes in the default package.
-        let mut namespace = self.namespace_of(source);
+        let mut namespace = namespace;
         while namespace != java.package {
             let classes = lookup(&join_path(namespace, &[declared]));
             if !classes.is_empty() {
-                return Some(resolve(classes));
+                return classes;
             }
             let Some((parent, _)) = namespace.rsplit_once("::") else {
                 break;
@@ -1762,16 +1809,16 @@ impl Builder {
         // An external explicit import still binds the name. Its absence
         // from this index does not make a same-package class the receiver.
         if explicit_import {
-            return Some(resolve(imported));
+            return imported;
         }
         let classes = lookup(&join_path(&java.package, &[declared]));
         if !classes.is_empty() {
-            return Some(resolve(classes));
+            return classes;
         }
         if declared.contains("::") {
             let classes = lookup(declared);
             if !classes.is_empty() {
-                return Some(resolve(classes));
+                return classes;
             }
         }
         let mut on_demand = lookup(&join_path("java::lang", &[declared]));
@@ -1782,7 +1829,7 @@ impl Builder {
         }
         on_demand.sort_unstable();
         on_demand.dedup();
-        Some(resolve(on_demand))
+        on_demand
     }
 
     fn resolve_reference(
@@ -1794,6 +1841,21 @@ impl Builder {
         context: Option<&str>,
     ) -> Result<Resolution, DropReason> {
         let node = &self.files[file as usize];
+        if let Some(binding) = node
+            .java
+            .as_ref()
+            .and_then(|java| java.type_reference(line, name))
+        {
+            let Some(path) = binding else {
+                return Err(DropReason::QualifiedUnresolved);
+            };
+            let types = self.resolve_java_type(source, self.namespace_of(source), path, None);
+            return match types.len() {
+                0 => Err(DropReason::QualifiedUnresolved),
+                1 => Ok(Resolution::new(Confidence::Scoped, types)),
+                _ => Ok(Resolution::new(Confidence::Ambiguous, types)),
+            };
+        }
         let ruby = node.family == "ruby";
         let usage = classify_usage(context, name, ruby);
         match usage {
@@ -1804,6 +1866,40 @@ impl Builder {
         }
         if let Some(resolution) = self.resolve_java_parameter_call(file, source, name, line) {
             return resolution;
+        }
+        let owner = &self.syms[source as usize];
+        if owner.kind == "function" && owner.name == name {
+            if let Some(arguments) = node
+                .java
+                .as_ref()
+                .and_then(|java| java.recursive_arguments(&owner.name, owner.line, line))
+            {
+                // A declaration and its recursive call may share a line.
+                // Syntax and arity must establish the call before the generic
+                // declaration/self-reference filters can discard its row.
+                let targets: Vec<u32> =
+                    self.by_qual
+                        .get(&owner.qual)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|&candidate| {
+                            let symbol = &self.syms[candidate as usize];
+                            symbol.kind == "function"
+                                && self.visible_from(file, candidate)
+                                && self.files[symbol.file as usize].java.as_ref().is_some_and(
+                                    |java| {
+                                        java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                                    },
+                                )
+                        })
+                        .collect();
+                return match targets.len() {
+                    0 => Err(DropReason::ReceiverUnresolved),
+                    1 => Ok(Resolution::new(Confidence::Scoped, targets)),
+                    _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
+                };
+            }
         }
         let cands = self.candidates(name, node.family, file);
         if cands.iter().any(|&c| {
@@ -2353,7 +2449,16 @@ fn resolve_file(
         let outcome = builder
             .resolve_reference(file, source, &name, line, context.as_deref())
             .and_then(|mut resolution| {
-                resolution.targets.retain(|&t| t != source);
+                let owner = &builder.syms[source as usize];
+                let recursive_java_call = owner.kind == "function"
+                    && owner.name == name
+                    && file_node.java.as_ref().is_some_and(|java| {
+                        java.recursive_arguments(&owner.name, owner.line, line)
+                            .is_some()
+                    });
+                resolution
+                    .targets
+                    .retain(|&t| t != source || recursive_java_call);
                 if resolution.targets.is_empty() {
                     Err(DropReason::SelfReference)
                 } else if !resolution.confidence.is_resolved()

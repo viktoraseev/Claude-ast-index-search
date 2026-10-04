@@ -56,6 +56,7 @@ import context_contracts
 import explore_contracts
 import graph_contracts
 import java_receiver_contracts
+import java_type_binding_contracts
 import unused_dep_contracts
 import java_dependency_contracts
 import android_dependency_contracts
@@ -506,6 +507,7 @@ class Fixture:
         self._unused_dep_results = None
         self._graph_results = None
         self._receiver_results = None
+        self._type_binding_results = None
         self._format_results = None
         self._file_view_results = None
         self._file_scope_results = None
@@ -1751,6 +1753,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def type_binding_check(self, check: sqlite3.Row):
+        if self._type_binding_results is None:
+            self._type_binding_results = java_type_binding_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._type_binding_results)
+        return {'source': java_type_binding_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def format_check(self, check: sqlite3.Row):
         if self._format_results is None:
             self._format_results = format_contracts.exercise(self.binary, self.database.parent)
@@ -1856,6 +1866,8 @@ class Fixture:
                 handler = self.graph_check
             if check['feature'] in java_receiver_contracts.FEATURES:
                 handler = self.receiver_check
+            if check['feature'] in java_type_binding_contracts.FEATURES:
+                handler = self.type_binding_check
             if check['feature'] in format_contracts.FEATURES:
                 handler = self.format_check
             if check['feature'] in file_view_contracts.FEATURES:
@@ -1945,6 +1957,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(explore_contracts.FEATURES)
     features.update(graph_contracts.FEATURES)
     features.update(java_receiver_contracts.FEATURES)
+    features.update(java_type_binding_contracts.FEATURES)
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
     features.update(java_dependency_contracts.FEATURES)
     features.update(android_dependency_contracts.FEATURES)
@@ -2084,6 +2097,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     explore_contracts.plan_explore(state, root)
     graph_contracts.plan_graph(state, root)
     java_receiver_contracts.plan_receivers(state, root)
+    java_type_binding_contracts.plan_types(state, root)
     unused_dep_contracts.plan_unused(state, root)
     java_dependency_contracts.plan_dependencies(state, root)
     android_dependency_contracts.plan_dependencies(state, root)
