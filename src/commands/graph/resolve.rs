@@ -1832,6 +1832,72 @@ impl Builder {
         on_demand
     }
 
+    fn resolve_java_static_call(
+        &self,
+        file: u32,
+        source: u32,
+        name: &str,
+        line: i64,
+    ) -> Option<Result<Resolution, DropReason>> {
+        let java = self.files[file as usize].java.as_ref()?;
+        let owner = &self.syms[source as usize];
+        let arguments = java.bare_arguments(&owner.name, owner.line, line, name)?;
+        let explicit: Vec<&str> = java
+            .static_imports
+            .iter()
+            .filter_map(|path| path.strip_suffix(&format!("::{name}")))
+            .collect();
+        let imported: Vec<&str> = if explicit.is_empty() {
+            java.static_imports
+                .iter()
+                .filter_map(|path| path.strip_suffix("::*"))
+                .collect()
+        } else {
+            explicit
+        };
+        if imported.is_empty() {
+            return None;
+        }
+        let Some(arguments) = arguments else {
+            return Some(Err(DropReason::ReceiverUnresolved));
+        };
+        let accepts = |target: u32| {
+            let symbol = &self.syms[target as usize];
+            symbol.kind == "function"
+                && self.visible_from(file, target)
+                && self.files[symbol.file as usize]
+                    .java
+                    .as_ref()
+                    .is_some_and(|java| {
+                        java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                    })
+        };
+        // Enclosing/inherited members take precedence over static imports.
+        if let Some(mut local) = self.resolve_in_class_scope(source, name) {
+            local.targets.retain(|&target| accepts(target));
+            if !local.targets.is_empty() {
+                return Some(Ok(local));
+            }
+        }
+        let mut targets = Vec::new();
+        for path in imported {
+            for class in self.resolve_java_type(source, self.namespace_of(source), path, None) {
+                if let Some(found) = self.resolve_in_hierarchy(class, source, name, true) {
+                    targets.extend(found.targets.into_iter().filter(|&target| accepts(target)));
+                }
+            }
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        // An explicit library import still binds when its class is absent
+        // from the native source index. Do not borrow an unrelated method.
+        Some(match targets.len() {
+            0 => Err(DropReason::ReceiverUnresolved),
+            1 => Ok(Resolution::new(Confidence::Import, targets)),
+            _ => Ok(Resolution::new(Confidence::Ambiguous, targets)),
+        })
+    }
+
     fn resolve_reference(
         &self,
         file: u32,
@@ -1865,6 +1931,9 @@ impl Builder {
             _ => {}
         }
         if let Some(resolution) = self.resolve_java_parameter_call(file, source, name, line) {
+            return resolution;
+        }
+        if let Some(resolution) = self.resolve_java_static_call(file, source, name, line) {
             return resolution;
         }
         let owner = &self.syms[source as usize];

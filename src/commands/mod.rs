@@ -253,11 +253,31 @@ impl PathResolver {
     /// Scope an existing canonical source path by its most specific owning
     /// root. Forced nested attachments must not leak into `--local` views.
     pub(crate) fn source_path_matches_filter(&self, path: &Path) -> bool {
-        let owner = std::iter::once((&self.primary_key, &self.primary))
+        self.source_owner(path)
+            .is_some_and(|(key, _)| self.matches_filter(Some(key)))
+    }
+
+    fn source_owner(&self, path: &Path) -> Option<(&str, &Path)> {
+        std::iter::once((&self.primary_key, &self.primary))
             .chain(self.extra.iter().map(|(key, path)| (key, path)))
             .filter(|(_, root)| path.starts_with(root))
-            .max_by_key(|(_, root)| root.components().count());
-        owner.is_some_and(|(key, _)| self.matches_filter(Some(key)))
+            .max_by_key(|(_, root)| root.components().count())
+            .map(|(key, root)| (key.as_str(), root.as_path()))
+    }
+
+    /// Match text selectors against the same owner-relative path SQL stores.
+    /// Display paths may be absolute or decorated and cannot serve as filters.
+    pub(crate) fn scoped_relative_path(&self, path: &Path) -> Option<String> {
+        let (key, owner) = self.source_owner(path)?;
+        if !self.matches_filter(Some(key)) {
+            return None;
+        }
+        Some(
+            path.strip_prefix(owner)
+                .ok()?
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     /// Format a path for human-readable output: prefixes `[name] ` when the

@@ -13,6 +13,7 @@ static LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_java::LANGUAG
 pub(super) struct JavaSource {
     pub package: String,
     pub imports: Vec<String>,
+    pub static_imports: Vec<String>,
     /// Reference rows carry a line and name, not a byte position. Colliding
     /// paths or value/type uses on one line remain explicit negative evidence.
     types: HashMap<(i64, String), Option<String>>,
@@ -23,6 +24,7 @@ pub(super) struct JavaSource {
     /// unsupported invocations. Never confidently choose the first on a line.
     invocations: HashMap<(String, i64, i64, String), Option<ParameterCall>>,
     direct_calls: HashMap<(String, i64, i64, String), Option<usize>>,
+    bare_calls: HashMap<(String, i64, i64, String), Option<usize>>,
     parameters: HashMap<(String, i64), Option<(usize, bool)>>,
 }
 
@@ -221,8 +223,12 @@ impl JavaSource {
                         }
                         WalkControl::Continue
                     });
-                    if !is_static && !parts.is_empty() {
-                        result.imports.push(parts.join("::"));
+                    if !parts.is_empty() {
+                        if is_static {
+                            result.static_imports.push(parts.join("::"));
+                        } else {
+                            result.imports.push(parts.join("::"));
+                        }
                     }
                 }
                 _ => {}
@@ -396,6 +402,24 @@ impl JavaSource {
                 name.start_position().row as i64 + 1,
                 text(name, source).to_owned(),
             );
+            if node.child_by_field_name("object").is_none() {
+                let arguments = node.child_by_field_name("arguments").map(|arguments| {
+                    let mut cursor = arguments.walk();
+                    arguments
+                        .named_children(&mut cursor)
+                        .filter(|argument| !argument.is_extra())
+                        .count()
+                });
+                result
+                    .bare_calls
+                    .entry(key.clone())
+                    .and_modify(|previous| {
+                        if *previous != arguments {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(arguments);
+            }
             if text(owner_name, source) == text(name, source) {
                 let direct_call = node
                     .child_by_field_name("object")
@@ -534,6 +558,18 @@ impl JavaSource {
             .flatten()
     }
 
+    pub fn bare_arguments(
+        &self,
+        owner: &str,
+        owner_line: i64,
+        line: i64,
+        name: &str,
+    ) -> Option<Option<usize>> {
+        self.bare_calls
+            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .copied()
+    }
+
     pub fn accepts_arguments(&self, name: &str, line: i64, arguments: usize) -> bool {
         self.parameters
             .get(&(name.to_owned(), line))
@@ -560,6 +596,24 @@ impl JavaSource {
 #[cfg(test)]
 mod tests {
     use super::JavaSource;
+
+    #[test]
+    fn static_imports_and_bare_call_arity_are_separate_from_type_imports() {
+        let java = JavaSource::parse("import java.util.List;\nimport static java.util.function.Function.identity;\nimport static java.lang.Integer.*;\nclass Probe {\n Object library() { return identity(/* no arguments */); }\n Integer qualified() { return Integer.valueOf(1); }\n}\n").unwrap();
+        assert_eq!(java.imports, ["java::util::List"]);
+        assert_eq!(
+            java.static_imports,
+            [
+                "java::util::function::Function::identity",
+                "java::lang::Integer::*"
+            ]
+        );
+        assert_eq!(
+            java.bare_arguments("library", 5, 5, "identity"),
+            Some(Some(0))
+        );
+        assert_eq!(java.bare_arguments("qualified", 6, 6, "valueOf"), None);
+    }
 
     #[test]
     fn parent_paths_preserve_qualifiers_nesting_and_generic_erasure() {

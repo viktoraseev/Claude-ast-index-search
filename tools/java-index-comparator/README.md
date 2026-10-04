@@ -46,6 +46,14 @@ using native DB rows as expected declarations. This is independent source/state
 coverage, not MCP equivalence. Other command formats, diagram-format selection
 and attached-root API scope remain pending.
 
+The Java navigation-scope fixture executes class, symbol, implementations,
+refs, usages, hierarchy and search on disposable sources in colliding roots.
+It checks literal file/module/cwd selector intersections, case, wildcard
+characters in paths, indexed and lexical usages, root ownership, pagination
+and rendered identities. This is independent source/state coverage, not MCP
+equivalence. Caller/call-tree selector composition and module/map/analysis/
+graph/conventions/explore scope remain pending in the overall scope matrix.
+
 Replay streams the first 100 failures in capture order plus every unsupported
 or error contract. Each check executes the current CLI against a rebuilt index;
 all recorded oracle operations and pagination requests are bound to their

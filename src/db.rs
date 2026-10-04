@@ -8292,17 +8292,19 @@ impl<'a> SearchScope<'a> {
     fn path_condition(&self) -> (String, Vec<String>) {
         let mut conditions = Vec::new();
         let mut params = Vec::new();
+        // Mirror matches_path literally: LIKE changes case and interprets
+        // underscores/percent signs in real filenames as wildcard patterns.
         if let Some(prefix) = self.dir_prefix {
-            conditions.push("f.path LIKE ?".to_string());
-            params.push(format!("{}%", prefix));
+            conditions.push("instr(f.path, ?) = 1".to_string());
+            params.push(prefix.to_string());
         }
         if let Some(file) = self.in_file {
-            conditions.push("f.path LIKE ?".to_string());
-            params.push(format!("%{}%", file));
+            conditions.push("instr(f.path, ?) > 0".to_string());
+            params.push(file.to_string());
         }
         if let Some(module) = self.module {
-            conditions.push("f.path LIKE ?".to_string());
-            params.push(format!("{}%", module));
+            conditions.push("instr(f.path, ?) = 1".to_string());
+            params.push(module.to_string());
         }
         if std::env::var_os("AST_INDEX_LOCAL_SCOPE").is_some() {
             conditions.push(

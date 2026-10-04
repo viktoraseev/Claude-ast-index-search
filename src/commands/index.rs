@@ -217,6 +217,7 @@ pub fn cmd_search(
     let prefilter = word_index
         .as_ref()
         .and_then(|words| words.prefilter(&literals));
+    let resolver = PathResolver::try_from_conn(root, &conn)?;
     let content_page = super::search_files_page_prefiltered(
         root,
         &pattern,
@@ -224,23 +225,11 @@ pub fn cmd_search(
         limit,
         prefilter.as_ref(),
         |path, line_num, line| {
+            let scoped_path = resolver.scoped_relative_path(path)?;
+            if !scope.matches_path(&scoped_path) {
+                return None;
+            }
             let rel_path = super::relative_path(root, path);
-            // Apply scope filter for grep results
-            if let Some(prefix) = scope.dir_prefix {
-                if !rel_path.starts_with(prefix) {
-                    return None;
-                }
-            }
-            if let Some(in_file) = scope.in_file {
-                if !rel_path.contains(in_file) {
-                    return None;
-                }
-            }
-            if let Some(module) = scope.module {
-                if !rel_path.starts_with(module) {
-                    return None;
-                }
-            }
             let content: String = line.trim().chars().take(100).collect();
             let key = format!("{}:{}", rel_path, line_num);
             if seen_content.insert(key) {
@@ -252,7 +241,6 @@ pub fn cmd_search(
     )?;
     content_matches = content_page.items;
 
-    let resolver = PathResolver::try_from_conn(root, &conn)?;
     // Apply --subtree / --local filters before resolving paths so we don't
     // do extra work on rows the user will throw away.
     let files: Vec<db::FileResult> = files
@@ -1232,16 +1220,21 @@ pub fn cmd_usages(
     // Try to use index first
     let _cache_lease = db::acquire_project_lease(root)?;
     let db_path = db::get_db_path(root)?;
-    if db_path.exists() {
-        let conn = db::open_db_leased(root)?;
-
-        let (source, total) = ReferenceSource::resolve(&conn, symbol, scope)?;
+    let conn = db_path
+        .exists()
+        .then(|| db::open_db_leased(root))
+        .transpose()?;
+    let resolver = conn
+        .as_ref()
+        .map(|conn| PathResolver::try_from_conn(root, conn))
+        .transpose()?;
+    if let (Some(conn), Some(resolver)) = (conn.as_ref(), resolver.as_ref()) {
+        let (source, total) = ReferenceSource::resolve(conn, symbol, scope)?;
 
         // An indexed declaration with zero references is an authoritative empty
         // result. Grep would turn its declaration and prose into false usages.
-        if total > 0 || db::count_symbols_by_name_scoped(&conn, symbol, None, scope, true)? > 0 {
-            let mut refs = source.find(&conn, symbol, limit, scope)?;
-            let resolver = PathResolver::try_from_conn(root, &conn)?;
+        if total > 0 || db::count_symbols_by_name_scoped(conn, symbol, None, scope, true)? > 0 {
+            let mut refs = source.find(conn, symbol, limit, scope)?;
             refs.retain(|r| resolver.matches_filter(r.root_path.as_deref()));
             for r in &mut refs {
                 r.path = resolver.resolve_with_root(&r.path, r.root_path.as_deref());
@@ -1300,23 +1293,17 @@ pub fn cmd_usages(
                 return None;
             }
 
-            let rel_path = relative_path(root, path);
-            // Apply scope filter for grep results
-            if let Some(in_file) = scope.in_file {
-                if !rel_path.contains(in_file) {
-                    return None;
-                }
+            let scoped_path = match &resolver {
+                Some(resolver) => resolver.scoped_relative_path(path)?,
+                None => relative_path(root, path),
+            };
+            if !scope.matches_path(&scoped_path) {
+                return None;
             }
-            if let Some(module) = scope.module {
-                if !rel_path.starts_with(module) {
-                    return None;
-                }
-            }
-            if let Some(prefix) = scope.dir_prefix {
-                if !rel_path.starts_with(prefix) {
-                    return None;
-                }
-            }
+            let rel_path = match &resolver {
+                Some(resolver) => super::display_path(resolver, root, path),
+                None => relative_path(root, path),
+            };
             let content: String = line.trim().chars().take(80).collect();
             Some((rel_path, line_num, content))
         },

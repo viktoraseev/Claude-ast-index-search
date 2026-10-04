@@ -384,3 +384,73 @@ fn recursive_java_call_tree_survives_building_a_graph() {
         }
     }
 }
+
+fn check_static_import_binding(import: &str, expected: &[&str]) {
+    check_static_import_binding_declarations(import, expected, "");
+}
+
+fn check_static_import_binding_declarations(import: &str, expected: &[&str], declarations: &str) {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(
+        project.path().join("Decoy.java"),
+        "package fixture;\nclass Decoy {\n static Object identity() { return null; }\n}\n",
+    )
+    .unwrap();
+    fs::write(project.path().join("Probe.java"),
+        format!("package fixture;\n{import}\nclass Probe {{\n Object library() {{ return identity(); }}\n{declarations}}}\n")).unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let output = run(
+        project.path(),
+        cache.path(),
+        &[
+            "--format",
+            "json",
+            "graph",
+            "dependencies",
+            "fixture.Probe.library",
+        ],
+    );
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actual: Vec<_> = document["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["other"]["name"] == "identity")
+        .map(|row| row["other"]["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn external_single_static_import_does_not_borrow_a_project_function() {
+    check_static_import_binding("import static java.util.function.Function.identity;", &[]);
+}
+
+#[test]
+fn external_wildcard_static_import_does_not_borrow_a_project_function() {
+    check_static_import_binding("import static java.util.function.Function.*;", &[]);
+}
+
+#[test]
+fn project_static_import_keeps_the_real_project_function() {
+    check_static_import_binding("import static fixture.Decoy.identity;", &["Decoy.java"]);
+}
+
+#[test]
+fn project_wildcard_static_import_keeps_the_real_project_function() {
+    check_static_import_binding("import static fixture.Decoy.*;", &["Decoy.java"]);
+}
+
+#[test]
+fn own_member_shadows_an_external_static_import() {
+    check_static_import_binding_declarations(
+        "import static java.util.function.Function.identity;",
+        &["Probe.java"],
+        " static Object identity() { return null; }\n",
+    );
+}
