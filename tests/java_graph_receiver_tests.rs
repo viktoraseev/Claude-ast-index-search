@@ -6,6 +6,153 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+#[test]
+fn collector_callbacks_use_stream_entries_before_key_value_projection() {
+    check_direct_callers(
+        r#"import java.util.*;
+import java.util.stream.*;
+record Item(int leaf) {}
+class Probe {
+ void collect(Map<String,Item> items) {
+  items.entrySet().stream().collect(Collectors.toMap(entry -> entry.getKey(), entry -> entry.getValue().leaf()));
+ }
+}
+"#,
+        "leaf",
+        &[("collect", 5)],
+    );
+}
+
+#[test]
+fn stream_extrema_keep_both_comparator_inputs_and_optional_result() {
+    check_direct_callers(
+        r#"import java.util.*;
+import java.util.stream.*;
+record Item(int leaf) {}
+class Probe {
+ void compare(Stream<Item> items) { items.max((left, right) -> left.leaf() - right.leaf()); }
+ void result(Stream<Item> items) { items.max(Comparator.comparingInt(Item::leaf)).map(item -> item.leaf()); }
+}
+"#,
+        "leaf",
+        &[("compare", 5), ("result", 6)],
+    );
+}
+
+#[test]
+fn callback_parameters_bind_qualified_helpers_and_constructors() {
+    check_direct_callers(
+        r#"import java.util.function.*;
+record Item(int leaf) {}
+class Helper {
+ Helper(Consumer<Item> callback) {}
+ void visit(UnaryOperator<Item> callback) {}
+}
+class Probe {
+ void qualified(Helper helper) { helper.visit(item -> { item.leaf(); return item; }); }
+ void constructed() { new Helper(item -> item.leaf()); }
+ void external(java.util.concurrent.atomic.AtomicReference<Item> helper) { helper.getAndUpdate(item -> { item.leaf(); return item; }); }
+}
+"#,
+        "leaf",
+        &[("qualified", 8), ("constructed", 9), ("external", 10)],
+    );
+}
+
+#[test]
+fn anonymous_method_captures_the_enclosing_method_parameter() {
+    check_direct_callers(
+        r#"record Item(int leaf) {}
+class Probe {
+ Runnable capture(Item item) {
+  return new Runnable() {
+   public void run() { item.leaf(); }
+  };
+ }
+}
+"#,
+        "leaf",
+        &[("run", 5)],
+    );
+}
+
+#[test]
+fn callback_overloads_and_class_literal_constructor_inputs_are_typed() {
+    check_direct_callers(
+        r#"import java.util.function.*;
+interface Marker {} record Item(int leaf) implements Marker {}
+class Helper<T extends Marker> {
+ Helper(Class<T> type, Consumer<T> callback) {}
+ void visit(T value) {}
+ void visit(UnaryOperator<T> callback) {}
+}
+class Probe {
+ void overloaded(Helper<Item> helper) { helper.visit(item -> { item.leaf(); return item; }); }
+ void constructed() { new Helper<>(Item.class, item -> item.leaf()); }
+}
+"#,
+        "leaf",
+        &[("overloaded", 9), ("constructed", 10)],
+    );
+}
+
+#[test]
+fn stream_lambda_projections_and_contextual_comparators_keep_result_types() {
+    check_direct_callers(
+        r#"import java.util.*;
+import java.util.stream.*;
+record Item(int leaf) { int key() { return 1; } static Item wrap(Item item) { return item; } }
+class Probe {
+ void factory(List<Item> items) {
+  var map = items.stream().collect(Collectors.toMap(Item::key, item -> Item.wrap(item)));
+  map.values().forEach(item -> item.leaf());
+ }
+ void mapped(List<Item> items) { items.stream().map(Item::wrap).distinct().map(item -> Item.wrap(item)).forEach(item -> item.leaf()); }
+ void comparator(List<Item> items) { items.stream().max(Comparator.comparingInt(item -> item.leaf())); }
+}
+"#,
+        "leaf",
+        &[("factory", 5), ("mapped", 9), ("comparator", 10)],
+    );
+}
+
+#[test]
+fn anonymous_methods_capture_enclosing_instance_fields() {
+    check_direct_callers(
+        r#"record Item(int leaf) {}
+class Probe {
+ Item item;
+ Runnable capture() { return new Runnable() {
+  public void run() { item.leaf(); }
+ }; }
+}
+"#,
+        "leaf",
+        &[("run", 5)],
+    );
+}
+
+#[test]
+fn anonymous_inherited_fields_and_project_comparators_preserve_shadowing() {
+    check_direct_callers(
+        r#"import java.util.stream.Stream;
+import java.util.function.ToIntFunction;
+class Item { public String toString() { return "item"; } }
+class Base { String item; void run() {} }
+class Comparator {
+ static java.util.Comparator<Item> comparingInt(ToIntFunction<String> extractor) { return (left, right) -> 0; }
+}
+class Probe {
+ Item item;
+ Base inherited() { return new Base() { public void run() { item.toString(); } }; }
+ void shadowed(Stream<Item> items) { items.max(Comparator.comparingInt(text -> text.toString().length())); }
+}
+"#,
+        "toString",
+        &[],
+    );
+}
+
 fn command(root: &Path, cache: &Path, arguments: &[&str]) -> Command {
     let binary = std::env::var_os("AST_INDEX_TEST_BINARY")
         .map(PathBuf::from)

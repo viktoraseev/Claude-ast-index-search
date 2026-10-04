@@ -795,7 +795,11 @@ impl Builder {
                 kind: row.kind,
                 line: row.line,
                 container: None,
-                qual: String::new(),
+                qual: if file_node.java.is_some() {
+                    row.qualified_name.unwrap_or_default().replace('.', "::")
+                } else {
+                    String::new()
+                },
                 file_private: false,
             });
         }
@@ -840,6 +844,10 @@ impl Builder {
             });
             let mut stack: Vec<u32> = Vec::new();
             for s in order {
+                let java_qual = file.java.as_ref().and_then(|_| {
+                    let qual = &self.syms[s as usize].qual;
+                    (!qual.is_empty()).then(|| qual.clone())
+                });
                 let (line, end) = {
                     let sym = &self.syms[s as usize];
                     (sym.line, sym.end)
@@ -850,11 +858,13 @@ impl Builder {
                 {
                     stack.pop();
                 }
-                let container = stack
-                    .iter()
-                    .rev()
-                    .copied()
-                    .find(|&c| self.syms[c as usize].end >= end);
+                let container = stack.iter().rev().copied().find(|&c| {
+                    self.syms[c as usize].end >= end
+                        && java_qual.as_deref().is_none_or(|qual| {
+                            qual.rsplit_once("::")
+                                .is_some_and(|(parent, _)| parent == self.syms[c as usize].qual)
+                        })
+                });
                 let qual = {
                     let sym = &self.syms[s as usize];
                     let reopened = is_container_kind(&sym.kind)
@@ -876,7 +886,11 @@ impl Builder {
                     // with their enclosing scopes already.
                     let qualified_by_parser = (is_container_kind(&sym.kind) && reopened.is_none())
                         || (sym.kind == "constant" && ruby);
-                    if qualified_by_parser && sym.name.contains("::") {
+                    if let Some(qual) = java_qual {
+                        // Line ranges cannot distinguish adjacent Java types or
+                        // members. The parser's syntax owner can.
+                        qual
+                    } else if qualified_by_parser && sym.name.contains("::") {
                         sym.name.trim_start_matches("::").to_string()
                     } else if let Some(c) = container {
                         format!("{}::{}", self.syms[c as usize].qual, own)
@@ -2010,8 +2024,10 @@ impl Builder {
         }
         match receiver {
             JavaReceiver::Unknown
+            | JavaReceiver::Identity
             | JavaReceiver::Parameter(_)
             | JavaReceiver::Callback { .. }
+            | JavaReceiver::CapturedField { .. }
             | JavaReceiver::CollectedMap { .. }
             | JavaReceiver::MethodProjection { .. } => Vec::new(),
             JavaReceiver::Array(_) => Vec::new(),
@@ -2236,7 +2252,7 @@ impl Builder {
                         "Supplier" | "Function" | "Consumer" | "UnaryOperator" | "BiFunction"
                         | "BiConsumer" | "BinaryOperator" => "java::util::function",
                         "Stream" => "java::util::stream",
-                        "Iterable" => "java::lang",
+                        "Iterable" | "Class" => "java::lang",
                         _ => return None,
                     };
                     if java
@@ -2273,6 +2289,7 @@ impl Builder {
                         | "java::util::Collection"
                         | "java::util::Set"
                         | "java::lang::Iterable"
+                        | "java::lang::Class"
                         | "java::util::Iterator"
                         | "java::util::Map"
                         | "java::util::Optional"
@@ -2465,6 +2482,10 @@ impl Builder {
     }
 
     fn java_is_arrays(&self, source: u32, receiver: &JavaReceiver) -> bool {
+        self.java_is_factory(source, receiver, "java::util::Arrays")
+    }
+
+    fn java_is_factory(&self, source: u32, receiver: &JavaReceiver, qualified: &str) -> bool {
         let JavaReceiver::Type(path) = receiver else {
             return false;
         };
@@ -2474,18 +2495,21 @@ impl Builder {
         {
             return false;
         }
-        path == "java::util::Arrays"
-            || (path == "Arrays"
+        let short = qualified.rsplit("::").next().unwrap_or_default();
+        let wildcard = format!(
+            "{}::*",
+            qualified.rsplit_once("::").map_or("", |(head, _)| head)
+        );
+        path == qualified
+            || (path == short
                 && self.files[self.syms[source as usize].file as usize]
                     .java
                     .as_ref()
                     .is_some_and(|java| {
-                        java.imports
-                            .iter()
-                            .any(|import| import == "java::util::Arrays")
-                            || (java.imports.iter().any(|import| import == "java::util::*")
+                        java.imports.iter().any(|import| import == qualified)
+                            || (java.imports.iter().any(|import| import == &wildcard)
                                 && !java.imports.iter().any(|import| {
-                                    import.rsplit("::").next() == Some("Arrays")
+                                    import.rsplit("::").next() == Some(short)
                                         || (import.ends_with("::*")
                                             && !import.starts_with("java::"))
                                 }))
@@ -2671,15 +2695,79 @@ impl Builder {
                 arguments,
                 parameter,
                 input,
+                class_literals,
+                context,
             } => {
-                let targets = self.java_invocation_targets(
-                    source,
-                    receiver.as_deref(),
-                    name,
-                    *line,
-                    *arguments,
-                    depth + 1,
-                );
+                if *arguments == 1
+                    && *parameter == 0
+                    && *input == 0
+                    && matches!(
+                        name.as_str(),
+                        "comparing" | "comparingInt" | "comparingLong" | "comparingDouble"
+                    )
+                    && receiver.as_deref().is_some_and(|receiver| {
+                        self.java_is_factory(source, receiver, "java::util::Comparator")
+                    })
+                {
+                    let context = context.as_deref()?;
+                    if matches!(
+                        self.java_collection_kind(source, context, depth + 1)
+                            .as_deref(),
+                        Some("Stream" | "List" | "Collection")
+                    ) {
+                        return self.java_element_receiver(source, context, depth + 1);
+                    }
+                    return None;
+                }
+                if *arguments == 1
+                    && *parameter == 0
+                    && *input == 0
+                    && matches!(name.as_str(), "getAndUpdate" | "updateAndGet")
+                {
+                    if let Some(receiver) = receiver.as_deref() {
+                        if self
+                            .java_collection_kind(source, receiver, depth + 1)
+                            .as_deref()
+                            == Some("AtomicReference")
+                        {
+                            return self.java_element_receiver(source, receiver, depth + 1);
+                        }
+                    }
+                }
+                let targets: Vec<_> = self
+                    .java_invocation_targets(
+                        source,
+                        receiver.as_deref(),
+                        name,
+                        *line,
+                        *arguments,
+                        depth + 1,
+                    )
+                    .into_iter()
+                    .filter(|&target| {
+                        let symbol = &self.syms[target as usize];
+                        self.files[symbol.file as usize]
+                            .java
+                            .as_ref()
+                            .and_then(|java| {
+                                java.callback_parameter(&symbol.name, symbol.line, *parameter)
+                            })
+                            .and_then(|callback| {
+                                self.java_collection_kind(target, callback, depth + 1)
+                            })
+                            .is_some_and(|kind| {
+                                matches!(
+                                    kind.as_str(),
+                                    "Function"
+                                        | "Consumer"
+                                        | "UnaryOperator"
+                                        | "BiFunction"
+                                        | "BiConsumer"
+                                        | "BinaryOperator"
+                                )
+                            })
+                    })
+                    .collect();
                 let [target] = targets.as_slice() else {
                     return None;
                 };
@@ -2705,12 +2793,111 @@ impl Builder {
                 {
                     return None;
                 }
-                self.java_argument_receiver(
+                let result = self.java_argument_receiver(
                     *target,
                     callback,
                     if kind == "BinaryOperator" { 0 } else { *input },
                     depth + 1,
-                )
+                )?;
+                if let JavaReceiver::Parameter(parameter) = &result.1 {
+                    let java = self.files[symbol.file as usize].java.as_ref()?;
+                    if let (Some(class), Some(receiver)) =
+                        (self.class_scope(*target), receiver.as_deref())
+                    {
+                        let owner = &self.syms[class as usize];
+                        if let Some(index) =
+                            java.parameter_index(&owner.name, owner.line, parameter)
+                        {
+                            if let Some(value) =
+                                self.java_argument_receiver(source, receiver, index, depth + 1)
+                            {
+                                return Some(value);
+                            }
+                        }
+                    }
+                    let mut inferred = None;
+                    for (index, literal) in class_literals.iter().enumerate() {
+                        let Some(literal) = literal else {
+                            continue;
+                        };
+                        let Some(formal) =
+                            java.callback_parameter(&symbol.name, symbol.line, index)
+                        else {
+                            continue;
+                        };
+                        if self
+                            .java_collection_kind(*target, formal, depth + 1)
+                            .as_deref()
+                            != Some("Class")
+                        {
+                            continue;
+                        }
+                        let Some((_, JavaReceiver::Parameter(variable))) =
+                            self.java_argument_receiver(*target, formal, 0, depth + 1)
+                        else {
+                            continue;
+                        };
+                        if variable != *parameter {
+                            continue;
+                        }
+                        let classes = self.resolve_java_type(
+                            source,
+                            self.namespace_of(source),
+                            literal,
+                            None,
+                        );
+                        let [class] = classes.as_slice() else {
+                            return None;
+                        };
+                        if inferred.is_some_and(|previous| previous != *class) {
+                            return None;
+                        }
+                        inferred = Some(*class);
+                    }
+                    if inferred.is_none() {
+                        let bound = java
+                            .type_bound(&symbol.name, symbol.line, parameter)
+                            .or_else(|| {
+                                let class = self.class_scope(*target)?;
+                                let owner = &self.syms[class as usize];
+                                java.type_bound(&owner.name, owner.line, parameter)
+                            });
+                        return bound.map(|path| (*target, JavaReceiver::Type(path.to_owned())));
+                    }
+                    return inferred.map(|class| {
+                        (
+                            class,
+                            JavaReceiver::Type(self.syms[class as usize].qual.clone()),
+                        )
+                    });
+                }
+                Some(result)
+            }
+            JavaReceiver::CapturedField {
+                value,
+                name,
+                boundary,
+            } => {
+                let targets = self.java_field_targets(
+                    source,
+                    &JavaReceiver::Type(boundary.clone()),
+                    name,
+                    depth + 1,
+                );
+                if targets.is_empty() {
+                    Some((source, value.as_ref().clone()))
+                } else {
+                    let [target] = targets.as_slice() else {
+                        return None;
+                    };
+                    let symbol = &self.syms[*target as usize];
+                    self.files[symbol.file as usize]
+                        .java
+                        .as_ref()?
+                        .member_receiver(&symbol.name, symbol.line)
+                        .cloned()
+                        .map(|value| (*target, value))
+                }
             }
             JavaReceiver::Field { receiver, name } => {
                 let targets = self.java_field_targets(source, receiver, name, depth + 1);
@@ -2769,6 +2956,32 @@ impl Builder {
                 if let Some((context, receiver)) = &bound {
                     let context = *context;
                     let kind = self.java_collection_kind(context, receiver, depth + 1);
+                    if name == "map"
+                        && *arguments == 1
+                        && matches!(kind.as_deref(), Some("Stream" | "Optional"))
+                    {
+                        if first_argument.as_deref() == Some(&JavaReceiver::Identity) {
+                            return Some((context, receiver.clone()));
+                        }
+                        let (owner, value) = self.java_declared_receiver(
+                            source,
+                            first_argument.as_deref()?,
+                            depth + 1,
+                        )?;
+                        let value = self.java_qualified_receiver(owner, &value, depth + 1);
+                        return Some((
+                            owner,
+                            JavaReceiver::Parameterized {
+                                path: if kind.as_deref() == Some("Stream") {
+                                    "java::util::stream::Stream"
+                                } else {
+                                    "java::util::Optional"
+                                }
+                                .to_owned(),
+                                arguments: vec![Some(value)],
+                            },
+                        ));
+                    }
                     let projected = if name == "stream"
                         && *arguments == 0
                         && matches!(kind.as_deref(), Some("List" | "Collection" | "Set"))
@@ -2782,6 +2995,7 @@ impl Builder {
                             "findFirst" | "findAny" if *arguments == 0 => {
                                 Some("java::util::Optional")
                             }
+                            "max" | "min" if *arguments == 1 => Some("java::util::Optional"),
                             "toList" if *arguments == 0 => Some("java::util::List"),
                             _ => None,
                         }

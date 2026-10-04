@@ -40,6 +40,11 @@ class CallHierarchyContractsTests(unittest.TestCase):
             [{'path': path.name} for path in sorted(self.root.glob('*.java'))], self.fixture.structure)
 
     def response(self, tool, request):
+        if tool == 'ide_find_references':
+            return {'resolvedSymbol': {'kind': 'method', 'name': 'leaf',
+                    'file': request['file'], 'line': request['line']},
+                    'usages': [{'file': request['file'], 'line': 4, 'type': 'METHOD_CALL'}],
+                    'totalIsExact': True, 'hasMore': False}
         self.assertEqual(tool, 'ide_call_hierarchy')
         self.assertEqual(request['depth'], 1)
         self.assertEqual(request['scope'], 'project_files')
@@ -144,6 +149,8 @@ class CallHierarchyContractsTests(unittest.TestCase):
         anchor = self.state.execute("SELECT * FROM call_hierarchy_anchors WHERE kind='accessor'").fetchone()
         def response(tool, request):
             if tool == 'ide_find_references':
+                if request['file'] == 'Probe.java':
+                    return self.response(tool, request)
                 return {'resolvedSymbol': {'kind': 'record component', 'name': 'leaf', 'file': 'Leaf.java', 'line': 1},
                         'usages': [{'file': 'Use.java', 'line': 2, 'type': 'METHOD_REFERENCE'}],
                         'totalIsExact': True, 'hasMore': False}
@@ -167,6 +174,8 @@ class CallHierarchyContractsTests(unittest.TestCase):
                      if entry['kind'] == 'usage' and entry['name'] == 'leaf')
         def response(tool, request):
             if tool == 'ide_find_references':
+                if request['file'] == 'Probe.java':
+                    return self.response(tool, request)
                 generated = request['file'] == 'Use.java'
                 return {'resolvedSymbol': {'kind': 'method' if generated else 'record component',
                         'name': 'leaf', 'file': 'Leaf.java', 'line': 1},
@@ -181,8 +190,8 @@ class CallHierarchyContractsTests(unittest.TestCase):
         self.assertEqual(result['verdict'], 'pass', result['error'])
         self.assertIn(['Use.java', 2, 'read'], json.loads(result['expected_json'])['items'])
         reference = [call.args[1] for call in self.oracle.call.call_args_list if call.args[0] == 'ide_find_references']
-        self.assertEqual(reference[0]['file'], 'Use.java')
-        self.assertEqual(reference[0]['column'], usage['column'])
+        generated_reference = next(request for request in reference if request['file'] == 'Use.java')
+        self.assertEqual(generated_reference['column'], usage['column'])
 
     def test_external_base_family_callers_require_exact_overridden_member_references(self):
         (self.root / 'Probe.java').write_text('class Probe implements Runnable {\n'

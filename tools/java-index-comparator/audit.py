@@ -997,7 +997,8 @@ class Fixture:
             for path in java_files(self.root):
                 file = path.relative_to(self.root).as_posix()
                 syntax.extend({**entry, 'file': file} for entry in self.structure(file)
-                              if entry['kind'] != 'parent' and entry['name'] == name)
+                              if entry['kind'] != 'parent' and entry['name'] == name
+                              and not entry.get('implicit', False))
         imports = [item for item in items if str(item.get("type", "")).upper() == "IMPORT"]
         usages = [item for item in items if str(item.get("type", "")).upper() != "IMPORT"]
         # Name-only CLI references span all Java namespaces. The syntax oracle

@@ -37,8 +37,13 @@ class Oracle:
 
 
 class NavigationContractTests(unittest.TestCase):
+    def temporary_directory(self):
+        boundary = Path(__file__).resolve().parents[2] / '.artifacts/tests'
+        boundary.mkdir(parents=True, exist_ok=True)
+        return tempfile.TemporaryDirectory(prefix='navigation-', dir=boundary)
+
     def test_enum_reference_position_uses_the_declaration_anchor(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.temporary_directory() as temporary:
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()
@@ -75,7 +80,7 @@ class NavigationContractTests(unittest.TestCase):
                 state.close()
 
     def test_implicit_enum_constructor_sites_do_not_become_lexical_type_mentions(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.temporary_directory() as temporary:
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()
@@ -104,8 +109,63 @@ class NavigationContractTests(unittest.TestCase):
             finally:
                 state.close()
 
+    def test_enum_normalization_preserves_explicit_mentions_and_detects_native_omissions(self):
+        with self.temporary_directory() as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'Mode.java').write_text('package example;\nenum Mode {\n'
+                '    ON(1),\n    OFF(2) { Mode self() { return Mode.ON; } };\n'
+                '    Mode(int n) {}\n}\nclass Client { Mode value = Mode.ON; }\n')
+
+            class EnumOracle:
+                def call(self, tool, arguments):
+                    if tool == 'ide_find_symbol':
+                        return {'symbols': [{'name': 'Mode', 'kind': 'CLASS', 'file': 'Mode.java',
+                            'line': 2, 'column': 6, 'qualifiedName': 'example.Mode'}]}
+                    if tool == 'ide_find_references':
+                        return {'resolvedSymbol': {'name': 'Mode', 'kind': 'enum'},
+                                'usages': [{'file': 'Mode.java', 'line': line, 'type': 'REFERENCE'}
+                                           for line in (3, 4, 7)]}
+                    raise AssertionError(tool)
+
+            binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+            database = directory / 'index.sqlite'
+            build_ast_index(str(binary), root, database, 'explicit-enum')
+            state, native = connect(directory / 'checks.sqlite'), connect(database)
+            try:
+                state.executescript(SCHEMA)
+                fixture = Fixture(root, binary, database, state, EnumOracle())
+                for feature in ('refs', 'usages'):
+                    with state:
+                        state.execute('INSERT INTO checks(id,feature,subject) VALUES (?,?,?)',
+                                      (feature, feature, 'Mode'))
+                    check = state.execute('SELECT * FROM checks WHERE id=?', (feature,)).fetchone()
+                    fixture.evaluate(check)
+                    result = state.execute('SELECT verdict,error,diff_json FROM checks WHERE id=?',
+                                           (feature,)).fetchone()
+                    self.assertEqual(result[0], 'pass', tuple(result))
+                    expected = json.loads(state.execute('SELECT expected_json FROM checks WHERE id=?',
+                                                        (feature,)).fetchone()[0])
+                    self.assertEqual({entry['line'] for entry in expected['usages']}, {4, 7})
+                # Mutate only the disposable native index. Same-line enum calls
+                # must not hide a missing explicit type mention after normalization.
+                with native:
+                    native.execute("DELETE FROM refs WHERE name='Mode' AND line=4")
+                for check in state.execute('SELECT * FROM checks'):
+                    fixture.evaluate(check)
+                    result = state.execute('SELECT verdict,diff_json FROM checks WHERE id=?',
+                                           (check['id'],)).fetchone()
+                    self.assertEqual(result[0], 'fail')
+                    missing = json.loads(result[1])['missing']
+                    expected = ['usage', 'Mode.java', 4] if check['feature'] == 'refs' else ['Mode.java', 4]
+                    self.assertIn(expected, missing)
+            finally:
+                native.close()
+                state.close()
+
     def test_same_line_overloads_detect_one_removed_production_index_row(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.temporary_directory() as temporary:
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()
@@ -139,7 +199,7 @@ class NavigationContractTests(unittest.TestCase):
                 state.close()
 
     def test_hierarchy_prefers_exact_interface_over_class_substring(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.temporary_directory() as temporary:
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()
@@ -167,7 +227,7 @@ class NavigationContractTests(unittest.TestCase):
                 state.close()
 
     def test_missing_handlers_execute_production_and_detect_a_removed_declaration(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with self.temporary_directory() as temporary:
             directory = Path(temporary)
             root = directory / 'project'
             root.mkdir()

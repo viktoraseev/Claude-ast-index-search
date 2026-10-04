@@ -16,6 +16,7 @@ FEATURE = 'call-tree:mcp-direct-callers'
 FEATURES = {FEATURE}
 REASON = ('live MCP direct Java caller owners; union of same-name JDK source method/constructor/accessor '
           'anchors; exact selected-member references normalize overridden-method families and generated accessors; '
+          'supplement field-initializer and recursive owners omitted by hierarchy views; '
           'not virtual-family, deep traversal or attached-root equivalence')
 CALLABLE_KINDS = {'method', 'constructor', 'accessor'}
 MAX_CALLERS = 100000
@@ -268,6 +269,28 @@ def callable_reference_owners(fixture, check, anchor):
     return owners
 
 
+def hierarchy_omits_source_owners(fixture, anchor):
+    """Schedule exact references for field initializers and self-recursion.
+
+    Hierarchy views can omit these owners. Independent syntax, rather than
+    native edges or a failed comparison, determines the supplemental query.
+    """
+    positions = fixture.state.execute('''SELECT DISTINCT path,line FROM call_hierarchy_usage_anchors
+        WHERE name=? ORDER BY path,line''', (anchor['name'],))
+    for count, (path, line) in enumerate(positions):
+        if count >= MAX_CALLERS:
+            raise UnsupportedHierarchy('hierarchy owner inventory exceeded bounded contract')
+        entries = fixture.structure(path)
+        if any(entry['kind'] in {'property', 'constant'}
+               and entry['line'] <= line <= entry['end_line'] for entry in entries):
+            return True
+        if path == anchor['path'] and any(entry['kind'] == 'method'
+                and entry['line'] == anchor['line'] and entry['name'] == anchor['name']
+                and entry['line'] <= line <= entry['end_line'] for entry in entries):
+            return True
+    return False
+
+
 def exercise(fixture, check):
     if not getattr(fixture, '_call_hierarchy_graph_ready', False):
         fixture.cli('graph', 'build')
@@ -318,7 +341,8 @@ def exercise(fixture, check):
                 expected.add(identity)
             if len(expected) > MAX_CALLERS:
                 raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
-        if anchor['kind'] in {'constructor', 'accessor'} or narrow_override:
+        if anchor['kind'] in {'constructor', 'accessor'} or narrow_override \
+                or hierarchy_omits_source_owners(fixture, anchor):
             expected.update(callable_reference_owners(fixture, check, anchor))
             if len(expected) > MAX_CALLERS:
                 raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')

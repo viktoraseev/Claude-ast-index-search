@@ -224,6 +224,12 @@ public class JavaStructure {
                             && end(tree.getType()) < 0;
                         emit(constant ? "constant" : "property", name,
                             constant ? start(tree.getType()) : namePosition(tree, name, ""), end(tree));
+                        if (constant) {
+                            // javac's enum creation type is synthetic: the real
+                            // constructor reference is anchored at the constant.
+                            emit("usage", owner.getSimpleName().toString(), start(tree.getType()),
+                                start(tree.getType()), ",\"usage_kind\":\"constructor_call\",\"implicit\":true");
+                        }
                     }
                     return super.visitVariable(tree, unused);
                 }

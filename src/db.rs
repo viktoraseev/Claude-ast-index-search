@@ -10743,6 +10743,7 @@ pub struct GraphSymbolRow {
     pub kind: String,
     pub line: i64,
     pub end_line: Option<i64>,
+    pub qualified_name: Option<String>,
 }
 
 /// A stored `symbol_edges` row.
@@ -10815,7 +10816,7 @@ pub fn load_graph_files(conn: &Connection) -> Result<Vec<GraphFileRow>> {
 /// Every symbol, grouped by file and ordered by start line.
 pub fn load_graph_symbols(conn: &Connection) -> Result<Vec<GraphSymbolRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_id, name, kind, line, end_line FROM symbols ORDER BY file_id, line, id",
+        "SELECT id, file_id, name, kind, line, end_line, qualified_name FROM symbols ORDER BY file_id, line, id",
     )?;
     let rows = stmt
         .query_map([], |row| {
@@ -10826,6 +10827,7 @@ pub fn load_graph_symbols(conn: &Connection) -> Result<Vec<GraphSymbolRow>> {
                 kind: row.get(3)?,
                 line: row.get(4)?,
                 end_line: row.get(5)?,
+                qualified_name: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
