@@ -250,6 +250,10 @@ impl PathResolver {
         true
     }
 
+    pub(crate) fn has_root_filter(&self) -> bool {
+        std::env::var("AST_INDEX_LOCAL_SCOPE").is_ok() || std::env::var("AST_INDEX_SUBTREE").is_ok()
+    }
+
     /// Scope an existing canonical source path by its most specific owning
     /// root. Forced nested attachments must not leak into `--local` views.
     pub(crate) fn source_path_matches_filter(&self, path: &Path) -> bool {

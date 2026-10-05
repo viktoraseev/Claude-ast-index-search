@@ -72,6 +72,7 @@ import caller_scope_contracts
 import module_format_contracts
 import insight_scope_contracts
 import module_scope_contracts
+import graph_root_contracts
 import call_hierarchy_contracts
 
 
@@ -530,6 +531,7 @@ class Fixture:
         self._insight_scope_results = None
         self._module_format_results = None
         self._module_scope_results = None
+        self._graph_root_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
         self._rank_results = None
@@ -1850,6 +1852,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def graph_root_check(self, check: sqlite3.Row):
+        if self._graph_root_results is None:
+            self._graph_root_results = graph_root_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._graph_root_results)
+        return {'source': graph_root_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def module_scope_check(self, check: sqlite3.Row):
         if self._module_scope_results is None:
             self._module_scope_results = module_scope_contracts.exercise(self.binary, self.database.parent)
@@ -1987,6 +1997,8 @@ class Fixture:
                 handler = self.format_check
             if check['feature'] in insight_scope_contracts.FEATURES:
                 handler = self.insight_scope_check
+            if check['feature'] in graph_root_contracts.FEATURES:
+                handler = self.graph_root_check
             if check['feature'] in module_scope_contracts.FEATURES:
                 handler = self.module_scope_check
             if check['feature'] in module_format_contracts.FEATURES:
@@ -2098,6 +2110,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(insight_scope_contracts.FEATURES | insight_scope_contracts.PENDING.keys())
     features.update(module_format_contracts.FEATURES)
     features.update(module_scope_contracts.FEATURES)
+    features.update(graph_root_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
     return features
 
@@ -2248,6 +2261,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     java_parent_contracts.plan_parents(state, root)
     insight_scope_contracts.plan_scope(state, root)
     module_scope_contracts.plan_scope(state, root)
+    graph_root_contracts.plan_scope(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

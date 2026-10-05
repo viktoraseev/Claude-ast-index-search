@@ -31,6 +31,10 @@
 //! row ids (`db::index_fingerprint`); every query compares them with the live
 //! index and flags a stale graph instead of answering from outdated edges
 //! silently.
+//!
+//! `--local` and `--subtree` select seeds and induce traversal within the
+//! selected root, before counts and pagination. Node metrics still describe
+//! the full stored graph; their output rows are restricted to the selection.
 
 mod java;
 mod metrics;
@@ -411,6 +415,42 @@ fn java_name_suffix(qualified: &str, wanted: &str) -> bool {
         || qualified
             .strip_suffix(wanted)
             .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn scoped_symbol_spec(
+    conn: &Connection,
+    spec: &str,
+    filter: &SymbolFilter,
+    resolver: &PathResolver,
+) -> Result<Vec<GraphSymbolInfo>> {
+    let mut matched = resolve_symbol_spec(conn, spec, filter)?;
+    matched.retain(|info| resolver.matches_filter(info.root_path.as_deref()));
+    Ok(matched)
+}
+
+/// Root selection induces the traversal graph, including its counters. Removing
+/// other-root rows only at rendering time permits paths to leave and re-enter.
+fn keep_root_edges(
+    conn: &Connection,
+    edges: &mut Vec<SymbolEdgeRow>,
+    resolver: &PathResolver,
+) -> Result<()> {
+    if !resolver.has_root_filter() {
+        return Ok(());
+    }
+    let ids = edges
+        .iter()
+        .flat_map(|edge| [edge.source_id, edge.target_id])
+        .collect();
+    let infos = infos_for(conn, &ids)?;
+    edges.retain(|edge| {
+        [edge.source_id, edge.target_id].iter().all(|id| {
+            infos
+                .get(id)
+                .is_some_and(|info| resolver.matches_filter(info.root_path.as_deref()))
+        })
+    });
+    Ok(())
 }
 
 /// The matched symbols plus, for class-like ones, every definition inside
@@ -925,11 +965,11 @@ pub fn cmd_graph_edges(
     let Some((conn, state)) = open_graph(root, refresh, format)? else {
         return Ok(());
     };
-    let matched = resolve_symbol_spec(&conn, spec, filter)?;
+    let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
+    let matched = scoped_symbol_spec(&conn, spec, filter, &resolver)?;
     if !describe_matches(spec, &matched, format) {
         return Ok(());
     }
-    let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
     let subjects = if members {
         with_members(&conn, &matched)?
     } else {
@@ -952,6 +992,7 @@ pub fn cmd_graph_edges(
             !(subject_ids.contains(&edge.source_id) && subject_ids.contains(&edge.target_id))
         })
         .collect();
+    keep_root_edges(&conn, &mut all_edges, &resolver)?;
     let exclude_tests = exclude_tests && direction == Direction::Dependents;
     let excluded_test_edges = if exclude_tests {
         drop_test_dependents(&conn, &mut all_edges)?
@@ -1152,6 +1193,7 @@ fn reverse_reach(
     depth: usize,
     max_code: u8,
     exclude_tests: bool,
+    resolver: &PathResolver,
 ) -> Result<Reach> {
     let seed_set: HashSet<i64> = seeds.iter().copied().collect();
     let mut visited: HashMap<i64, (usize, i64, u8)> = HashMap::new();
@@ -1162,6 +1204,7 @@ fn reverse_reach(
             break;
         }
         let mut edges = db::load_symbol_edges_to(conn, &frontier, max_code)?;
+        keep_root_edges(conn, &mut edges, resolver)?;
         edges.retain(|edge| {
             !seed_set.contains(&edge.source_id) && !visited.contains_key(&edge.source_id)
         });
@@ -1201,11 +1244,11 @@ pub fn cmd_graph_impact(
     let Some((conn, state)) = open_graph(root, refresh, format)? else {
         return Ok(());
     };
-    let matched = resolve_symbol_spec(&conn, spec, filter)?;
+    let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
+    let matched = scoped_symbol_spec(&conn, spec, filter, &resolver)?;
     if !describe_matches(spec, &matched, format) {
         return Ok(());
     }
-    let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
     let seed_infos = if members {
         with_members(&conn, &matched)?
     } else {
@@ -1219,6 +1262,7 @@ pub fn cmd_graph_impact(
         depth,
         max_confidence(include_ambiguous),
         exclude_tests,
+        &resolver,
     )?;
     let resolved_only = if include_ambiguous {
         Some(reverse_reach(
@@ -1227,6 +1271,7 @@ pub fn cmd_graph_impact(
             depth,
             max_confidence(false),
             exclude_tests,
+            &resolver,
         )?)
     } else {
         None
@@ -1445,6 +1490,7 @@ fn shortest_paths(
     to: &HashSet<i64>,
     max_depth: usize,
     max_code: u8,
+    resolver: &PathResolver,
 ) -> Result<Option<ShortestPaths>> {
     let mut distance: HashMap<i64, usize> = from.iter().map(|&id| (id, 0)).collect();
     let mut preds: Predecessors = HashMap::new();
@@ -1464,6 +1510,15 @@ fn shortest_paths(
                 .into_iter()
                 .map(|(container, member)| (container, member, CONTAINS)),
         );
+        if resolver.has_root_filter() {
+            let ids = steps.iter().map(|(_, target, _)| *target).collect();
+            let infos = infos_for(conn, &ids)?;
+            steps.retain(|(_, target, _)| {
+                infos
+                    .get(target)
+                    .is_some_and(|info| resolver.matches_filter(info.root_path.as_deref()))
+            });
+        }
         let mut next: Vec<i64> = Vec::new();
         for (source, target, code) in steps {
             match distance.get(&target) {
@@ -1574,15 +1629,15 @@ pub fn cmd_graph_path(
     let Some((conn, state)) = open_graph(root, refresh, format)? else {
         return Ok(());
     };
-    let from_matches = resolve_symbol_spec(&conn, from, filter_from)?;
+    let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
+    let from_matches = scoped_symbol_spec(&conn, from, filter_from, &resolver)?;
     if !describe_matches(from, &from_matches, format) {
         return Ok(());
     }
-    let to_matches = resolve_symbol_spec(&conn, to, filter_to)?;
+    let to_matches = scoped_symbol_spec(&conn, to, filter_to, &resolver)?;
     if !describe_matches(to, &to_matches, format) {
         return Ok(());
     }
-    let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
     let from_ids: Vec<i64> = with_members(&conn, &from_matches)?
         .iter()
         .map(|info| info.id)
@@ -1594,13 +1649,13 @@ pub fn cmd_graph_path(
     let max_code = max_confidence(include_ambiguous);
 
     let mut direction = None;
-    let mut found = shortest_paths(&conn, &from_ids, &to_ids, max_depth, max_code)?;
+    let mut found = shortest_paths(&conn, &from_ids, &to_ids, max_depth, max_code, &resolver)?;
     if found.is_some() {
         direction = Some("forward");
     } else {
         let to_list: Vec<i64> = to_ids.iter().copied().collect();
         let from_set: HashSet<i64> = from_ids.iter().copied().collect();
-        found = shortest_paths(&conn, &to_list, &from_set, max_depth, max_code)?;
+        found = shortest_paths(&conn, &to_list, &from_set, max_depth, max_code, &resolver)?;
         if found.is_some() {
             direction = Some("reverse");
         }
@@ -1851,7 +1906,8 @@ pub fn cmd_graph_cycles(
         return Ok(());
     };
     let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
-    let edges = db::load_all_symbol_edges(&conn, max_confidence(false))?;
+    let mut edges = db::load_all_symbol_edges(&conn, max_confidence(false))?;
+    keep_root_edges(&conn, &mut edges, &resolver)?;
     let mut dense: HashMap<i64, usize> = HashMap::new();
     let mut ids: Vec<i64> = Vec::new();
     let mut adjacency: Vec<Vec<usize>> = Vec::new();
@@ -1909,9 +1965,13 @@ pub fn cmd_graph_cycles(
         .map(|component| {
             let members: HashSet<usize> = component.iter().copied().collect();
             let example = cycle_through(component[0], &members, &adjacency);
-            let files: HashSet<&str> = component
+            let files: HashSet<(Option<&str>, &str)> = component
                 .iter()
-                .filter_map(|&node| infos.get(&ids[node]).map(|info| info.path.as_str()))
+                .filter_map(|&node| {
+                    infos
+                        .get(&ids[node])
+                        .map(|info| (info.root_path.as_deref(), info.path.as_str()))
+                })
                 .collect();
             let to_ref = |node: &usize| {
                 infos
@@ -2077,7 +2137,8 @@ pub fn cmd_graph_top(
     // page is full instead of joining every metrics row with its symbol.
     let mut items = Vec::new();
     let mut total_matching = 0usize;
-    let filtered = kind.is_some() || path_prefix.is_some() || exclude_tests;
+    let filtered =
+        kind.is_some() || path_prefix.is_some() || exclude_tests || resolver.has_root_filter();
     for chunk in rows.chunks(2000) {
         let ids: Vec<i64> = chunk.iter().map(|m| m.symbol_id).collect();
         let infos = db::load_graph_symbol_infos(&conn, &ids)?;
@@ -2143,7 +2204,7 @@ pub fn cmd_graph_metrics(
     let resolver = PathResolver::from_conn(root, &conn).with_decoration(format != "json");
     let mut matched: Vec<GraphSymbolInfo> = Vec::new();
     for spec in specs {
-        matched.extend(resolve_symbol_spec(&conn, spec, filter)?);
+        matched.extend(scoped_symbol_spec(&conn, spec, filter, &resolver)?);
     }
     // Several specs can select the same declaration, including qualified and
     // unqualified aliases. Union identities before totals and result limits.
