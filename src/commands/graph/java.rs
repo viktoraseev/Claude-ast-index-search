@@ -25,6 +25,8 @@ pub(super) struct TypeDeclaration {
     pub local_scope: Option<Range<usize>>,
 }
 
+type ScalarArguments = Vec<Option<String>>;
+
 #[derive(Default)]
 pub(super) struct JavaSource {
     pub package: String,
@@ -63,6 +65,7 @@ pub(super) struct JavaSource {
     constructor_declarations: HashSet<(String, i64)>,
     canonical_types: HashMap<String, Vec<String>>,
     creation_types: HashMap<(String, i64, i64, String), Vec<Option<String>>>,
+    invocation_types: HashMap<(String, i64, i64, String), Option<ScalarArguments>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -158,6 +161,68 @@ type VariableScopes = HashMap<usize, HashMap<String, Vec<VariableBinding>>>;
 fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
     let mut scopes = VariableScopes::new();
     walk_tree_preorder(&root, |declaration| {
+        if declaration.kind() == "catch_formal_parameter" {
+            if let (Some(name), Some(clause)) = (
+                declaration.child_by_field_name("name"),
+                declaration.parent(),
+            ) {
+                let mut cursor = declaration.walk();
+                let ty = declaration
+                    .named_children(&mut cursor)
+                    .find(|node| node.kind() == "catch_type");
+                // A multi-catch least upper bound needs semantic evidence. Still
+                // record its binding so it cannot borrow an enclosing field.
+                let declared = ty.and_then(|ty| {
+                    let mut cursor = ty.walk();
+                    let types: Vec<_> = ty
+                        .named_children(&mut cursor)
+                        .filter(|node| !node.is_extra())
+                        .collect();
+                    (types.len() == 1)
+                        .then(|| type_name(types[0], source))
+                        .flatten()
+                });
+                scopes
+                    .entry(clause.id())
+                    .or_default()
+                    .entry(text(name, source).to_owned())
+                    .or_default()
+                    .push(VariableBinding {
+                        position: name.start_byte(),
+                        field: false,
+                        declared,
+                        inferred: None,
+                    });
+            }
+        }
+        if declaration.kind() == "resource" {
+            if let (Some(name), Some(ty), Some(statement)) = (
+                declaration.child_by_field_name("name"),
+                declaration.child_by_field_name("type"),
+                declaration.parent().and_then(|spec| spec.parent()),
+            ) {
+                // Resource bindings cover subsequent initializers and the try
+                // body, but never sibling catch/finally clauses.
+                for scope in [declaration.parent(), statement.child_by_field_name("body")]
+                    .into_iter()
+                    .flatten()
+                {
+                    scopes
+                        .entry(scope.id())
+                        .or_default()
+                        .entry(text(name, source).to_owned())
+                        .or_default()
+                        .push(VariableBinding {
+                            position: name.start_byte(),
+                            field: false,
+                            declared: (text(ty, source) != "var")
+                                .then(|| type_name(ty, source))
+                                .flatten(),
+                            inferred: generic_receiver(ty, declaration, source),
+                        });
+                }
+            }
+        }
         if declaration.kind() == "formal_parameter" {
             if let (Some(name), Some(ty), Some(owner)) = (
                 declaration.child_by_field_name("name"),
@@ -432,10 +497,12 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                 }
             }
         }
-        if declaration.kind() != "local_variable_declaration"
-            || !declaration
-                .child_by_field_name("type")
-                .is_some_and(|ty| text(ty, source) == "var")
+        if !matches!(
+            declaration.kind(),
+            "local_variable_declaration" | "resource"
+        ) || !declaration
+            .child_by_field_name("type")
+            .is_some_and(|ty| text(ty, source) == "var")
         {
             return WalkControl::Continue;
         }
@@ -443,7 +510,12 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
             return WalkControl::Continue;
         };
         let mut cursor = declaration.walk();
-        for variable in declaration.named_children(&mut cursor) {
+        let variables: Vec<_> = if declaration.kind() == "resource" {
+            vec![declaration]
+        } else {
+            declaration.named_children(&mut cursor).collect()
+        };
+        for variable in variables {
             if let (Some(name), Some(value)) = (
                 variable.child_by_field_name("name"),
                 variable.child_by_field_name("value"),
@@ -721,6 +793,29 @@ fn argument_count(node: Node<'_>) -> Option<usize> {
     Some(count)
 }
 
+fn parameter_type(parameter: Node<'_>) -> Option<Node<'_>> {
+    parameter.child_by_field_name("type").or_else(|| {
+        if parameter.kind() != "spread_parameter" {
+            return None;
+        }
+        // Java's grammar gives a spread parameter an unnamed element type.
+        let mut cursor = parameter.walk();
+        let ty = parameter.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "integral_type"
+                    | "floating_point_type"
+                    | "boolean_type"
+                    | "type_identifier"
+                    | "scoped_type_identifier"
+                    | "generic_type"
+                    | "array_type"
+            )
+        });
+        ty
+    })
+}
+
 /// Check explicit target types without guessing an overloaded invocation's SAM.
 fn method_reference_context(node: Node<'_>, source: &str) -> Option<JavaReceiver> {
     let mut expression = node;
@@ -872,6 +967,15 @@ fn creation_argument_types(
                 .to_owned(),
             ),
             "true" | "false" => Some("boolean".to_owned()),
+            "character_literal" => Some("char".to_owned()),
+            "decimal_floating_point_literal" | "hex_floating_point_literal" => Some(
+                if text(argument, source).ends_with(['F', 'f']) {
+                    "float"
+                } else {
+                    "double"
+                }
+                .to_owned(),
+            ),
             "null_literal" => Some("null".to_owned()),
             _ => match expression_receiver(argument, owner, source, scopes, 0) {
                 JavaReceiver::Type(ty) => Some(ty),
@@ -2343,7 +2447,7 @@ impl JavaSource {
                             .named_children(&mut cursor)
                             .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
                             .map(|p| {
-                                p.child_by_field_name("type").and_then(|ty| {
+                                parameter_type(p).and_then(|ty| {
                                     generic_receiver_at(ty, node, source, 0, true)
                                         .or_else(|| type_name(ty, source).map(JavaReceiver::Type))
                                 })
@@ -2582,6 +2686,16 @@ impl JavaSource {
             if reference {
                 return WalkControl::Continue;
             }
+            let argument_types = Some(creation_argument_types(node, owner, source, &scopes));
+            result
+                .invocation_types
+                .entry(key.clone())
+                .and_modify(|previous| {
+                    if *previous != argument_types {
+                        *previous = None;
+                    }
+                })
+                .or_insert(argument_types);
             if node.child_by_field_name("object").is_none() {
                 let arguments = node.child_by_field_name("arguments").map(|arguments| {
                     let mut cursor = arguments.walk();
@@ -3003,6 +3117,39 @@ impl JavaSource {
             .is_some_and(|(count, variadic)| {
                 arguments == count || (variadic && arguments >= count - 1)
             })
+    }
+
+    pub fn invocation_arguments(
+        &self,
+        owner: &str,
+        owner_line: i64,
+        line: i64,
+        name: &str,
+    ) -> Option<&[Option<String>]> {
+        self.invocation_types
+            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))?
+            .as_deref()
+    }
+
+    pub fn fixed_arity(&self, name: &str, line: i64, arguments: usize) -> bool {
+        self.parameters.get(&(name.to_owned(), line)) == Some(&Some((arguments, false)))
+    }
+
+    pub fn invocation_parameter(
+        &self,
+        name: &str,
+        line: i64,
+        index: usize,
+    ) -> Option<&JavaReceiver> {
+        let (count, variadic) = self.parameters.get(&(name.to_owned(), line))?.as_ref()?;
+        // Expanded varargs use the last declared element type. An explicit
+        // array argument has no scalar evidence and remains unresolved.
+        let index = if *variadic && *count > 0 {
+            index.min(count - 1)
+        } else {
+            index
+        };
+        self.reference_parameter(name, line, index)
     }
 
     #[cfg(test)]

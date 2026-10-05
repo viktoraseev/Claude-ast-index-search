@@ -1769,6 +1769,163 @@ impl Builder {
             .ok_or(DropReason::ReceiverUnresolved)
     }
 
+    fn java_primitive(path: &str) -> bool {
+        matches!(
+            path,
+            "byte" | "short" | "char" | "int" | "long" | "float" | "double" | "boolean"
+        )
+    }
+
+    fn java_primitive_widens(from: &str, to: &str) -> bool {
+        from == to
+            || matches!(
+                (from, to),
+                ("byte", "short" | "int" | "long" | "float" | "double")
+                    | ("short" | "char", "int" | "long" | "float" | "double")
+                    | ("int", "long" | "float" | "double")
+                    | ("long", "float" | "double")
+                    | ("float", "double")
+            )
+    }
+
+    /// Reject proven scalar incompatibilities; unknown reference ancestry and
+    /// boxing stay conservative. A JDK string cannot inhabit a project type.
+    fn java_invocation_compatible(&self, source: u32, target: u32, name: &str, line: i64) -> bool {
+        let owner = &self.syms[source as usize];
+        let symbol = &self.syms[target as usize];
+        let Some(arguments) = self.files[owner.file as usize]
+            .java
+            .as_ref()
+            .and_then(|java| java.invocation_arguments(&owner.name, owner.line, line, name))
+        else {
+            return true;
+        };
+        let Some(java) = &self.files[symbol.file as usize].java else {
+            return true;
+        };
+        let jdk_string = |context: u32, path: &str| {
+            if !matches!(path, "String" | "java::lang::String") {
+                return false;
+            }
+            if !self
+                .resolve_java_type(context, self.namespace_of(context), path, None)
+                .is_empty()
+            {
+                return false;
+            }
+            path == "java::lang::String"
+                || self.files[self.syms[context as usize].file as usize]
+                    .java
+                    .as_ref()
+                    .is_some_and(|java| {
+                        !java.imports.iter().any(|import| {
+                            (import.ends_with("::String") && import != "java::lang::String")
+                                || (import.ends_with("::*") && import != "java::lang::*")
+                        }) && !java
+                            .static_imports
+                            .iter()
+                            .any(|import| import.ends_with("::String") || import.ends_with("::*"))
+                    })
+        };
+        arguments.iter().enumerate().all(|(index, argument)| {
+            let Some(argument) = argument else {
+                return true;
+            };
+            let Some(JavaReceiver::Type(parameter)) =
+                java.invocation_parameter(&symbol.name, symbol.line, index)
+            else {
+                return true;
+            };
+            if argument == "null" {
+                return !Self::java_primitive(parameter);
+            }
+            if Self::java_primitive(argument) && Self::java_primitive(parameter) {
+                return Self::java_primitive_widens(argument, parameter);
+            }
+            let string_input = jdk_string(source, argument);
+            if string_input {
+                let classes =
+                    self.resolve_java_type(target, self.namespace_of(target), parameter, None);
+                if !classes.is_empty()
+                    && classes.iter().all(|&class| {
+                        !matches!(
+                            self.syms[class as usize].qual.as_str(),
+                            "java::lang::String" | "java::lang::Object"
+                        )
+                    })
+                {
+                    return false;
+                }
+            }
+            !(Self::java_primitive(argument) && jdk_string(target, parameter)
+                || Self::java_primitive(parameter) && string_input)
+        })
+    }
+
+    /// Prefer a fixed primitive signature only when every argument is known
+    /// and it widens to the competing signature in every position. Unknown
+    /// calls, mixed signatures, boxing phases and varargs remain unresolved.
+    fn java_narrow_invocation_targets(
+        &self,
+        source: u32,
+        name: &str,
+        line: i64,
+        targets: &mut Vec<u32>,
+    ) {
+        if targets.len() < 2 {
+            return;
+        }
+        let owner = &self.syms[source as usize];
+        let Some(arguments) = self.files[owner.file as usize]
+            .java
+            .as_ref()
+            .and_then(|java| java.invocation_arguments(&owner.name, owner.line, line, name))
+        else {
+            return;
+        };
+        if arguments.is_empty()
+            || !arguments
+                .iter()
+                .all(|arg| arg.as_deref().is_some_and(Self::java_primitive))
+        {
+            return;
+        }
+        let more_specific = |left: u32, right: u32| {
+            let left_symbol = &self.syms[left as usize];
+            let right_symbol = &self.syms[right as usize];
+            let (Some(left_java), Some(right_java)) = (
+                &self.files[left_symbol.file as usize].java,
+                &self.files[right_symbol.file as usize].java,
+            ) else {
+                return false;
+            };
+            if !left_java.fixed_arity(&left_symbol.name, left_symbol.line, arguments.len())
+                || !right_java.fixed_arity(&right_symbol.name, right_symbol.line, arguments.len())
+            {
+                return false;
+            }
+            let mut strict = false;
+            for index in 0..arguments.len() {
+                let (Some(JavaReceiver::Type(left)), Some(JavaReceiver::Type(right))) = (
+                    left_java.invocation_parameter(&left_symbol.name, left_symbol.line, index),
+                    right_java.invocation_parameter(&right_symbol.name, right_symbol.line, index),
+                ) else {
+                    return false;
+                };
+                if !Self::java_primitive(left)
+                    || !Self::java_primitive(right)
+                    || !Self::java_primitive_widens(left, right)
+                {
+                    return false;
+                }
+                strict |= left != right;
+            }
+            strict
+        };
+        let candidates = targets.clone();
+        targets.retain(|&target| !candidates.iter().any(|&other| more_specific(other, target)));
+    }
+
     /// Explicit Java binding types narrow a receiver to its declaration
     /// scope before name-based fallback. Unknown/ambiguous types are not
     /// guessed from the one method that happens to exist elsewhere.
@@ -1798,7 +1955,7 @@ impl Builder {
             let resolution = self
                 .resolve_in_hierarchy(*class, source, name, false)
                 .ok_or(DropReason::ReceiverUnresolved)?;
-            let targets: Vec<u32> = resolution
+            let mut targets: Vec<u32> = resolution
                 .targets
                 .into_iter()
                 .filter(|&candidate| {
@@ -1809,9 +1966,12 @@ impl Builder {
                             .as_ref()
                             .is_some_and(|syntax| {
                                 syntax.accepts_arguments(&symbol.name, symbol.line, call.arguments)
+                                    && self
+                                        .java_invocation_compatible(source, candidate, name, line)
                             })
                 })
                 .collect();
+            self.java_narrow_invocation_targets(source, name, line, &mut targets);
             match targets.len() {
                 0 => Err(DropReason::ReceiverUnresolved),
                 1 => Ok(Resolution::new(Confidence::Scoped, targets)),
@@ -2266,12 +2426,17 @@ impl Builder {
                     .as_ref()
                     .is_some_and(|java| {
                         java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                            && self.java_invocation_compatible(source, target, name, line)
                     })
         };
         // Enclosing/inherited members take precedence over static imports.
         if let Some(mut local) = self.resolve_in_class_scope(source, name) {
             local.targets.retain(|&target| accepts(target));
+            self.java_narrow_invocation_targets(source, name, line, &mut local.targets);
             if !local.targets.is_empty() {
+                if local.targets.len() == 1 && local.confidence == Confidence::Ambiguous {
+                    local.confidence = Confidence::Scoped;
+                }
                 return Some(Ok(local));
             }
         }
@@ -2285,6 +2450,7 @@ impl Builder {
         }
         targets.sort_unstable();
         targets.dedup();
+        self.java_narrow_invocation_targets(source, name, line, &mut targets);
         // An explicit library import still binds when its class is absent
         // from the native source index. Do not borrow an unrelated method.
         Some(match targets.len() {
@@ -2309,7 +2475,7 @@ impl Builder {
         let mut scope = self.class_scope(source);
         while let Some(class) = scope {
             if let Some(found) = self.resolve_in_hierarchy(class, source, name, false) {
-                let targets: Vec<_> = found
+                let mut targets: Vec<_> = found
                     .targets
                     .into_iter()
                     .filter(|&target| {
@@ -2320,9 +2486,12 @@ impl Builder {
                                 .as_ref()
                                 .is_some_and(|java| {
                                     java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                                        && self
+                                            .java_invocation_compatible(source, target, name, line)
                                 })
                     })
                     .collect();
+                self.java_narrow_invocation_targets(source, name, line, &mut targets);
                 return Some(match targets.len() {
                     0 => Err(DropReason::ReceiverUnresolved),
                     1 => {
@@ -2748,7 +2917,13 @@ impl Builder {
         }
         if let Some(receiver) = receiver {
             let classes = self.java_receiver_classes(source, receiver, depth + 1);
-            self.java_receiver_members(source, &classes, name, Some(arguments))
+            let mut targets = self
+                .java_receiver_members(source, &classes, name, Some(arguments))
+                .into_iter()
+                .filter(|&target| self.java_invocation_compatible(source, target, name, line))
+                .collect();
+            self.java_narrow_invocation_targets(source, name, line, &mut targets);
+            targets
         } else {
             let file = self.syms[source as usize].file;
             self.resolve_java_static_call(file, source, name, line)
@@ -3840,6 +4015,11 @@ impl Builder {
                 .filter(|classes| !classes.is_empty())
                 .unwrap_or_else(|| self.java_receiver_classes(source, &call.receiver, 0));
             let mut targets = self.java_receiver_members(source, &classes, name, call.arguments);
+            if call.arguments.is_some() {
+                targets
+                    .retain(|&target| self.java_invocation_compatible(source, target, name, line));
+                self.java_narrow_invocation_targets(source, name, line, &mut targets);
+            }
             if let Some(context) = &call.reference_context {
                 if let Some(inputs) = self.java_functional_arity(source, context) {
                     targets.retain(|&target| {
@@ -4184,7 +4364,7 @@ impl Builder {
                 // A declaration and its recursive call may share a line.
                 // Syntax and arity must establish the call before the generic
                 // declaration/self-reference filters can discard its row.
-                let targets: Vec<u32> =
+                let mut targets: Vec<u32> =
                     self.by_qual
                         .get(&owner.qual)
                         .into_iter()
@@ -4197,10 +4377,14 @@ impl Builder {
                                 && self.files[symbol.file as usize].java.as_ref().is_some_and(
                                     |java| {
                                         java.accepts_arguments(&symbol.name, symbol.line, arguments)
+                                            && self.java_invocation_compatible(
+                                                source, candidate, name, line,
+                                            )
                                     },
                                 )
                         })
                         .collect();
+                self.java_narrow_invocation_targets(source, name, line, &mut targets);
                 return match targets.len() {
                     0 => Err(DropReason::ReceiverUnresolved),
                     1 => Ok(Resolution::new(Confidence::Scoped, targets)),
