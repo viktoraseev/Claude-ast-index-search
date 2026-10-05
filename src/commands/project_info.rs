@@ -177,9 +177,8 @@ pub fn cmd_map_scoped(
 }
 
 /// Count module declarations in the header's directory/root context, before
-/// the detailed display selector or page limits. Attached module paths are
-/// absolute; primary paths are relative. Never infer ownership by probing a
-/// same-named directory in another root or by the module's display name.
+/// the detailed display selector or page limits. Explicit owners keep colliding
+/// module directories distinct; legacy absolute paths remain readable.
 fn count_map_modules(
     conn: &rusqlite::Connection,
     root: &Path,
@@ -187,12 +186,17 @@ fn count_map_modules(
     resolver: &super::PathResolver,
 ) -> Result<i64> {
     let primary = std::path::PathBuf::from(db::normalize_root_for_storage(root));
-    let mut stmt = conn.prepare("SELECT path FROM modules")?;
+    let mut stmt = conn.prepare("SELECT path,root_path FROM modules")?;
     let mut rows = stmt.query([])?;
     let mut count = 0;
     while let Some(row) = rows.next()? {
         let stored: String = row.get(0)?;
-        let absolute = primary.join(stored);
+        let owner: String = row.get(1)?;
+        let absolute = if owner.is_empty() {
+            primary.join(stored)
+        } else {
+            Path::new(&owner).join(stored)
+        };
         if let Some(relative) = resolver.scoped_relative_path(&absolute) {
             // A directory selector ending in '/' must include a declaration
             // at that directory, while retaining literal case and wildcards.

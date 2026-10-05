@@ -25,7 +25,13 @@ pub(super) struct TypeDeclaration {
     pub local_scope: Option<Range<usize>>,
 }
 
-type InvocationArguments = Vec<Option<String>>;
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum InvocationArgument {
+    Type(String),
+    Field(JavaReceiver),
+}
+
+type InvocationArguments = Vec<Option<InvocationArgument>>;
 
 #[derive(Default)]
 pub(super) struct JavaSource {
@@ -51,6 +57,7 @@ pub(super) struct JavaSource {
     returns: HashMap<(String, i64), Option<String>>,
     return_receivers: HashMap<(String, i64), JavaReceiver>,
     member_receivers: HashMap<(String, i64), JavaReceiver>,
+    member_invocation_types: HashMap<(String, i64), Option<String>>,
     getter_receivers: HashMap<(String, i64, String), Option<(i64, JavaReceiver)>>,
     type_parameters: HashMap<(String, i64), Vec<String>>,
     return_parameters: HashMap<(String, i64), String>,
@@ -1017,7 +1024,54 @@ fn invocation_type(node: Node<'_>, source: &str) -> Option<String> {
             "[]".repeat(array_dimensions(dimensions))
         ));
     }
+    // Outer<A>.Inner<B> cannot be represented by erasing the outer arguments.
+    let mut generic_qualifier = false;
+    walk_tree_preorder(&node, |child| {
+        if child.kind() == "type_arguments" {
+            return WalkControl::SkipChildren;
+        }
+        generic_qualifier |= child.id() != node.id() && child.kind() == "generic_type";
+        WalkControl::Continue
+    });
+    if generic_qualifier {
+        return None;
+    }
+    if node.kind() == "generic_type" {
+        let mut cursor = node.walk();
+        let arguments = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "type_arguments")?;
+        let mut cursor = arguments.walk();
+        let arguments: Option<Vec<_>> = arguments
+            .named_children(&mut cursor)
+            .filter(|child| !child.is_extra())
+            .map(|child| invocation_type(child, source))
+            .collect();
+        let arguments = arguments?;
+        // Diamond inference and wildcard capture need semantic evidence.
+        if arguments.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "{}<{}>",
+            type_name(node, source)?,
+            arguments.join(",")
+        ));
+    }
+    if node.kind() == "wildcard" {
+        return None;
+    }
     type_name(node, source)
+}
+
+fn invocation_has_type_parameter(ty: Node<'_>, owner: Node<'_>, source: &str) -> bool {
+    let mut found = false;
+    walk_tree_preorder(&ty, |child| {
+        found |=
+            child.kind() == "type_identifier" && type_parameter(owner, text(child, source), source);
+        WalkControl::Continue
+    });
+    found
 }
 
 fn array_dimensions(node: Node<'_>) -> usize {
@@ -1028,14 +1082,11 @@ fn array_dimensions(node: Node<'_>) -> usize {
 }
 
 fn declared_invocation_type(ty: Node<'_>, declaration: Node<'_>, source: &str) -> Option<String> {
+    if invocation_has_type_parameter(ty, declaration, source) {
+        return None;
+    }
     let mut ty = invocation_type(ty, source)?;
-    if ty == "var"
-        || type_parameter(
-            declaration,
-            ty.trim_end_matches("[]").split("::").next()?,
-            source,
-        )
-    {
+    if ty == "var" {
         return None;
     }
     let mut cursor = declaration.walk();
@@ -1164,9 +1215,10 @@ fn invocation_argument_type(
             .strip_suffix("[]")
             .map(str::to_owned),
         "cast_expression" | "object_creation_expression" => {
-            let ty = invocation_type(node.child_by_field_name("type")?, source)?;
-            (!type_parameter(owner, ty.trim_end_matches("[]").split("::").next()?, source))
-                .then_some(ty)
+            let ty = node.child_by_field_name("type")?;
+            (!invocation_has_type_parameter(ty, owner, source))
+                .then(|| invocation_type(ty, source))
+                .flatten()
         }
         "array_creation_expression" => {
             let element = invocation_type(node.child_by_field_name("type")?, source)?;
@@ -2126,6 +2178,13 @@ impl JavaSource {
                         .filter(|variable| variable.kind() == "variable_declarator")
                     {
                         if let Some(name) = variable.child_by_field_name("name") {
+                            result.member_invocation_types.insert(
+                                (
+                                    text(name, source).to_owned(),
+                                    name.start_position().row as i64 + 1,
+                                ),
+                                declared_invocation_type(ty, variable, source),
+                            );
                             result.member_receivers.insert(
                                 (
                                     text(name, source).to_owned(),
@@ -2499,6 +2558,15 @@ impl JavaSource {
                         let Some(name) = component.child_by_field_name("name") else {
                             continue;
                         };
+                        result.member_invocation_types.insert(
+                            (
+                                text(name, source).to_owned(),
+                                name.start_position().row as i64 + 1,
+                            ),
+                            component
+                                .child_by_field_name("type")
+                                .and_then(|ty| declared_invocation_type(ty, component, source)),
+                        );
                         if let Some(receiver) =
                             component.child_by_field_name("type").and_then(|ty| {
                                 generic_receiver(ty, node, source).or_else(|| {
@@ -2941,7 +3009,16 @@ impl JavaSource {
                 arguments
                     .named_children(&mut cursor)
                     .filter(|argument| !argument.is_extra())
-                    .map(|argument| invocation_argument_type(argument, owner, source, &scopes, 0))
+                    .map(|argument| {
+                        invocation_argument_type(argument, owner, source, &scopes, 0)
+                            .map(InvocationArgument::Type)
+                            .or_else(|| {
+                                let receiver =
+                                    expression_receiver(argument, owner, source, &scopes, 0);
+                                matches!(receiver, JavaReceiver::Field { .. })
+                                    .then_some(InvocationArgument::Field(receiver))
+                            })
+                    })
                     .collect()
             });
             result
@@ -3382,9 +3459,15 @@ impl JavaSource {
         owner_line: i64,
         line: i64,
         name: &str,
-    ) -> Option<&[Option<String>]> {
+    ) -> Option<&[Option<InvocationArgument>]> {
         self.invocation_types
             .get(&(owner.to_owned(), owner_line, line, name.to_owned()))?
+            .as_deref()
+    }
+
+    pub fn member_invocation_type(&self, name: &str, line: i64) -> Option<&str> {
+        self.member_invocation_types
+            .get(&(name.to_owned(), line))?
             .as_deref()
     }
 

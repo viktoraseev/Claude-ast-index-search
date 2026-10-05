@@ -4448,7 +4448,8 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
             path TEXT NOT NULL,
-            kind TEXT
+            kind TEXT,
+            root_path TEXT NOT NULL DEFAULT ''
         );
 
         -- Module dependencies
@@ -5011,6 +5012,8 @@ fn inspect_open_migrations(
     let files_exists = table_exists(conn, "files")?;
     let symbols_exists = table_exists(conn, "symbols")?;
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
+    let modules_current =
+        !table_exists(conn, "modules")? || column_exists(conn, "modules", "root_path")?;
     let files_uniqueness_current = !files_exists || !files_has_legacy_path_unique(conn)?;
     let symbols_current = !symbols_exists
         || (column_exists(conn, "symbols", "qualified_name")?
@@ -5062,6 +5065,7 @@ fn inspect_open_migrations(
             || !git_signals_exist
             || !symbol_graph_exists
             || !files_current
+            || !modules_current
             || !files_uniqueness_current
             || !symbols_current
             || stored_root.as_deref() != Some(normalized_root)
@@ -5154,6 +5158,13 @@ fn apply_open_migrations_transaction(
     }
     if rebuild_files {
         rebuild_legacy_files_table(&tx)?;
+    }
+
+    if table_exists(&tx, "modules")? && !column_exists(&tx, "modules", "root_path")? {
+        tx.execute(
+            "ALTER TABLE modules ADD COLUMN root_path TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
     }
 
     if table_exists(&tx, "symbols")? {

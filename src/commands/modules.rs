@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use colored::Colorize;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::Pagination;
 use crate::db;
@@ -24,27 +24,138 @@ use crate::indexer;
 /// graph, including seed resolution, reverse edges, counts and route hops.
 fn open_module_query_db(root: &Path) -> Result<db::LeasedConnection> {
     let conn = db::open_db_leased(root)?;
+    let resolver = super::PathResolver::try_from_conn(root, &conn)?;
+    if let Ok(name) = std::env::var("AST_INDEX_SUBTREE") {
+        anyhow::ensure!(
+            db::list_subtrees(&conn)?.iter().any(|s| s.name == name),
+            "Unknown subtree: {name}"
+        );
+    }
     let cwd = std::env::current_dir()?;
-    if let Ok(relative) = cwd.strip_prefix(root) {
-        if !relative.as_os_str().is_empty() {
-            let prefix = format!("{}/", relative.to_string_lossy());
-            conn.execute_batch("CREATE TEMP TABLE selected_module_ids(id INTEGER PRIMARY KEY);")?;
-            conn.execute(
-                "INSERT INTO selected_module_ids
-                 SELECT id FROM main.modules WHERE instr(path || '/', ?1)=1",
-                params![prefix],
-            )?;
-            conn.execute_batch(
-                "CREATE TEMP VIEW modules AS
-                     SELECT m.* FROM main.modules m JOIN selected_module_ids s ON s.id=m.id;
-                 CREATE TEMP VIEW module_deps AS
-                     SELECT d.* FROM main.module_deps d
-                     JOIN temp.modules src ON src.id=d.module_id
-                     JOIN temp.modules dst ON dst.id=d.dep_module_id;",
-            )?;
+    let prefix = cwd
+        .strip_prefix(root)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| format!("{}/", p.to_string_lossy()));
+    conn.execute_batch("CREATE TEMP TABLE selected_module_ids(id INTEGER PRIMARY KEY);")?;
+    {
+        let mut stmt = conn.prepare("SELECT id,path,root_path FROM main.modules")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            let owner: String = row.get(2)?;
+            let registered = owner.is_empty()
+                || resolver.is_primary_root(Some(&owner))
+                || resolver.subtree_name(Some(&owner)).is_some();
+            if registered
+                && resolver.matches_filter(if owner.is_empty() { None } else { Some(&owner) })
+                && prefix
+                    .as_ref()
+                    .is_none_or(|p| format!("{path}/").starts_with(p))
+            {
+                conn.execute("INSERT INTO selected_module_ids VALUES (?1)", params![id])?;
+            }
         }
     }
+    conn.execute_batch(
+        "CREATE TEMP VIEW modules AS
+             SELECT m.* FROM main.modules m JOIN selected_module_ids s ON s.id=m.id;
+         CREATE TEMP VIEW module_deps AS
+             SELECT d.* FROM main.module_deps d
+             JOIN temp.modules src ON src.id=d.module_id
+             JOIN temp.modules dst ON dst.id=d.dep_module_id;",
+    )?;
     Ok(conn)
+}
+
+/// Resolve display paths by the module's indexed owner, never filesystem probing.
+fn module_display_path(
+    conn: &Connection,
+    root: &Path,
+    name: &str,
+    path: &str,
+    format: &str,
+) -> Result<String> {
+    let owner: String = conn.query_row(
+        "SELECT root_path FROM main.modules WHERE name=?1",
+        params![name],
+        |r| r.get(0),
+    )?;
+    let resolver =
+        super::PathResolver::try_from_conn(root, conn)?.with_decoration(format != "json");
+    let raw = if db::list_subtrees(conn)?.is_empty() && !Path::new(path).is_absolute() {
+        path.to_owned()
+    } else if owner.is_empty() {
+        root.join(path).to_string_lossy().into_owned()
+    } else {
+        Path::new(&owner).join(path).to_string_lossy().into_owned()
+    };
+    if format != "json" {
+        if let Some(name) = resolver.subtree_name(Some(&owner)) {
+            return Ok(format!("[{name}] {raw}"));
+        }
+    }
+    Ok(raw)
+}
+
+/// Exact names take precedence; path aliases must identify one selected owner.
+fn selected_module(conn: &Connection, root: &Path, query: &str) -> Result<Option<(i64, String)>> {
+    let exact = conn
+        .query_row(
+            "SELECT id,name FROM modules WHERE name=?1",
+            params![query],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if exact.is_some() {
+        return Ok(exact);
+    }
+    let mut stmt = conn.prepare("SELECT id,name,path,root_path FROM modules ORDER BY name")?;
+    let mut rows = stmt.query([])?;
+    let mut selected = None;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(2)?;
+        let owner: String = row.get(3)?;
+        let absolute = if owner.is_empty() {
+            root.join(&path)
+        } else {
+            Path::new(&owner).join(&path)
+        };
+        if query == path || query == absolute.to_string_lossy() {
+            anyhow::ensure!(
+                selected.is_none(),
+                "Ambiguous module path; use a qualified module name"
+            );
+            selected = Some((row.get(0)?, row.get(1)?));
+        }
+    }
+    if selected.is_none() {
+        let normalized = if query.contains("::") {
+            query.replace('/', ".")
+        } else {
+            query
+                .trim_start_matches(':')
+                .replace(':', ".")
+                .replace('/', ".")
+        };
+        selected = conn
+            .query_row(
+                "SELECT id,name FROM modules WHERE name=?1",
+                params![normalized],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+    }
+    Ok(selected)
+}
+
+fn module_location(conn: &Connection, name: &str) -> Result<(String, String)> {
+    Ok(conn.query_row(
+        "SELECT path,root_path FROM main.modules WHERE name=?1",
+        params![name],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
 }
 
 /// Readiness belongs to the underlying index, independent of query scope.
@@ -83,32 +194,23 @@ fn print_empty_module_result(
     Ok(())
 }
 
-/// Check both module name and path aliases used by dependency navigation.
-fn module_exists(conn: &Connection, module: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM modules WHERE name=?1 OR path=?1)",
-        params![module],
-        |row| row.get(0),
-    )?)
-}
-
 fn print_module_edges(
     conn: &Connection,
     module: &str,
+    root: &Path,
     edges: &[(String, String, String)],
     empty_reason: &str,
 ) -> Result<()> {
-    let reason = if !module_exists(conn, module)? {
+    let reason = if selected_module(conn, root, module)?.is_none() {
         Some("missing_module")
     } else if edges.is_empty() {
         Some(empty_reason)
     } else {
         None
     };
-    let items: Vec<_> = edges
-        .iter()
-        .map(|(name, path, kind)| serde_json::json!({"name": name, "path": path, "kind": kind}))
-        .collect();
+    let items: Vec<_> = edges.iter().map(|(name, path, kind)| {
+        Ok(serde_json::json!({"name": name, "path": module_display_path(conn, root, name, path, "json")?, "kind": kind}))
+    }).collect::<Result<_>>()?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -147,11 +249,15 @@ pub fn cmd_module_with_format(
         "SELECT name, path FROM modules WHERE name LIKE ?1 ORDER BY name, path LIMIT ?2",
     )?;
     let sql_pattern = format!("%{}%", pattern);
-    let modules: Vec<(String, String)> = stmt
+    let mut modules: Vec<(String, String)> = stmt
         .query_map(rusqlite::params![sql_pattern, limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<Result<_, _>>()?;
+
+    for (name, path) in &mut modules {
+        *path = module_display_path(&conn, root, name, path, format)?;
+    }
 
     if format == "json" {
         let total: usize = conn.query_row(
@@ -218,11 +324,23 @@ pub fn cmd_deps_with_format(root: &Path, module: &str, format: &str) -> Result<(
         return Ok(());
     }
 
-    let deps = indexer::get_module_deps(&conn, module)?;
+    let seed = selected_module(&conn, root, module)?;
+    let deps = match seed {
+        Some((_, name)) => indexer::get_module_deps(&conn, &name)?,
+        None => Vec::new(),
+    };
 
     if format == "json" {
-        return print_module_edges(&conn, module, &deps, "no_dependencies");
+        return print_module_edges(&conn, module, root, &deps, "no_dependencies");
     }
+
+    let deps: Vec<_> = deps
+        .into_iter()
+        .map(|(name, path, kind)| {
+            let path = module_display_path(&conn, root, &name, &path, format)?;
+            Ok((name, path, kind))
+        })
+        .collect::<Result<_>>()?;
 
     println!(
         "{}",
@@ -299,11 +417,23 @@ pub fn cmd_dependents_with_format(root: &Path, module: &str, format: &str) -> Re
         return Ok(());
     }
 
-    let dependents = indexer::get_module_dependents(&conn, module)?;
+    let seed = selected_module(&conn, root, module)?;
+    let dependents = match seed {
+        Some((_, name)) => indexer::get_module_dependents(&conn, &name)?,
+        None => Vec::new(),
+    };
 
     if format == "json" {
-        return print_module_edges(&conn, module, &dependents, "no_dependents");
+        return print_module_edges(&conn, module, root, &dependents, "no_dependents");
     }
+
+    let dependents: Vec<_> = dependents
+        .into_iter()
+        .map(|(name, path, kind)| {
+            let path = module_display_path(&conn, root, &name, &path, format)?;
+            Ok((name, path, kind))
+        })
+        .collect::<Result<_>>()?;
 
     println!(
         "{}",
@@ -404,14 +534,12 @@ pub fn cmd_unused_deps_with_format(
     }
 
     // Get module id and path
-    let module_info: Option<(i64, String, String)> = conn
-        .query_row(
-            "SELECT id, path, name FROM modules WHERE name = ?1 OR path = ?1
-             ORDER BY name=?1 DESC, id LIMIT 1",
-            params![module],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .ok();
+    let module_info = selected_module(&conn, root, module)?
+        .map(|(id, name)| -> Result<_> {
+            let (path, _) = module_location(&conn, &name)?;
+            Ok((id, path, name))
+        })
+        .transpose()?;
 
     let (module_id, module_path, module_name) = match module_info {
         Some(info) => info,
@@ -428,7 +556,7 @@ pub fn cmd_unused_deps_with_format(
     };
 
     // Get all dependencies
-    let deps = indexer::get_module_deps(&conn, module)?;
+    let deps = indexer::get_module_deps(&conn, &module_name)?;
 
     if deps.is_empty() {
         if format == "json" {
@@ -485,6 +613,7 @@ pub fn cmd_unused_deps_with_format(
     // Swift code imports a dependency by its module name, so `import Dep`
     // in any source file of the module proves the dependency is used no matter
     // which kinds of symbols (structs, extensions, free functions) it touches.
+    let (_, module_root) = module_location(&conn, &module_name)?;
     let module_imports = db::find_swift_imports_under(&conn, &module_path)?;
 
     let mut dep_usages: HashMap<String, DepUsage> = HashMap::new();
@@ -497,6 +626,7 @@ pub fn cmd_unused_deps_with_format(
 
     for (dep_name, dep_path, dep_kind) in &deps {
         let mut usage = DepUsage::default();
+        let (_, dependency_root) = module_location(&conn, dep_name)?;
 
         // 1. Check direct usage: a Swift import, else references to the
         //    dependency's symbols via the index (refs table)
@@ -505,8 +635,14 @@ pub fn cmd_unused_deps_with_format(
             usage.direct_count = 1;
             usage.direct_symbols = vec![format!("import {}", dep_module_name)];
         } else {
-            let (direct_count, direct_names) =
-                count_symbols_used_in_module(&conn, root, dep_path, &module_path)?;
+            let (direct_count, direct_names) = count_symbols_used_in_module(
+                &conn,
+                root,
+                dep_path,
+                &module_path,
+                &dependency_root,
+                &module_root,
+            )?;
             usage.direct_count = direct_count;
             usage.direct_symbols = direct_names;
         }
@@ -531,8 +667,14 @@ pub fn cmd_unused_deps_with_format(
             })?;
             for export in exports {
                 let (name, path) = export?;
-                let (count, names) =
-                    count_symbols_used_in_module(&conn, root, &path, &module_path)?;
+                let (count, names) = count_symbols_used_in_module(
+                    &conn,
+                    root,
+                    &path,
+                    &module_path,
+                    &module_location(&conn, &name)?.1,
+                    &module_root,
+                )?;
                 if count > 0 {
                     usage.transitive_count += count;
                     usage.transitive_via.push((name, names));
@@ -629,7 +771,9 @@ pub fn cmd_unused_deps_with_format(
             // Check if these resources are used in the target module
             for resource in resources {
                 let (res_type, res_name) = resource?;
-                let usage_scope = MODULE_FILE_SCOPE.replace("f.path", "ru.usage_file");
+                let usage_scope = MODULE_FILE_SCOPE
+                    .replace("f.path", "ru.usage_file")
+                    .replace("f.root_path", "owner.root_path");
                 let mut usage_stmt = conn.prepare(&format!(
                     "SELECT ru.usage_type FROM resource_usages ru
                      JOIN resources r ON ru.resource_id = r.id
@@ -725,7 +869,7 @@ pub fn cmd_unused_deps_with_format(
                 "unused"
             };
             let mut item = serde_json::json!({
-                "name": name, "path": path, "kind": kind, "category": category,
+                "name": name, "path": module_display_path(&conn, root, name, path, format)?, "kind": kind, "category": category,
                 "usage": {"direct": usage.direct_count, "transitive": usage.transitive_count,
                           "xml": usage.xml_count, "resources": usage.resource_count}
             });
@@ -916,7 +1060,8 @@ const MODULE_FILE_SCOPE: &str = "
     (?1='' OR substr(f.path,1,length(?1)+1)=?1||'/')
     AND NOT EXISTS (
         SELECT 1 FROM main.modules child
-        WHERE length(child.path)>length(?1)
+        WHERE (child.root_path='' OR child.root_path=f.root_path)
+          AND length(child.path)>length(?1)
           AND (?1='' OR substr(child.path,1,length(?1)+1)=?1||'/')
           AND substr(f.path,1,length(child.path)+1)=child.path||'/'
     )";
@@ -1711,8 +1856,8 @@ pub fn cmd_module_route(
     }
 
     // Resolve module ids.
-    let from_id = db::find_module_id_by_name(&conn, from)?;
-    let to_id = db::find_module_id_by_name(&conn, to)?;
+    let from_id = selected_module(&conn, root, from)?.map(|(id, _)| id);
+    let to_id = selected_module(&conn, root, to)?.map(|(id, _)| id);
 
     let kind_filter: Option<&str> = if via_kind == "all" {
         None
@@ -2032,6 +2177,8 @@ fn count_symbols_used_in_module(
     root: &Path,
     dependency_path: &str,
     module_path: &str,
+    dependency_root: &str,
+    module_root: &str,
 ) -> Result<(usize, Vec<String>)> {
     let used = UsedDependencySymbols::new()?;
 
@@ -2040,12 +2187,13 @@ fn count_symbols_used_in_module(
     // at a time, and ask the index only for exact declaration identities.
     let resolver = super::PathResolver::try_from_conn(root, conn)?.with_decoration(false);
     let mut files = conn.prepare(&format!(
-        "SELECT f.path,f.root_path FROM files f WHERE {MODULE_FILE_SCOPE}
+        "SELECT f.path,f.root_path FROM files f WHERE {MODULE_FILE_SCOPE} AND (?3='' OR f.root_path=?3)
          AND substr(f.path,-5)='.java' ORDER BY f.path,f.root_path"
     ))?;
-    let rows = files.query_map(params![module_path], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = files.query_map(
+        params![module_path, rusqlite::types::Null, module_root],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
     let mut exists = conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM symbols s JOIN files f ON s.file_id=f.id
          WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
@@ -2053,7 +2201,7 @@ fn count_symbols_used_in_module(
     )?;
     let mut owners = conn.prepare_cached(&format!(
         "SELECT DISTINCT s.name FROM symbols s JOIN files f ON s.file_id=f.id
-         WHERE {MODULE_FILE_SCOPE} AND substr(f.path,-5)='.java' AND s.qualified_name=?2
+         WHERE {MODULE_FILE_SCOPE} AND (?3='' OR f.root_path=?3) AND substr(f.path,-5)='.java' AND s.qualified_name=?2
          AND s.kind IN ('class','interface','enum') ORDER BY s.name"
     ))?;
     for row in rows {
@@ -2136,9 +2284,11 @@ fn count_symbols_used_in_module(
             }
         }
         for identity in identities {
-            for name in owners.query_map(params![dependency_path, identity], |row| {
-                row.get::<_, String>(0)
-            })? {
+            for name in owners
+                .query_map(params![dependency_path, identity, dependency_root], |row| {
+                    row.get::<_, String>(0)
+                })?
+            {
                 used.insert(&name?)?;
             }
         }
@@ -2148,19 +2298,23 @@ fn count_symbols_used_in_module(
     // at 100 types or retaining its whole type population in a Rust Vec.
     let mut candidates = conn.prepare(&format!(
         "SELECT DISTINCT s.name FROM symbols s JOIN files f ON s.file_id=f.id
-         WHERE {MODULE_FILE_SCOPE} AND s.kind IN ('class','interface','enum','object')
+         WHERE {MODULE_FILE_SCOPE} AND (?3='' OR f.root_path=?3) AND s.kind IN ('class','interface','enum','object')
          ORDER BY s.name"
     ))?;
-    let symbols = candidates.query_map(params![dependency_path], |row| row.get::<_, String>(0))?;
+    let symbols = candidates.query_map(
+        params![dependency_path, rusqlite::types::Null, dependency_root],
+        |row| row.get::<_, String>(0),
+    )?;
 
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT EXISTS(SELECT 1 FROM refs r JOIN files f ON r.file_id=f.id
-         WHERE {MODULE_FILE_SCOPE} AND substr(f.path,-5)!='.java' AND r.name=?2)"
+         WHERE {MODULE_FILE_SCOPE} AND (?3='' OR f.root_path=?3) AND substr(f.path,-5)!='.java' AND r.name=?2)"
     ))?;
 
     for symbol in symbols {
         let symbol = symbol?;
-        let count: i64 = stmt.query_row(params![module_path, &symbol], |row| row.get(0))?;
+        let count: i64 =
+            stmt.query_row(params![module_path, &symbol, module_root], |row| row.get(0))?;
         if count > 0 {
             used.insert(&symbol)?;
         }

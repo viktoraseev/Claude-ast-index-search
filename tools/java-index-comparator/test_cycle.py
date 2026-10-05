@@ -50,6 +50,9 @@ class CycleTests(unittest.TestCase):
         self.assertIn("Do not repair Kotlin, Swift, Perl, shell", prompt)
         self.assertIn("Ignore non-Java pending rows in older evidence", prompt)
         self.assertNotIn("All applicable ast-index features remain in scope", prompt)
+        self.assertIn("Preserve concurrently added regression assertions too", prompt)
+        self.assertIn("Do not run git restore, git checkout or git reset", prompt)
+        self.assertIn("retain unrelated and concurrent", prompt)
 
     def test_recorded_problems_and_failed_verification_take_priority(self):
         cases = [{"counts": {kind: 1}} for kind in ("fail", "unsupported", "error")]

@@ -6,9 +6,34 @@ import unittest
 from audit import JAVA_EXCLUDED_FEATURES, SCHEMA, plan
 from common import connect
 import annotation_contracts
+import android_contracts
 
 
 class JavaScopeTests(unittest.TestCase):
+    def test_java_audit_keeps_framework_contracts_pending_for_non_java_markers(self):
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts' / 'tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=artifacts) as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'Sentinel.java').write_text('class Sentinel {}\n')
+            resource = root / '.generated' / 'res' / 'values' / 'strings.xml'
+            resource.parent.mkdir(parents=True)
+            resource.write_text('<resources><string name="title">Sample</string></resources>')
+            (root / 'build.gradle').write_text("plugins { id 'com.android.library' }\n")
+            state = connect(directory / 'evidence.sqlite')
+            self.addCleanup(state.close)
+            state.executescript(SCHEMA)
+            plan(state, [{'path': 'Sentinel.java'}], '  class  Classes\n  symbol  Symbols',
+                 [], root, java_only=True)
+            self.assertEqual(state.execute('SELECT count(*) FROM file_inventory').fetchone()[0], 3)
+            for feature in android_contracts.FEATURES:
+                self.assertEqual(state.execute('SELECT status FROM coverage WHERE feature=?',
+                                               (feature + ':target',)).fetchone()[0], 'pending')
+            self.assertEqual(state.execute("SELECT count(*) FROM checks WHERE subject='target-absence'").fetchone()[0], 0)
+            self.assertEqual(state.execute("SELECT count(*) FROM checks WHERE verdict='pass'").fetchone()[0], 0)
+
     def test_every_existing_java_case_survives_and_shared_contracts_remain_pending(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -27,12 +27,18 @@ class Target {
  int boxed(java.lang.Integer value) { return 2; }
  int rank(int[] value) { return 1; }
  int rank(java.lang.Object value) { return 2; }
+ int rankField(int[] value) { return 1; }
+ int rankField(java.lang.Object value) { return 2; }
+ int genericVariable(Box<java.lang.Integer> value) { return 1; }
+ int genericVariable(java.lang.Object value) { return 2; }
+ int genericField(Box<java.lang.Integer> value) { return 1; }
+ int genericField(java.lang.Object value) { return 2; }
 }
 "#,
     ),
     (
         "Types.java",
-        "package fixture;\nclass Parent {}\nclass Child extends Parent {}\n",
+        "package fixture;\nclass Parent {}\nclass Child extends Parent {}\nclass Box<T> {}\nclass Holder { int[][] matrix; Box<java.lang.String> value; }\n",
     ),
     (
         "Probe.java",
@@ -48,6 +54,9 @@ class Probe {
  int boxed(Target target, java.lang.Integer value) { return target.boxed(value); }
  int rank(Target target, int[][] value) { int[][] local = value; var inferred = new int[1][1]; target.rank(local); target.rank(inferred); target.rank(this.matrix); return target.rank(value); }
  int[][] matrix;
+ int rankField(Target target, Holder holder) { return target.rankField(holder.matrix); }
+ int genericVariable(Target target, Box<java.lang.String> value) { return target.genericVariable(value); }
+ int genericField(Target target, Holder holder) { return target.genericField(holder.value); }
 }
 "#,
     ),
@@ -115,6 +124,9 @@ fn java_known_argument_types_and_applicability_phases_select_exact_overloads() {
         ("arity", 9, 15),
         ("boxed", 10, 18),
         ("rank", 11, 20),
+        ("rankField", 13, 22),
+        ("genericVariable", 14, 24),
+        ("genericField", 15, 26),
     ] {
         let seed = format!("fixture.Probe.{name}");
         let document: serde_json::Value = serde_json::from_slice(&run(
@@ -282,5 +294,153 @@ class MoreProbe {
             .collect();
         actual.sort_unstable();
         assert_eq!(actual, lines, "{name}");
+    }
+}
+
+#[test]
+fn field_types_and_invariant_generics_keep_exact_and_unknown_targets() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let root = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::write(root.path().join("Generic.java"), r#"package fixture;
+class Generic<T> {}
+class Parent {}
+class Child extends Parent {}
+class Fields { int values[][]; Generic<java.lang.String> same; Generic<Generic<java.lang.String>> nested; }
+class Choices {
+ int same(Generic<java.lang.String> value) { return 1; }
+ int same(java.lang.Object value) { return 2; }
+ int invariant(Generic<Parent> value) { return 1; }
+ int invariant(java.lang.Object value) { return 2; }
+ int nested(Generic<Generic<java.lang.Integer>> value) { return 1; }
+ int nested(java.lang.Object value) { return 2; }
+ int rank(int[] value) { return 1; }
+ int rank(java.lang.Object value) { return 2; }
+ int unknown(Generic<java.lang.Integer> value) { return 1; }
+ int unknown(java.lang.Object value) { return 2; }
+}
+class GenericProbe {
+ int same(Choices target, Fields fields) { return target.same(fields.same); }
+ int invariant(Choices target, Generic<Child> value) { return target.invariant(value); }
+ int nested(Choices target, Fields fields) { return target.nested(fields.nested); }
+ int rank(Choices target, Fields fields) { return target.rank(fields.values); }
+ int wildcard(Choices target, Generic<?> value) { return target.unknown(value); }
+ <T> int variable(Choices target, Generic<T> value) { return target.unknown(value); }
+ int raw(Choices target, Generic value) { return target.unknown(value); }
+}
+"#).unwrap();
+    // The field's short type belongs to its declaring package, even though a
+    // same-named type exists in the caller's package.
+    for (path, source) in [
+        (
+            "foreign/Value.java",
+            "package foreign; public class Value {}\n",
+        ),
+        (
+            "foreign/Holder.java",
+            "package foreign; public class Holder { public Value value; }\n",
+        ),
+        ("fixture/Value.java", "package fixture; class Value {}\n"),
+        (
+            "fixture/Scoped.java",
+            r#"package fixture;
+class Scoped {
+ int choose(foreign.Value value) { return 1; }
+ int choose(Value value) { return 2; }
+ int call(foreign.Holder holder) { return choose(holder.value); }
+}
+"#,
+        ),
+    ] {
+        let destination = root.path().join(path);
+        fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        fs::write(destination, source).unwrap();
+    }
+    run(root.path(), cache.path(), &["rebuild", "--force"]);
+    run(root.path(), cache.path(), &["graph", "build"]);
+    for (seed, name, path, lines) in [
+        ("fixture.GenericProbe.same", "same", "Generic.java", vec![7]),
+        (
+            "fixture.GenericProbe.invariant",
+            "invariant",
+            "Generic.java",
+            vec![10],
+        ),
+        (
+            "fixture.GenericProbe.nested",
+            "nested",
+            "Generic.java",
+            vec![12],
+        ),
+        (
+            "fixture.GenericProbe.rank",
+            "rank",
+            "Generic.java",
+            vec![14],
+        ),
+        (
+            "fixture.GenericProbe.wildcard",
+            "unknown",
+            "Generic.java",
+            vec![15, 16],
+        ),
+        (
+            "fixture.GenericProbe.variable",
+            "unknown",
+            "Generic.java",
+            vec![15, 16],
+        ),
+        (
+            "fixture.GenericProbe.raw",
+            "unknown",
+            "Generic.java",
+            vec![15, 16],
+        ),
+        (
+            "fixture.Scoped.call",
+            "choose",
+            "fixture/Scoped.java",
+            vec![3],
+        ),
+    ] {
+        let document: serde_json::Value = serde_json::from_slice(&run(
+            root.path(),
+            cache.path(),
+            &[
+                "--format",
+                "json",
+                "graph",
+                "dependencies",
+                seed,
+                "--include-ambiguous",
+                "--limit",
+                "100",
+            ],
+        ))
+        .unwrap();
+        assert_eq!(document["matched"].as_array().unwrap().len(), 1, "{seed}");
+        let mut actual = Vec::new();
+        for edge in document["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|edge| edge["other"]["name"] == name)
+        {
+            assert_eq!(edge["other"]["path"], path, "{seed}");
+            assert_eq!(edge["other"]["kind"], "function", "{seed}");
+            let confidence = if lines.len() != 1 {
+                "ambiguous"
+            } else if seed == "fixture.Scoped.call" {
+                "local"
+            } else {
+                "scoped"
+            };
+            assert_eq!(edge["confidence"], confidence, "{seed}");
+            actual.push(edge["other"]["line"].as_i64().unwrap());
+        }
+        actual.sort_unstable();
+        assert_eq!(actual, lines, "{seed}");
     }
 }

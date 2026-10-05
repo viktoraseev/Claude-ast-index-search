@@ -163,8 +163,13 @@ them. All Java-applicable ast-index features remain in scope, not only class/sym
 Do not modify the target project. Do not commit target source, evidence databases,
 private names or large fixtures. Do not change AGENTS.md. Keep project payloads
 out of your messages. Do not commit or push: the driver verifies and commits.
-Preserve the existing harness changes and regression assertions. Establish
-red/green evidence for the current batch, not a defect fixed in an earlier round.
+Preserve the existing harness changes and regression assertions.
+Preserve concurrently added regression assertions too: the coordinator can add
+verified cases during a round. Do not run git restore, git checkout or git reset
+on changed files to remove formatting. Undo only your own formatting hunks with
+apply_patch, using your pre-format snapshot; retain unrelated and concurrent
+changes. If ownership is unclear, leave the changes intact and report it.
+Establish red/green evidence for the current batch, not a defect fixed in an earlier round.
 Validate broad-query normalization against full-name oracle
 queries before treating a navigation mismatch as a production defect.
 Do not install plugins/hooks/MCP configuration or write outside this repository

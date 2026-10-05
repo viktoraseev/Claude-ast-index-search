@@ -2954,15 +2954,23 @@ pub fn collect_module_files(root: &Path) -> Vec<PathBuf> {
 pub fn sync_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf]) -> Result<usize> {
     let scratch = Connection::open_in_memory()?;
     db::init_db(&scratch)?;
+    for subtree in db::list_subtrees(conn)? {
+        scratch.execute(
+            "INSERT INTO subtrees(name,canonical_path,original_path) VALUES (?1,?2,?3)",
+            rusqlite::params![subtree.name, subtree.canonical_path, subtree.original_path],
+        )?;
+    }
     let count = index_modules_from_files(&scratch, root, files)?;
-    let fresh: Vec<(String, String, Option<String>)> = scratch
-        .prepare("SELECT name, path, kind FROM modules")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+    let fresh: Vec<(String, String, Option<String>, String)> = scratch
+        .prepare("SELECT name, path, kind, root_path FROM modules")?
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
         .collect::<Result<_, _>>()?;
     let unread = db::get_unread_module_manifests(&scratch)?;
 
     let fresh_names: std::collections::HashSet<&str> =
-        fresh.iter().map(|(name, _, _)| name.as_str()).collect();
+        fresh.iter().map(|(name, _, _, _)| name.as_str()).collect();
     let existing: Vec<String> = conn
         .prepare("SELECT name FROM modules")?
         .query_map([], |row| row.get(0))?
@@ -2971,14 +2979,17 @@ pub fn sync_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf]
     let tx = conn.unchecked_transaction()?;
     {
         let mut upsert = tx.prepare_cached(
-            "INSERT INTO modules (name, path, kind) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET path = excluded.path, kind = excluded.kind",
+            "INSERT INTO modules (name, path, kind, root_path) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(name) DO UPDATE SET path = excluded.path, kind = excluded.kind, root_path = excluded.root_path",
         )?;
-        for (name, path, kind) in &fresh {
-            upsert.execute(rusqlite::params![name, path, kind])?;
+        for (name, path, kind, owner) in &fresh {
+            upsert.execute(rusqlite::params![name, path, kind, owner])?;
         }
         let mut delete = tx.prepare_cached("DELETE FROM modules WHERE name = ?1")?;
-        for name in existing.iter().filter(|name| !fresh_names.contains(name.as_str())) {
+        for name in existing
+            .iter()
+            .filter(|name| !fresh_names.contains(name.as_str()))
+        {
             delete.execute(rusqlite::params![name])?;
         }
     }
@@ -3001,6 +3012,35 @@ pub fn refresh_module_graph(
     Ok((module_count, dep_count))
 }
 
+/// Keep Maven module paths relative to their registered owner, with distinct
+/// names for reactors that share directory layouts or artifact coordinates.
+fn maven_module_identity(
+    root: &Path,
+    subtrees: &[db::Subtree],
+    parent: &Path,
+    artifact: &str,
+) -> (String, String, String) {
+    let owner = subtrees
+        .iter()
+        .filter(|s| parent.starts_with(&s.canonical_path))
+        .max_by_key(|s| Path::new(&s.canonical_path).components().count());
+    let owner_path = owner.map_or(root, |s| Path::new(&s.canonical_path));
+    let relative = parent
+        .strip_prefix(owner_path)
+        .unwrap_or(parent)
+        .to_string_lossy()
+        .to_string();
+    let local_name = if relative.is_empty() {
+        artifact.to_string()
+    } else {
+        relative.replace('/', ".")
+    };
+    let name = owner.map_or(local_name.clone(), |s| {
+        format!("{}::{}", s.name, local_name)
+    });
+    (name, relative, db::normalize_root_for_storage(owner_path))
+}
+
 /// Index modules from a pre-collected list of module files (avoids re-walking the filesystem)
 pub fn index_modules_from_files(
     conn: &Connection,
@@ -3008,6 +3048,7 @@ pub fn index_modules_from_files(
     files: &[PathBuf],
 ) -> Result<usize> {
     let mut count = 0;
+    let subtrees = db::list_subtrees(conn)?;
 
     let mut swift_manifests: Vec<&Path> = Vec::new();
 
@@ -3078,22 +3119,13 @@ pub fn index_modules_from_files(
             // Maven modules (pom.xml)
             if name_str == "pom.xml" {
                 if let Some(parent) = path.parent() {
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
-
                     if let Ok(content) = fs::read_to_string(path) {
                         if let Some(manifest) = maven_manifest::parse(&content) {
-                            let module_name = if module_path.is_empty() {
-                                manifest.artifact
-                            } else {
-                                module_path.replace('/', ".")
-                            };
+                            let (name, path, owner) =
+                                maven_module_identity(root, &subtrees, parent, &manifest.artifact);
                             conn.execute(
-                                "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
-                                rusqlite::params![module_name, module_path],
+                                "INSERT OR IGNORE INTO modules (name, path, root_path) VALUES (?1, ?2, ?3)",
+                                rusqlite::params![name, path, owner],
                             )?;
                             count += 1;
                         }
@@ -3279,15 +3311,23 @@ fn extract_python_module_name(content: &str) -> Option<String> {
 
 /// Collect build files (Gradle, Maven, ya.make, Python, Swift manifests) from module paths in DB (for standalone rebuild modules/deps)
 pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec<PathBuf>> {
-    let mut stmt = conn.prepare("SELECT path, kind FROM modules")?;
+    let mut stmt = conn.prepare("SELECT path, kind, root_path FROM modules")?;
     let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
     let mut files = Vec::new();
     let mut seen_manifests = std::collections::HashSet::new();
     for row in rows {
-        let (module_path, kind) = row?;
-        let dir = root.join(&module_path);
+        let (module_path, kind, owner) = row?;
+        let dir = if owner.is_empty() {
+            root.join(&module_path)
+        } else {
+            Path::new(&owner).join(&module_path)
+        };
         if matches!(kind.as_deref(), Some("spm" | "tuist")) {
             // A Swift module's path is its source directory; the manifest that
             // declares it lives in an ancestor directory.
@@ -3314,7 +3354,9 @@ pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec
         ] {
             let p = dir.join(name);
             if p.exists() {
-                files.push(p);
+                if seen_manifests.insert(p.clone()) {
+                    files.push(p);
+                }
                 break;
             }
         }
@@ -3522,6 +3564,7 @@ pub fn index_module_dependencies(
     let py_setup_deps_re = &*PY_SETUP_DEPS_RE;
 
     let mono_root = find_arc_root(root);
+    let subtrees = db::list_subtrees(conn)?;
 
     // First, ensure all modules are indexed and get their IDs. Gradle's
     // generated accessors must be derived from the stored filesystem path:
@@ -3596,7 +3639,7 @@ pub fn index_module_dependencies(
         )?;
 
         // Reactor dependencies bind by Maven coordinates, not directory names.
-        let mut maven_coordinates: HashMap<(String, String), Vec<i64>> = HashMap::new();
+        let mut maven_coordinates: HashMap<(String, String), Vec<(String, i64)>> = HashMap::new();
         for path in gradle_files
             .iter()
             .filter(|p| p.file_name().is_some_and(|n| n == "pom.xml"))
@@ -3610,20 +3653,13 @@ pub fn index_module_dependencies(
             let Some(manifest) = maven_manifest::parse(&content) else {
                 continue;
             };
-            let rel = parent
-                .strip_prefix(root)
-                .unwrap_or(parent)
-                .to_string_lossy();
-            let name = if rel.is_empty() {
-                manifest.artifact.clone()
-            } else {
-                rel.replace('/', ".")
-            };
+            let (name, _, owner) =
+                maven_module_identity(root, &subtrees, parent, &manifest.artifact);
             if let Some(&id) = module_ids.get(&name) {
                 maven_coordinates
                     .entry((manifest.group, manifest.artifact))
                     .or_default()
-                    .push(id);
+                    .push((owner, id));
             }
         }
 
@@ -3660,21 +3696,19 @@ pub fn index_module_dependencies(
 
                         let source_module_name: String = match file_name {
                             "pom.xml" => {
-                                let rel = parent
-                                    .strip_prefix(&root_buf)
-                                    .unwrap_or(parent)
-                                    .to_string_lossy();
-                                if rel.is_empty() {
-                                    let Some(manifest) = fs::read_to_string(path)
-                                        .ok()
-                                        .and_then(|content| maven_manifest::parse(&content))
-                                    else {
-                                        return Vec::new();
-                                    };
-                                    manifest.artifact
-                                } else {
-                                    rel.replace('/', ".")
-                                }
+                                let Some(manifest) = fs::read_to_string(path)
+                                    .ok()
+                                    .and_then(|content| maven_manifest::parse(&content))
+                                else {
+                                    return Vec::new();
+                                };
+                                maven_module_identity(
+                                    &root_buf,
+                                    &subtrees,
+                                    parent,
+                                    &manifest.artifact,
+                                )
+                                .0
                             }
                             "ya.make" => {
                                 let rel = if let Some(ref mono) = mono_root {
@@ -3738,11 +3772,30 @@ pub fn index_module_dependencies(
                         match file_name {
                             "pom.xml" => {
                                 if let Some(manifest) = maven_manifest::parse(&content) {
+                                    let owner = maven_module_identity(
+                                        &root_buf,
+                                        &subtrees,
+                                        parent,
+                                        &manifest.artifact,
+                                    )
+                                    .2;
                                     for (group, artifact, scope) in manifest.dependencies {
                                         if let Some(ids) = maven_coordinates.get(&(group, artifact))
                                         {
-                                            if let [id] = ids.as_slice() {
-                                                edges.push((module_id, *id, scope));
+                                            let local: Vec<_> = ids
+                                                .iter()
+                                                .filter(|(key, _)| *key == owner)
+                                                .collect();
+                                            let target = match local.as_slice() {
+                                                [(_, id)] => Some(*id),
+                                                [] => match ids.as_slice() {
+                                                    [(_, id)] => Some(*id),
+                                                    _ => None,
+                                                },
+                                                _ => None,
+                                            };
+                                            if let Some(id) = target {
+                                                edges.push((module_id, id, scope));
                                             }
                                         }
                                     }

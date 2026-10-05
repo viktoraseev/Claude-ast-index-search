@@ -13,7 +13,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::java::{JavaReceiver, JavaSource, TypeAccess};
+use super::java::{InvocationArgument, JavaReceiver, JavaSource, TypeAccess};
 use super::metrics::compute_metrics;
 use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
@@ -1905,6 +1905,78 @@ impl Builder {
         if parameter_array.is_some() {
             return Some(false);
         }
+        if input.contains('<') || parameter.contains('<') {
+            let split = |ty: &str| ty.split('<').next().unwrap_or(ty).to_owned();
+            let input_raw = split(input);
+            let parameter_raw = split(parameter);
+            if self.java_lang_type(parameter_owner, parameter).as_deref()
+                == Some("java::lang::Object")
+            {
+                return Some(true);
+            }
+            // A parameterized subclass needs type-argument substitution. Only
+            // identical declaring types establish invariant arguments here.
+            let inputs = self.resolve_java_type(
+                input_owner,
+                self.namespace_of(input_owner),
+                &input_raw,
+                None,
+            );
+            let parameters = self.resolve_java_type(
+                parameter_owner,
+                self.namespace_of(parameter_owner),
+                &parameter_raw,
+                None,
+            );
+            if parameters.len() == 1
+                && self.java_lang_type(input_owner, &input_raw).as_deref()
+                    == Some("java::lang::Object")
+            {
+                return Some(false);
+            }
+            let ([input_class], [parameter_class]) = (inputs.as_slice(), parameters.as_slice())
+            else {
+                return None;
+            };
+            if input_class != parameter_class {
+                return None;
+            }
+            let Some(parameters) = Self::java_invariant_arguments(parameter) else {
+                // Assigning a parameterized value to its raw declaring type.
+                return Some(true);
+            };
+            let inputs = Self::java_invariant_arguments(input)?;
+            if inputs.len() != parameters.len() {
+                return None;
+            }
+            let mut certain = true;
+            for (input, parameter) in inputs.into_iter().zip(parameters) {
+                // Invariance requires identity, rather than argument widening.
+                match (
+                    self.java_invocation_conversion(
+                        input_owner,
+                        input,
+                        parameter_owner,
+                        parameter,
+                        false,
+                        depth + 1,
+                    ),
+                    self.java_invocation_conversion(
+                        parameter_owner,
+                        parameter,
+                        input_owner,
+                        input,
+                        false,
+                        depth + 1,
+                    ),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => return Some(false),
+                    (Some(true), Some(true)) => {}
+                    _ => certain = false,
+                }
+            }
+            return certain.then_some(true);
+        }
         let input_primitive = Self::java_primitive(input);
         let parameter_primitive = Self::java_primitive(parameter);
         if input_primitive && parameter_primitive {
@@ -2006,6 +2078,55 @@ impl Builder {
         complete.then_some(false)
     }
 
+    /// Split concrete generic arguments without splitting nested containers.
+    fn java_invariant_arguments(ty: &str) -> Option<Vec<&str>> {
+        let (_, arguments) = ty.split_once('<')?;
+        let arguments = arguments.strip_suffix('>')?;
+        let mut depth = 0usize;
+        let mut start = 0;
+        let mut result = Vec::new();
+        for (position, character) in arguments.char_indices() {
+            match character {
+                '<' => depth += 1,
+                '>' => depth = depth.checked_sub(1)?,
+                ',' if depth == 0 => {
+                    result.push(&arguments[start..position]);
+                    start = position + 1;
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 || arguments.is_empty() {
+            return None;
+        }
+        result.push(&arguments[start..]);
+        Some(result)
+    }
+
+    /// Resolve explicit field metadata in its declaring source namespace.
+    fn java_invocation_argument(
+        &self,
+        source: u32,
+        argument: &InvocationArgument,
+    ) -> Option<(u32, String)> {
+        match argument {
+            InvocationArgument::Type(ty) => Some((source, ty.clone())),
+            InvocationArgument::Field(JavaReceiver::Field { receiver, name }) => {
+                let targets = self.java_field_targets(source, receiver, name, 0);
+                let [target] = targets.as_slice() else {
+                    return None;
+                };
+                let symbol = &self.syms[*target as usize];
+                self.files[symbol.file as usize]
+                    .java
+                    .as_ref()?
+                    .member_invocation_type(&symbol.name, symbol.line)
+                    .map(|ty| (*target, ty.to_owned()))
+            }
+            InvocationArgument::Field(_) => None,
+        }
+    }
+
     fn java_invocation_formals(
         &self,
         target: u32,
@@ -2045,7 +2166,7 @@ impl Builder {
         &self,
         source: u32,
         target: u32,
-        arguments: &[Option<String>],
+        arguments: &[Option<InvocationArgument>],
         phase: u8,
     ) -> Option<bool> {
         let symbol = &self.syms[target as usize];
@@ -2060,12 +2181,13 @@ impl Builder {
         for (input, parameter) in arguments.iter().zip(parameters.iter()) {
             let conversion =
                 input
-                    .as_deref()
+                    .as_ref()
                     .zip(parameter.as_deref())
                     .and_then(|(input, parameter)| {
+                        let (input_owner, input) = self.java_invocation_argument(source, input)?;
                         self.java_invocation_conversion(
-                            source,
-                            input,
+                            input_owner,
+                            &input,
                             target,
                             parameter,
                             phase > 0,
