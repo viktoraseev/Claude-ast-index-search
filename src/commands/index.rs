@@ -639,6 +639,19 @@ fn is_multi_term_query(query: &str) -> bool {
         >= 2
 }
 
+/// Check that indexed navigation can run without contaminating JSON stdout.
+fn navigation_index_available(root: &Path, format: &str) -> Result<bool> {
+    if db::db_exists(root) {
+        return Ok(true);
+    }
+    let message = "Index not found. Run 'ast-index rebuild' first.";
+    if format == "json" {
+        anyhow::bail!(message);
+    }
+    println!("{}", message.red());
+    Ok(false)
+}
+
 /// Find symbol by name or glob pattern
 pub fn cmd_symbol(
     root: &Path,
@@ -651,11 +664,7 @@ pub fn cmd_symbol(
     fuzzy: bool,
     with_content: bool,
 ) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !navigation_index_available(root, format)? {
         return Ok(());
     }
 
@@ -757,11 +766,7 @@ pub fn cmd_class(
     scope: &SearchScope,
     fuzzy: bool,
 ) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !navigation_index_available(root, format)? {
         return Ok(());
     }
 
@@ -879,11 +884,7 @@ pub fn cmd_implementations(
     scope: &SearchScope,
     with_content: bool,
 ) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !navigation_index_available(root, format)? {
         return Ok(());
     }
 
@@ -951,11 +952,7 @@ pub fn cmd_refs(
     format: &str,
     scope: &SearchScope,
 ) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !navigation_index_available(root, format)? {
         return Ok(());
     }
 
@@ -1075,12 +1072,14 @@ pub fn cmd_refs(
 }
 
 /// Show class hierarchy (parents and children)
-pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+pub fn cmd_hierarchy(
+    root: &Path,
+    name: &str,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
+) -> Result<()> {
+    if !navigation_index_available(root, format)? {
         return Ok(());
     }
 
@@ -1107,6 +1106,19 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
         .or_else(|| candidates.next());
 
     let Some(target) = target else {
+        if format == "json" {
+            let document = serde_json::json!({
+                "schema_version": PAGINATED_JSON_SCHEMA_VERSION,
+                "query": name,
+                "target": null,
+                "parents": [],
+                "children": [],
+                "pagination": Pagination::new(0, 0, limit),
+                "skipped": "not_found",
+            });
+            println!("{}", serde_json::to_string_pretty(&document)?);
+            return Ok(());
+        }
         println!("{}", format!("Class '{}' not found.", name).red());
         return Ok(());
     };
@@ -1118,16 +1130,7 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     } else {
         target.display_name()
     };
-    println!("{}", format!("Hierarchy for '{}':", heading).bold());
-
     let parents: Vec<(String, String)> = db::find_parents_scoped(&conn, &target.name, scope)?;
-
-    if !parents.is_empty() {
-        println!("\n  {}", "Parents:".cyan());
-        for (parent, kind) in &parents {
-            println!("    {} ({})", parent, kind);
-        }
-    }
 
     let total = db::count_implementations_scoped(&conn, name, scope)?;
     let mut children = db::find_implementations_scoped(&conn, name, limit, scope)?;
@@ -1136,6 +1139,37 @@ pub fn cmd_hierarchy(root: &Path, name: &str, limit: usize, scope: &SearchScope)
     for c in &mut children {
         c.path = resolver.resolve_with_root(&c.path, c.root_path.as_deref());
     }
+    if format == "json" {
+        let mut target_document = serde_json::to_value(target)?;
+        target_document["path"] = serde_json::Value::from(
+            resolver.resolve_with_root(&target.path, target.root_path.as_deref()),
+        );
+        let parent_rows: Vec<_> = parents
+            .iter()
+            .map(|(name, kind)| serde_json::json!({"name": name, "kind": kind}))
+            .collect();
+        let page = Page::new(children, total, limit);
+        let document = serde_json::json!({
+            "schema_version": page.schema_version,
+            "query": name,
+            "target": target_document,
+            "parents": parent_rows,
+            "children": page.items,
+            "pagination": page.pagination,
+        });
+        println!("{}", serde_json::to_string_pretty(&document)?);
+        return Ok(());
+    }
+
+    println!("{}", format!("Hierarchy for '{}':", heading).bold());
+
+    if !parents.is_empty() {
+        println!("\n  {}", "Parents:".cyan());
+        for (parent, kind) in &parents {
+            println!("    {} ({})", parent, kind);
+        }
+    }
+
     if !children.is_empty() {
         let header = if total > children.len() {
             format!("Children ({} of {} shown):", children.len(), total)

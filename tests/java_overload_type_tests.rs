@@ -139,6 +139,10 @@ class Probe extends Target {
  int nullValue(Target target) { return target.pick(null); }
  int conservative(Target target) { return target.unknown(null); }
  int collision(Target target) { return target.pick(1) + target.pick("x"); }
+ int unknownArray(Target target) { return target.many(array()); }
+ int[] array() { return new int[] {1}; }
+ int unknownReference(Target target) { return target.unknown(reference()); }
+ Object reference() { return new Object(); }
 }
 "#;
     let bare = r#"package fixture;
@@ -180,16 +184,18 @@ class Bare extends Target {
         ),
         ("Probe.boxing", "boxed", &["boxed(Integer value)"]),
         ("Probe.expanded", "many", &["many(int... value)"]),
-        // Arrays, reference specificity and distinct calls sharing one row
-        // retain ambiguity until richer evidence can establish their targets.
+        ("Probe.explicitArray", "many", &["many(int... value)"]),
+        ("Probe.nullValue", "pick", &["pick(String value)"]),
+        ("Probe.conservative", "unknown", &["unknown(String value)"]),
+        // Missing return-type evidence and distinct calls sharing one row
+        // still retain ambiguity; richer known types cannot hide these guards.
         (
-            "Probe.explicitArray",
+            "Probe.unknownArray",
             "many",
             &["many(int... value)", "many(String... value)"],
         ),
-        ("Probe.nullValue", "pick", &["pick(String value)"]),
         (
-            "Probe.conservative",
+            "Probe.unknownReference",
             "unknown",
             &["unknown(Object value)", "unknown(String value)"],
         ),

@@ -1788,11 +1788,301 @@ impl Builder {
             )
     }
 
-    /// Reject proven scalar incompatibilities; unknown reference ancestry and
-    /// boxing stay conservative. A JDK string cannot inhabit a project type.
+    /// Recognize library types only after excluding project/import shadows.
+    fn java_lang_type(&self, context: u32, path: &str) -> Option<String> {
+        const TYPES: &[&str] = &[
+            "Object",
+            "String",
+            "Number",
+            "Boolean",
+            "Byte",
+            "Short",
+            "Character",
+            "Integer",
+            "Long",
+            "Float",
+            "Double",
+            "Cloneable",
+        ];
+        if !self
+            .resolve_java_type(context, self.namespace_of(context), path, None)
+            .is_empty()
+        {
+            return None;
+        }
+        if path == "java::io::Serializable" {
+            return Some(path.to_owned());
+        }
+        let short = path.strip_prefix("java::lang::").unwrap_or(path);
+        if !TYPES.contains(&short) {
+            return None;
+        }
+        if path.starts_with("java::lang::") {
+            return Some(path.to_owned());
+        }
+        let java = self.files[self.syms[context as usize].file as usize]
+            .java
+            .as_ref()?;
+        if java.imports.iter().any(|import| {
+            (import.ends_with(&format!("::{short}")) && import != &format!("java::lang::{short}"))
+                || (import.ends_with("::*") && import != "java::lang::*")
+        }) || java
+            .static_imports
+            .iter()
+            .any(|import| import.ends_with(&format!("::{short}")) || import.ends_with("::*"))
+        {
+            return None;
+        }
+        Some(format!("java::lang::{short}"))
+    }
+
+    fn java_boxed_type(primitive: &str) -> Option<&'static str> {
+        Some(match primitive {
+            "boolean" => "java::lang::Boolean",
+            "byte" => "java::lang::Byte",
+            "short" => "java::lang::Short",
+            "char" => "java::lang::Character",
+            "int" => "java::lang::Integer",
+            "long" => "java::lang::Long",
+            "float" => "java::lang::Float",
+            "double" => "java::lang::Double",
+            _ => return None,
+        })
+    }
+
+    /// Three-valued conversion evidence: absent library ancestry remains unknown.
+    fn java_invocation_conversion(
+        &self,
+        input_owner: u32,
+        input: &str,
+        parameter_owner: u32,
+        parameter: &str,
+        loose: bool,
+        depth: usize,
+    ) -> Option<bool> {
+        if depth >= 32 {
+            return None;
+        }
+        if input == "null" {
+            return Some(!Self::java_primitive(parameter));
+        }
+        let input_array = input.strip_suffix("[]");
+        let parameter_array = parameter.strip_suffix("[]");
+        if let (Some(input), Some(parameter)) = (input_array, parameter_array) {
+            if Self::java_primitive(input) || Self::java_primitive(parameter) {
+                return Some(input == parameter);
+            }
+            return self.java_invocation_conversion(
+                input_owner,
+                input,
+                parameter_owner,
+                parameter,
+                false,
+                depth + 1,
+            );
+        }
+        if input_array.is_some() {
+            if !self
+                .resolve_java_type(
+                    parameter_owner,
+                    self.namespace_of(parameter_owner),
+                    parameter,
+                    None,
+                )
+                .is_empty()
+            {
+                return Some(false);
+            }
+            return self
+                .java_lang_type(parameter_owner, parameter)
+                .map(|parameter| {
+                    matches!(
+                        parameter.as_str(),
+                        "java::lang::Object" | "java::lang::Cloneable" | "java::io::Serializable"
+                    )
+                });
+        }
+        if parameter_array.is_some() {
+            return Some(false);
+        }
+        let input_primitive = Self::java_primitive(input);
+        let parameter_primitive = Self::java_primitive(parameter);
+        if input_primitive && parameter_primitive {
+            return Some(Self::java_primitive_widens(input, parameter));
+        }
+        if input_primitive || parameter_primitive {
+            if !loose {
+                return Some(false);
+            }
+            if input_primitive {
+                return self.java_invocation_conversion(
+                    input_owner,
+                    Self::java_boxed_type(input)?,
+                    parameter_owner,
+                    parameter,
+                    false,
+                    depth + 1,
+                );
+            }
+            let input = self.java_lang_type(input_owner, input)?;
+            let primitive = [
+                "boolean", "byte", "short", "char", "int", "long", "float", "double",
+            ]
+            .into_iter()
+            .find(|ty| Self::java_boxed_type(ty) == Some(input.as_str()));
+            return Some(
+                primitive
+                    .is_some_and(|primitive| Self::java_primitive_widens(primitive, parameter)),
+            );
+        }
+        let input_jdk = self.java_lang_type(input_owner, input);
+        let parameter_jdk = self.java_lang_type(parameter_owner, parameter);
+        if parameter_jdk.as_deref() == Some("java::lang::Object") {
+            return Some(true);
+        }
+        if let (Some(input), Some(parameter)) = (&input_jdk, &parameter_jdk) {
+            return Some(
+                input == parameter
+                    || parameter == "java::lang::Number"
+                        && matches!(
+                            input.as_str(),
+                            "java::lang::Byte"
+                                | "java::lang::Short"
+                                | "java::lang::Integer"
+                                | "java::lang::Long"
+                                | "java::lang::Float"
+                                | "java::lang::Double"
+                        )
+                    || parameter == "java::io::Serializable"
+                        && !matches!(
+                            input.as_str(),
+                            "java::lang::Object" | "java::lang::Cloneable"
+                        ),
+            );
+        }
+        let inputs =
+            self.resolve_java_type(input_owner, self.namespace_of(input_owner), input, None);
+        let parameters = self.resolve_java_type(
+            parameter_owner,
+            self.namespace_of(parameter_owner),
+            parameter,
+            None,
+        );
+        let ([input_class], [parameter_class]) = (inputs.as_slice(), parameters.as_slice()) else {
+            // Final library scalars cannot extend/implement a project declaration.
+            if input_jdk
+                .as_deref()
+                .is_some_and(|ty| !matches!(ty, "java::lang::Object" | "java::lang::Number"))
+                && parameters.len() == 1
+            {
+                return Some(false);
+            }
+            return None;
+        };
+        let mut queue = VecDeque::from([*input_class]);
+        let mut visited = HashSet::new();
+        let mut complete = true;
+        while let Some(class) = queue.pop_front() {
+            if class == *parameter_class {
+                return Some(true);
+            }
+            if !visited.insert(class) {
+                continue;
+            }
+            if visited.len() > 1024 {
+                return None;
+            }
+            let symbol = &self.syms[class as usize];
+            let declared = self.files[symbol.file as usize]
+                .java
+                .as_ref()?
+                .parent_types(&symbol.name, symbol.line)?;
+            for parent in declared {
+                let parents = self.resolve_java_type(class, self.namespace_of(class), parent, None);
+                complete &= parents.len() == 1 || self.java_lang_type(class, parent).is_some();
+                queue.extend(parents);
+            }
+        }
+        complete.then_some(false)
+    }
+
+    fn java_invocation_formals(
+        &self,
+        target: u32,
+        count: usize,
+        phase: u8,
+    ) -> Option<Vec<Option<String>>> {
+        let symbol = &self.syms[target as usize];
+        let (parameters, variadic) = self.files[symbol.file as usize]
+            .java
+            .as_ref()?
+            .invocation_signature(&symbol.name, symbol.line)?;
+        if phase < 2 {
+            return (count == parameters.len()).then(|| parameters.to_vec());
+        }
+        if !variadic || parameters.is_empty() || count < parameters.len() - 1 {
+            return None;
+        }
+        let fixed = parameters.len() - 1;
+        // Include the trailing element for specificity even for zero varargs.
+        Some(
+            (0..count.max(parameters.len()))
+                .map(|index| {
+                    if index < fixed {
+                        parameters[index].clone()
+                    } else {
+                        parameters[fixed]
+                            .as_deref()
+                            .and_then(|ty| ty.strip_suffix("[]"))
+                            .map(str::to_owned)
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    fn java_invocation_applicability(
+        &self,
+        source: u32,
+        target: u32,
+        arguments: &[Option<String>],
+        phase: u8,
+    ) -> Option<bool> {
+        let symbol = &self.syms[target as usize];
+        self.files[symbol.file as usize]
+            .java
+            .as_ref()?
+            .invocation_signature(&symbol.name, symbol.line)?;
+        let Some(parameters) = self.java_invocation_formals(target, arguments.len(), phase) else {
+            return Some(false);
+        };
+        let mut certain = true;
+        for (input, parameter) in arguments.iter().zip(parameters.iter()) {
+            let conversion =
+                input
+                    .as_deref()
+                    .zip(parameter.as_deref())
+                    .and_then(|(input, parameter)| {
+                        self.java_invocation_conversion(
+                            source,
+                            input,
+                            target,
+                            parameter,
+                            phase > 0,
+                            0,
+                        )
+                    });
+            match conversion {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => certain = false,
+            }
+        }
+        certain.then_some(true)
+    }
+
     fn java_invocation_compatible(&self, source: u32, target: u32, name: &str, line: i64) -> bool {
         let owner = &self.syms[source as usize];
-        let symbol = &self.syms[target as usize];
         let Some(arguments) = self.files[owner.file as usize]
             .java
             .as_ref()
@@ -1800,71 +2090,13 @@ impl Builder {
         else {
             return true;
         };
-        let Some(java) = &self.files[symbol.file as usize].java else {
-            return true;
-        };
-        let jdk_string = |context: u32, path: &str| {
-            if !matches!(path, "String" | "java::lang::String") {
-                return false;
-            }
-            if !self
-                .resolve_java_type(context, self.namespace_of(context), path, None)
-                .is_empty()
-            {
-                return false;
-            }
-            path == "java::lang::String"
-                || self.files[self.syms[context as usize].file as usize]
-                    .java
-                    .as_ref()
-                    .is_some_and(|java| {
-                        !java.imports.iter().any(|import| {
-                            (import.ends_with("::String") && import != "java::lang::String")
-                                || (import.ends_with("::*") && import != "java::lang::*")
-                        }) && !java
-                            .static_imports
-                            .iter()
-                            .any(|import| import.ends_with("::String") || import.ends_with("::*"))
-                    })
-        };
-        arguments.iter().enumerate().all(|(index, argument)| {
-            let Some(argument) = argument else {
-                return true;
-            };
-            let Some(JavaReceiver::Type(parameter)) =
-                java.invocation_parameter(&symbol.name, symbol.line, index)
-            else {
-                return true;
-            };
-            if argument == "null" {
-                return !Self::java_primitive(parameter);
-            }
-            if Self::java_primitive(argument) && Self::java_primitive(parameter) {
-                return Self::java_primitive_widens(argument, parameter);
-            }
-            let string_input = jdk_string(source, argument);
-            if string_input {
-                let classes =
-                    self.resolve_java_type(target, self.namespace_of(target), parameter, None);
-                if !classes.is_empty()
-                    && classes.iter().all(|&class| {
-                        !matches!(
-                            self.syms[class as usize].qual.as_str(),
-                            "java::lang::String" | "java::lang::Object"
-                        )
-                    })
-                {
-                    return false;
-                }
-            }
-            !(Self::java_primitive(argument) && jdk_string(target, parameter)
-                || Self::java_primitive(parameter) && string_input)
+        (0..3).any(|phase| {
+            self.java_invocation_applicability(source, target, arguments, phase) != Some(false)
         })
     }
 
-    /// Prefer a fixed primitive signature only when every argument is known
-    /// and it widens to the competing signature in every position. Unknown
-    /// calls, mixed signatures, boxing phases and varargs remain unresolved.
+    /// Strict invocation precedes boxing, which precedes expanded varargs.
+    /// Unknown applicability participates in earlier phases and cannot be hidden.
     fn java_narrow_invocation_targets(
         &self,
         source: u32,
@@ -1883,42 +2115,50 @@ impl Builder {
         else {
             return;
         };
-        if arguments.is_empty()
-            || !arguments
-                .iter()
-                .all(|arg| arg.as_deref().is_some_and(Self::java_primitive))
-        {
+        let Some(phase) = (0..3).find(|&phase| {
+            targets.iter().any(|&target| {
+                self.java_invocation_applicability(source, target, arguments, phase) != Some(false)
+            })
+        }) else {
+            return;
+        };
+        // Without a proven applicable candidate, an earlier unknown phase
+        // cannot justify discarding a later, known applicable declaration.
+        if !targets.iter().any(|&target| {
+            self.java_invocation_applicability(source, target, arguments, phase) == Some(true)
+        }) {
             return;
         }
+        targets.retain(|&target| {
+            self.java_invocation_applicability(source, target, arguments, phase) != Some(false)
+        });
         let more_specific = |left: u32, right: u32| {
-            let left_symbol = &self.syms[left as usize];
-            let right_symbol = &self.syms[right as usize];
-            let (Some(left_java), Some(right_java)) = (
-                &self.files[left_symbol.file as usize].java,
-                &self.files[right_symbol.file as usize].java,
-            ) else {
-                return false;
-            };
-            if !left_java.fixed_arity(&left_symbol.name, left_symbol.line, arguments.len())
-                || !right_java.fixed_arity(&right_symbol.name, right_symbol.line, arguments.len())
+            if self.java_invocation_applicability(source, left, arguments, phase) != Some(true)
+                || self.java_invocation_applicability(source, right, arguments, phase) != Some(true)
             {
                 return false;
             }
+            let (Some(left_parameters), Some(right_parameters)) = (
+                self.java_invocation_formals(left, arguments.len(), phase),
+                self.java_invocation_formals(right, arguments.len(), phase),
+            ) else {
+                return false;
+            };
+            if left_parameters.len() != right_parameters.len() {
+                return false;
+            }
             let mut strict = false;
-            for index in 0..arguments.len() {
-                let (Some(JavaReceiver::Type(left)), Some(JavaReceiver::Type(right))) = (
-                    left_java.invocation_parameter(&left_symbol.name, left_symbol.line, index),
-                    right_java.invocation_parameter(&right_symbol.name, right_symbol.line, index),
-                ) else {
+            for (left_parameter, right_parameter) in
+                left_parameters.iter().zip(right_parameters.iter())
+            {
+                let (Some(lp), Some(rp)) = (left_parameter, right_parameter) else {
                     return false;
                 };
-                if !Self::java_primitive(left)
-                    || !Self::java_primitive(right)
-                    || !Self::java_primitive_widens(left, right)
-                {
+                if self.java_invocation_conversion(left, lp, right, rp, false, 0) != Some(true) {
                     return false;
                 }
-                strict |= left != right;
+                strict |=
+                    self.java_invocation_conversion(right, rp, left, lp, false, 0) == Some(false);
             }
             strict
         };

@@ -1512,7 +1512,7 @@ fn main() -> Result<()> {
                 module: module.as_deref(),
                 dir_prefix: dir_prefix_ref,
             };
-            commands::index::cmd_hierarchy(&root, &name, limit, &scope)
+            commands::index::cmd_hierarchy(&root, &name, limit, format, &scope)
         }
         Commands::Usages {
             symbol,

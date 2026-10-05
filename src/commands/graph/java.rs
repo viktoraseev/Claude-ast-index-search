@@ -25,7 +25,7 @@ pub(super) struct TypeDeclaration {
     pub local_scope: Option<Range<usize>>,
 }
 
-type ScalarArguments = Vec<Option<String>>;
+type InvocationArguments = Vec<Option<String>>;
 
 #[derive(Default)]
 pub(super) struct JavaSource {
@@ -65,7 +65,8 @@ pub(super) struct JavaSource {
     constructor_declarations: HashSet<(String, i64)>,
     canonical_types: HashMap<String, Vec<String>>,
     creation_types: HashMap<(String, i64, i64, String), Vec<Option<String>>>,
-    invocation_types: HashMap<(String, i64, i64, String), Option<ScalarArguments>>,
+    invocation_types: HashMap<(String, i64, i64, String), Option<InvocationArguments>>,
+    invocation_parameters: HashMap<(String, i64), Vec<Option<String>>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -152,6 +153,7 @@ struct VariableBinding {
     field: bool,
     declared: Option<String>,
     inferred: Option<JavaReceiver>,
+    invocation_type: Option<String>,
 }
 
 type VariableScopes = HashMap<usize, HashMap<String, Vec<VariableBinding>>>;
@@ -190,6 +192,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                     .push(VariableBinding {
                         position: name.start_byte(),
                         field: false,
+                        invocation_type: declared.clone(),
                         declared,
                         inferred: None,
                     });
@@ -215,6 +218,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                         .push(VariableBinding {
                             position: name.start_byte(),
                             field: false,
+                            invocation_type: declared_invocation_type(ty, declaration, source),
                             declared: (text(ty, source) != "var")
                                 .then(|| type_name(ty, source))
                                 .flatten(),
@@ -243,6 +247,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                         .push(VariableBinding {
                             position: name.start_byte(),
                             field: false,
+                            invocation_type: declared_invocation_type(ty, declaration, source),
                             declared: type_name(ty, source),
                             inferred: generic_receiver(ty, owner, source),
                         });
@@ -311,6 +316,11 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                                         .push(VariableBinding {
                                             position,
                                             field: false,
+                                            invocation_type: declared_invocation_type(
+                                                ty,
+                                                declaration,
+                                                source,
+                                            ),
                                             declared: type_name(ty, source),
                                             inferred: generic_receiver(ty, parent, source),
                                         });
@@ -355,6 +365,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                             .push(VariableBinding {
                                 position: name.start_byte(),
                                 field: false,
+                                invocation_type: declared_invocation_type(*ty, declaration, source),
                                 declared: type_name(*ty, source),
                                 inferred: generic_receiver(*ty, scope, source),
                             });
@@ -377,6 +388,9 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                     .push(VariableBinding {
                         position: name.start_byte(),
                         field: false,
+                        invocation_type: declaration
+                            .child_by_field_name("type")
+                            .and_then(|ty| declared_invocation_type(ty, declaration, source)),
                         declared: declaration
                             .child_by_field_name("type")
                             .and_then(|ty| type_name(ty, source)),
@@ -402,6 +416,9 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                             .push(VariableBinding {
                                 position: name.start_byte(),
                                 field: true,
+                                invocation_type: component
+                                    .child_by_field_name("type")
+                                    .and_then(|ty| declared_invocation_type(ty, component, source)),
                                 declared: component
                                     .child_by_field_name("type")
                                     .and_then(|ty| type_name(ty, source)),
@@ -466,6 +483,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                 .push(VariableBinding {
                     position: name.start_byte(),
                     field,
+                    invocation_type: declared_invocation_type(declared_type, variable, source),
                     declared,
                     inferred: generic_receiver(declared_type, declaration, source),
                 });
@@ -521,6 +539,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                 variable.child_by_field_name("value"),
             ) {
                 let inferred = expression_receiver(value, owner, source, &scopes, 0);
+                let invocation_type = invocation_argument_type(value, owner, source, &scopes, 0);
                 for scope in scopes.values_mut() {
                     if let Some(bindings) = scope.get_mut(text(name, source)) {
                         for binding in bindings
@@ -528,6 +547,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                             .filter(|binding| binding.position == name.start_byte())
                         {
                             binding.inferred = Some(inferred.clone());
+                            binding.invocation_type = invocation_type.clone();
                         }
                     }
                 }
@@ -983,6 +1003,227 @@ fn creation_argument_types(
             },
         })
         .collect()
+}
+
+fn invocation_type(node: Node<'_>, source: &str) -> Option<String> {
+    if node.has_error() {
+        return None;
+    }
+    if node.kind() == "array_type" {
+        let element = invocation_type(node.child_by_field_name("element")?, source)?;
+        let dimensions = node.child_by_field_name("dimensions")?;
+        return Some(format!(
+            "{element}{}",
+            "[]".repeat(array_dimensions(dimensions))
+        ));
+    }
+    type_name(node, source)
+}
+
+fn array_dimensions(node: Node<'_>) -> usize {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .filter(|child| child.kind() == "[")
+        .count()
+}
+
+fn declared_invocation_type(ty: Node<'_>, declaration: Node<'_>, source: &str) -> Option<String> {
+    let mut ty = invocation_type(ty, source)?;
+    if ty == "var"
+        || type_parameter(
+            declaration,
+            ty.trim_end_matches("[]").split("::").next()?,
+            source,
+        )
+    {
+        return None;
+    }
+    let mut cursor = declaration.walk();
+    let dimensions: usize = declaration
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "dimensions")
+        .map(array_dimensions)
+        .sum();
+    ty.push_str(&"[]".repeat(dimensions + usize::from(declaration.kind() == "spread_parameter")));
+    Some(ty)
+}
+
+fn variable_invocation_type(
+    call: Node<'_>,
+    name: &str,
+    fields_only: bool,
+    scopes: &VariableScopes,
+    source: &str,
+) -> Option<Option<String>> {
+    let mut ancestor = call.parent();
+    let mut fields_blocked = false;
+    while let Some(node) = ancestor {
+        if !fields_only && node.kind() == "lambda_expression" {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                let mut shadowed = false;
+                let mut typed = None;
+                walk_tree_preorder(&parameters, |binding| {
+                    shadowed |= binding.kind() == "identifier" && text(binding, source) == name;
+                    if binding.kind() == "formal_parameter"
+                        && binding
+                            .child_by_field_name("name")
+                            .is_some_and(|identifier| text(identifier, source) == name)
+                    {
+                        typed = binding
+                            .child_by_field_name("type")
+                            .and_then(|ty| declared_invocation_type(ty, binding, source));
+                    }
+                    WalkControl::Continue
+                });
+                if shadowed {
+                    return Some(typed);
+                }
+            }
+        }
+        if let Some(bindings) = scopes.get(&node.id()).and_then(|scope| scope.get(name)) {
+            if let Some(binding) = bindings
+                .iter()
+                .filter(|binding| {
+                    (!fields_only || binding.field)
+                        && (!fields_blocked || !binding.field)
+                        && (binding.field || binding.position < call.start_byte())
+                })
+                .max_by_key(|binding| binding.position)
+            {
+                return Some(binding.invocation_type.clone());
+            }
+        }
+        if blocks_enclosing_fields(node, source) {
+            fields_blocked = true;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+/// Preserve invocation types without changing receiver or constructor inference.
+fn invocation_argument_type(
+    node: Node<'_>,
+    owner: Node<'_>,
+    source: &str,
+    scopes: &VariableScopes,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 16 || node.has_error() {
+        return None;
+    }
+    let recurse = |child| invocation_argument_type(child, owner, source, scopes, depth + 1);
+    let promote = |ty: String| match ty.as_str() {
+        "byte" | "short" | "char" => Some("int".to_owned()),
+        "int" | "long" | "float" | "double" => Some(ty),
+        _ => None,
+    };
+    if node.kind() == "identifier" {
+        if let Some(ty) = variable_invocation_type(node, text(node, source), false, scopes, source)
+        {
+            return ty;
+        }
+    }
+    if node.kind() == "field_access"
+        && node
+            .child_by_field_name("object")
+            .is_some_and(|object| object.kind() == "this")
+    {
+        if let Some(ty) = node.child_by_field_name("field").and_then(|field| {
+            variable_invocation_type(node, text(field, source), true, scopes, source)
+        }) {
+            return ty;
+        }
+    }
+    match node.kind() {
+        "string_literal" => Some("java::lang::String".to_owned()),
+        "decimal_integer_literal"
+        | "hex_integer_literal"
+        | "octal_integer_literal"
+        | "binary_integer_literal" => Some(
+            if text(node, source).ends_with(['L', 'l']) {
+                "long"
+            } else {
+                "int"
+            }
+            .to_owned(),
+        ),
+        "decimal_floating_point_literal" | "hex_floating_point_literal" => Some(
+            if text(node, source).ends_with(['F', 'f']) {
+                "float"
+            } else {
+                "double"
+            }
+            .to_owned(),
+        ),
+        "true" | "false" => Some("boolean".to_owned()),
+        "character_literal" => Some("char".to_owned()),
+        "null_literal" => Some("null".to_owned()),
+        "parenthesized_expression" => recurse(node.named_child(0)?),
+        "array_access" => recurse(node.child_by_field_name("array")?)?
+            .strip_suffix("[]")
+            .map(str::to_owned),
+        "cast_expression" | "object_creation_expression" => {
+            let ty = invocation_type(node.child_by_field_name("type")?, source)?;
+            (!type_parameter(owner, ty.trim_end_matches("[]").split("::").next()?, source))
+                .then_some(ty)
+        }
+        "array_creation_expression" => {
+            let element = invocation_type(node.child_by_field_name("type")?, source)?;
+            let mut cursor = node.walk();
+            let count: usize = node
+                .named_children(&mut cursor)
+                .map(|child| match child.kind() {
+                    "dimensions_expr" => 1,
+                    "dimensions" => array_dimensions(child),
+                    _ => 0,
+                })
+                .sum();
+            (count > 0).then(|| format!("{element}{}", "[]".repeat(count)))
+        }
+        "unary_expression" => {
+            let operator = text(node.child_by_field_name("operator")?, source);
+            let ty = recurse(node.child_by_field_name("operand")?)?;
+            match operator {
+                "+" | "-" | "~" => promote(ty),
+                "!" if ty == "boolean" => Some(ty),
+                _ => None,
+            }
+        }
+        "binary_expression" => {
+            let left = recurse(node.child_by_field_name("left")?)?;
+            let right = recurse(node.child_by_field_name("right")?)?;
+            let operator = text(node.child_by_field_name("operator")?, source);
+            if operator == "+" && (left == "java::lang::String" || right == "java::lang::String") {
+                return Some("java::lang::String".to_owned());
+            }
+            if matches!(
+                operator,
+                "==" | "!=" | "<" | ">" | "<=" | ">=" | "&&" | "||"
+            ) {
+                return Some("boolean".to_owned());
+            }
+            if left == "boolean" && right == "boolean" && matches!(operator, "&" | "|" | "^") {
+                return Some(left);
+            }
+            let (left, right) = (promote(left)?, promote(right)?);
+            if matches!(operator, "<<" | ">>" | ">>>") {
+                return Some(left);
+            }
+            if !matches!(operator, "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^") {
+                return None;
+            }
+            ["double", "float", "long", "int"]
+                .into_iter()
+                .find(|ty| left == *ty || right == *ty)
+                .map(str::to_owned)
+        }
+        _ => match expression_receiver(node, owner, source, scopes, 0) {
+            JavaReceiver::Type(ty) => Some(ty),
+            JavaReceiver::Array(Some(element)) => Some(format!("{element}[]")),
+            _ => None,
+        },
+    }
 }
 
 fn identity_projection(node: Node<'_>, source: &str) -> bool {
@@ -2441,6 +2682,15 @@ impl JavaSource {
                         result.static_methods.insert(key.clone());
                     }
                     let mut cursor = parameters.walk();
+                    result.invocation_parameters.insert(
+                        key.clone(),
+                        parameters
+                            .named_children(&mut cursor)
+                            .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
+                            .map(|p| declared_invocation_type(parameter_type(p)?, p, source))
+                            .collect(),
+                    );
+                    let mut cursor = parameters.walk();
                     result.reference_parameters.insert(
                         key.clone(),
                         parameters
@@ -2686,7 +2936,14 @@ impl JavaSource {
             if reference {
                 return WalkControl::Continue;
             }
-            let argument_types = Some(creation_argument_types(node, owner, source, &scopes));
+            let argument_types = node.child_by_field_name("arguments").map(|arguments| {
+                let mut cursor = arguments.walk();
+                arguments
+                    .named_children(&mut cursor)
+                    .filter(|argument| !argument.is_extra())
+                    .map(|argument| invocation_argument_type(argument, owner, source, &scopes, 0))
+                    .collect()
+            });
             result
                 .invocation_types
                 .entry(key.clone())
@@ -3131,25 +3388,15 @@ impl JavaSource {
             .as_deref()
     }
 
-    pub fn fixed_arity(&self, name: &str, line: i64, arguments: usize) -> bool {
-        self.parameters.get(&(name.to_owned(), line)) == Some(&Some((arguments, false)))
-    }
-
-    pub fn invocation_parameter(
-        &self,
-        name: &str,
-        line: i64,
-        index: usize,
-    ) -> Option<&JavaReceiver> {
+    pub fn invocation_signature(&self, name: &str, line: i64) -> Option<(&[Option<String>], bool)> {
         let (count, variadic) = self.parameters.get(&(name.to_owned(), line))?.as_ref()?;
-        // Expanded varargs use the last declared element type. An explicit
-        // array argument has no scalar evidence and remains unresolved.
-        let index = if *variadic && *count > 0 {
-            index.min(count - 1)
-        } else {
-            index
-        };
-        self.reference_parameter(name, line, index)
+        if *count == 0 {
+            return Some((&[], *variadic));
+        }
+        Some((
+            self.invocation_parameters.get(&(name.to_owned(), line))?,
+            *variadic,
+        ))
     }
 
     #[cfg(test)]
