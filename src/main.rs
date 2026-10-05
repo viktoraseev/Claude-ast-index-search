@@ -1226,13 +1226,27 @@ fn main() -> Result<()> {
             function_name,
             limit,
             in_file,
-        } => commands::grep::cmd_callers(&root, &function_name, limit, format, in_file.as_deref()),
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: None,
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::grep::cmd_callers(&root, &function_name, limit, format, &scope)
+        }
         Commands::CallTree {
             function_name,
             depth,
             limit,
             in_file,
-        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit, in_file.as_deref()),
+        } => {
+            let scope = db::SearchScope {
+                in_file: in_file.as_deref(),
+                module: None,
+                dir_prefix: dir_prefix_ref,
+            };
+            commands::grep::cmd_call_tree(&root, &function_name, depth, limit, &scope)
+        }
         Commands::Provides { type_name, limit } => {
             commands::grep::cmd_provides(&root, &type_name, limit, format)
         }

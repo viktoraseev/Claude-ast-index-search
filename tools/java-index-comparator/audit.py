@@ -64,6 +64,7 @@ import format_contracts
 import file_view_contracts
 import file_scope_contracts
 import navigation_scope_contracts
+import caller_scope_contracts
 import module_format_contracts
 import call_hierarchy_contracts
 
@@ -515,6 +516,7 @@ class Fixture:
         self._file_view_results = None
         self._file_scope_results = None
         self._navigation_scope_results = None
+        self._caller_scope_results = None
         self._module_format_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
@@ -1757,6 +1759,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def caller_scope_check(self, check: sqlite3.Row):
+        if self._caller_scope_results is None:
+            self._caller_scope_results = caller_scope_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._caller_scope_results)
+        return {'source': caller_scope_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def receiver_check(self, check: sqlite3.Row):
         if self._receiver_results is None:
             self._receiver_results = java_receiver_contracts.exercise(self.binary, self.database.parent)
@@ -1894,6 +1904,8 @@ class Fixture:
                 handler = self.graph_check
             if check['feature'] in java_receiver_contracts.FEATURES:
                 handler = self.receiver_check
+            if check['feature'] in caller_scope_contracts.FEATURES:
+                handler = self.caller_scope_check
             if check['feature'] in java_type_binding_contracts.FEATURES:
                 handler = self.type_binding_check
             if check['feature'] in format_contracts.FEATURES:
@@ -1999,6 +2011,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(file_view_contracts.FEATURES)
     features.update(file_scope_contracts.FEATURES)
     features.update(navigation_scope_contracts.FEATURES)
+    features.update(caller_scope_contracts.FEATURES)
     features.update(module_format_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
     return features
@@ -2142,6 +2155,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     file_view_contracts.plan_views(state, root)
     file_scope_contracts.plan_scope(state, root)
     navigation_scope_contracts.plan_scope(state, root)
+    caller_scope_contracts.plan_scope(state, root)
     module_format_contracts.plan_formats(state, root)
 
 

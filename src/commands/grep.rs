@@ -353,7 +353,7 @@ pub fn cmd_callers(
     function_name: &str,
     limit: usize,
     format: &str,
-    in_file: Option<&str>,
+    scope: &db::SearchScope<'_>,
 ) -> Result<()> {
     let pattern = format!(
         "{}|{}",
@@ -362,7 +362,7 @@ pub fn cmd_callers(
     );
     let def_pattern = build_def_skip_pattern(function_name);
     let conn = db::open_db_leased(root)?;
-    let resolver = PathResolver::try_from_conn(root, &conn)?;
+    let resolver = PathResolver::try_from_conn(root, &conn)?.with_decoration(format != "json");
     let roots = resolver.grep_roots();
     // Every caller idiom contains the name itself.
     let word_index = super::WordIndex::load(root, &conn)?;
@@ -385,10 +385,11 @@ pub fn cmd_callers(
             path.extension().is_some_and(|ext| ext == "java") || !def_pattern.is_match(line)
         },
         |path, line_num, line| {
-            let rel_path = super::display_path(&resolver, root, path);
-            if in_file.is_some_and(|filter| !rel_path.contains(filter)) {
+            let scoped_path = resolver.scoped_relative_path(path)?;
+            if !scope.matches_path(&scoped_path) {
                 return None;
             }
+            let rel_path = super::display_path(&resolver, root, path);
             if path.extension().is_some_and(|ext| ext == "java") {
                 if java_calls.as_ref().is_none_or(
                     |(cached, _): &(PathBuf, std::collections::HashSet<usize>)| cached != path,
@@ -475,7 +476,7 @@ pub fn cmd_call_tree(
     function_name: &str,
     max_depth: usize,
     limit_per_level: usize,
-    in_file: Option<&str>,
+    scope: &db::SearchScope<'_>,
 ) -> Result<()> {
     println!("{}", format!("Call tree for '{}':", function_name).bold());
     println!("  {}", function_name.cyan());
@@ -490,7 +491,7 @@ pub fn cmd_call_tree(
         function_name,
         max_depth,
         limit_per_level,
-        in_file,
+        scope,
     )?;
     walk_call_tree(
         function_name,
@@ -557,13 +558,16 @@ fn collect_tree_callers(
     function_name: &str,
     max_depth: usize,
     limit: usize,
-    in_file: Option<&str>,
+    scope: &db::SearchScope<'_>,
 ) -> Result<HashMap<String, CallerSites>> {
     let mut callers = HashMap::new();
     if limit == 0 {
         return Ok(callers);
     }
     let mut files: Option<Vec<PathBuf>> = None;
+    let resolver = conn
+        .map(|conn| PathResolver::try_from_conn(root, conn))
+        .transpose()?;
     let word_index = match conn {
         Some(conn) => super::WordIndex::load(root, conn)?,
         None => None,
@@ -575,7 +579,20 @@ fn collect_tree_callers(
         }
         let files = match files {
             Some(ref files) => files,
-            None => files.insert(super::project_source_files(root, &ALL_SOURCE_EXTENSIONS)?),
+            None => {
+                let mut selected = super::project_source_files(root, &ALL_SOURCE_EXTENSIONS)?;
+                // Apply ownership and owner-relative selectors before every
+                // level's limits, for both graph and syntax attribution.
+                selected.retain(|path| {
+                    let relative = match &resolver {
+                        Some(resolver) => resolver.scoped_relative_path(path),
+                        None => Some(relative_path(root, path)),
+                    };
+                    relative.is_some_and(|relative| scope.matches_path(&relative))
+                });
+                selected.dedup();
+                files.insert(selected)
+            }
         };
         // Skipping files that hold none of the names keeps the path order of
         // the rest, so each name still gets the same first lines.
@@ -583,15 +600,7 @@ fn collect_tree_callers(
         let prefilter = word_index
             .as_ref()
             .and_then(|words| words.prefilter(&names));
-        let found = find_caller_functions(
-            root,
-            conn,
-            files,
-            &missing,
-            limit,
-            in_file,
-            prefilter.as_ref(),
-        )?;
+        let found = find_caller_functions(root, conn, files, &missing, limit, prefilter.as_ref())?;
         callers.extend(missing.into_iter().zip(found));
     }
 }
@@ -726,7 +735,6 @@ fn find_caller_functions(
     files: &[PathBuf],
     function_names: &[String],
     limit: usize,
-    in_file: Option<&str>,
     prefilter: Option<&super::WordPrefilter<'_>>,
 ) -> Result<Vec<CallerSites>> {
     // Java syntax distinguishes calls from prose, declarations and method
@@ -734,10 +742,11 @@ fn find_caller_functions(
     // Parse one file at a time; retain at most `limit` owners per requested name.
     let mut java_callers: Vec<CallerSites> = vec![Vec::new(); function_names.len()];
     let mut graph_answered = vec![false; function_names.len()];
+    let resolver = conn.map(|conn| PathResolver::from_conn(root, conn).with_decoration(true));
     if let Some(conn) = conn {
         let state = db::symbol_graph_state(conn)?;
         if state.built && !state.stale {
-            let resolver = PathResolver::from_conn(root, conn).with_decoration(false);
+            let resolver = resolver.as_ref().unwrap();
             let selected: HashSet<&Path> = files.iter().map(PathBuf::as_path).collect();
             let absolute = |path: &str, root_path: Option<&str>| {
                 let path = PathBuf::from(resolver.resolve_with_root_raw(path, root_path));
@@ -777,15 +786,13 @@ fn find_caller_functions(
                         matches!(source.kind.as_str(), "function" | "property" | "constant")
                             && source.path.ends_with(".java")
                             && selected.contains(path.as_path())
-                            && in_file
-                                .is_none_or(|filter| relative_path(root, &path).contains(filter))
                     })?
                 {
                     for source in callers.into_iter().flatten() {
                         let path = absolute(&source.path, source.root_path.as_deref());
                         sites.push((
                             source.name,
-                            relative_path(root, &path),
+                            super::display_path(resolver, root, &path),
                             source.line as usize,
                         ));
                     }
@@ -812,9 +819,11 @@ fn find_caller_functions(
         if graph_answered.iter().all(|answered| *answered) {
             continue;
         }
-        let rel = relative_path(root, path);
-        if in_file.is_some_and(|filter| !rel.contains(filter))
-            || prefilter.is_some_and(|filter| !filter.may_contain(path))
+        let rel = resolver.as_ref().map_or_else(
+            || relative_path(root, path),
+            |resolver| super::display_path(resolver, root, path),
+        );
+        if prefilter.is_some_and(|filter| !filter.may_contain(path))
             || java_callers.iter().all(|sites| sites.len() >= limit)
         {
             continue;
@@ -865,10 +874,7 @@ fn find_caller_functions(
         &patterns,
         limit * 3,
         prefilter,
-        |index, path, line| {
-            !def_patterns[index].is_match(line)
-                && in_file.map_or(true, |filter| relative_path(root, path).contains(filter))
-        },
+        |index, _path, line| !def_patterns[index].is_match(line),
         |index, path, line_num, _line| {
             files_with_calls[index]
                 .entry(path.to_path_buf())

@@ -630,10 +630,16 @@ where
     for extra in roots.iter().skip(1) {
         wb.add(extra);
     }
+    let walk_roots: HashSet<PathBuf> = roots.iter().cloned().collect();
     wb.hidden(true)
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| {
+            !crate::indexer::is_excluded_dir(entry)
+                // An explicitly walked nested root has its own depth-zero
+                // entry. Do not also visit it through an ancestor root.
+                && !(entry.depth() > 0 && walk_roots.contains(entry.path()))
+        })
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
@@ -1218,10 +1224,14 @@ fn project_walker(root: &Path) -> Result<Option<ignore::WalkParallel>> {
     for extra in roots.iter().skip(1) {
         wb.add(extra);
     }
+    let walk_roots: HashSet<PathBuf> = roots.iter().cloned().collect();
     wb.hidden(true)
         .git_ignore(use_git)
         .git_exclude(use_git)
-        .filter_entry(|entry| !crate::indexer::is_excluded_dir(entry))
+        .filter_entry(move |entry| {
+            !crate::indexer::is_excluded_dir(entry)
+                && !(entry.depth() > 0 && walk_roots.contains(entry.path()))
+        })
         .threads(num_cpus());
     if let Some(ref arc) = arc_root {
         wb.add_custom_ignore_filename(".gitignore");
