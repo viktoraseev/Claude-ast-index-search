@@ -67,6 +67,7 @@ import file_scope_contracts
 import navigation_scope_contracts
 import caller_scope_contracts
 import module_format_contracts
+import insight_scope_contracts
 import call_hierarchy_contracts
 
 
@@ -519,6 +520,7 @@ class Fixture:
         self._file_scope_results = None
         self._navigation_scope_results = None
         self._caller_scope_results = None
+        self._insight_scope_results = None
         self._module_format_results = None
         self._vcs_results = None
         self._vcs_budget_results = None
@@ -1508,17 +1510,24 @@ class Fixture:
             module_count = source.execute('SELECT count(*) FROM modules').fetchone()[0]
             depth = 3 if file_count > 5000 else 2
 
-            def directory(path):
+            attached = {row[0] for row in source.execute('SELECT canonical_path FROM subtrees')}
+
+            def directory(path, owner):
                 parts = path.split('/')
                 prefix = '/'.join(parts[:min(depth, len(parts) - 1)])
+                if attached:
+                    root = Path(owner) if owner else self.root
+                    if root != self.root and str(root) not in attached:
+                        raise Unsupported('map contains an unregistered owning root')
+                    return str(root / prefix).rstrip('/') + '/'
                 return prefix + '/' if prefix else '.'
 
             counts, kinds, symbols = Counter(), {}, {}
-            for row in source.execute('SELECT path FROM files'):
+            for row in source.execute('SELECT path,root_path FROM files'):
                 if module is None or row['path'].startswith(module):
-                    counts[directory(row['path'])] += 1
+                    counts[directory(row['path'], row['root_path'])] += 1
             # Order candidates before retaining each group's bounded top slice.
-            rows = source.execute('''SELECT s.id,s.name,s.kind,s.line,f.path FROM symbols s
+            rows = source.execute('''SELECT s.id,s.name,s.kind,s.line,f.path,f.root_path FROM symbols s
                 JOIN files f ON f.id=s.file_id WHERE s.parent_id IS NULL
                 AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
                 ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'interface' THEN 1
@@ -1528,7 +1537,7 @@ class Fixture:
             for row in rows:
                 if module is not None and not row['path'].startswith(module):
                     continue
-                group = directory(row['path'])
+                group = directory(row['path'], row['root_path'])
                 kinds.setdefault(group, Counter())[row['kind']] += 1
                 selected = symbols.setdefault(group, [])
                 if len(selected) < 20:
@@ -1801,6 +1810,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def insight_scope_check(self, check: sqlite3.Row):
+        if self._insight_scope_results is None:
+            self._insight_scope_results = insight_scope_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._insight_scope_results)
+        return {'source': insight_scope_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def module_format_check(self, check: sqlite3.Row):
         if self._module_format_results is None:
             self._module_format_results = module_format_contracts.exercise(self.binary, self.database.parent)
@@ -1922,6 +1939,8 @@ class Fixture:
                 handler = self.type_binding_check
             if check['feature'] in format_contracts.FEATURES:
                 handler = self.format_check
+            if check['feature'] in insight_scope_contracts.FEATURES:
+                handler = self.insight_scope_check
             if check['feature'] in module_format_contracts.FEATURES:
                 handler = self.module_format_check
             if check['feature'] in call_hierarchy_contracts.FEATURES:
@@ -2025,6 +2044,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(file_scope_contracts.FEATURES)
     features.update(navigation_scope_contracts.FEATURES)
     features.update(caller_scope_contracts.FEATURES)
+    features.update(insight_scope_contracts.FEATURES | insight_scope_contracts.PENDING.keys())
     features.update(module_format_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
     return features
@@ -2171,6 +2191,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     navigation_scope_contracts.plan_scope(state, root)
     caller_scope_contracts.plan_scope(state, root)
     module_format_contracts.plan_formats(state, root)
+    insight_scope_contracts.plan_scope(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

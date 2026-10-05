@@ -8,7 +8,6 @@ use std::path::Path;
 
 use anyhow::Result;
 use colored::Colorize;
-use rusqlite::params;
 use serde::Serialize;
 
 use crate::db;
@@ -109,6 +108,24 @@ pub fn cmd_map(
     limit: usize,
     format: &str,
 ) -> Result<()> {
+    cmd_map_scoped(
+        root,
+        module,
+        per_dir,
+        limit,
+        format,
+        &db::SearchScope::none(),
+    )
+}
+
+pub fn cmd_map_scoped(
+    root: &Path,
+    module: Option<&str>,
+    per_dir: usize,
+    limit: usize,
+    format: &str,
+    scope: &db::SearchScope,
+) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -118,7 +135,15 @@ pub fn cmd_map(
     }
 
     let conn = db::open_db_leased(root)?;
-    let stats = db::get_stats(&conn)?;
+    let mut stats = db::get_stats(&conn)?;
+    stats.file_count = 0;
+    db::visit_insight_files_scoped(&conn, scope, |_, _| {
+        stats.file_count += 1;
+        Ok(())
+    })?;
+    // Modules and project labels describe the whole index; modules do not
+    // carry attached-root ownership. Keep that metadata distinct from files.
+    let resolver = super::PathResolver::try_from_conn(root, &conn)?;
 
     let depth = if stats.file_count > 5000 { 3 } else { 2 };
 
@@ -129,14 +154,24 @@ pub fn cmd_map(
             &conn,
             &stats,
             project.as_deref(),
-            module,
+            &db::SearchScope { module, ..*scope },
+            &resolver,
             per_dir,
             limit,
             depth,
             format,
         )?;
     } else {
-        cmd_map_summary(&conn, &stats, project.as_deref(), limit, depth, format)?;
+        cmd_map_summary(
+            &conn,
+            &stats,
+            project.as_deref(),
+            scope,
+            &resolver,
+            limit,
+            depth,
+            format,
+        )?;
     }
 
     Ok(())
@@ -148,50 +183,46 @@ fn project_prefix(project: Option<&str>) -> String {
     project.map_or_else(String::new, |label| format!("Project: {label} | "))
 }
 
+/// Group within the owning root before rendering, so colliding relative paths
+/// never merge. Apply directory depth to the relative path, not an absolute root.
+fn map_directory(path: &str, owner: &str, depth: usize, resolver: &super::PathResolver) -> String {
+    let dir = dir_prefix(path, depth);
+    let raw = resolver.resolve_with_root_raw(&dir, Some(owner));
+    if raw.is_empty() {
+        ".".to_string()
+    } else {
+        format!("{}/", raw.trim_end_matches('/'))
+    }
+}
+
 /// Summary mode: directories + file counts + kind counts, sorted by file_count desc
+#[allow(clippy::too_many_arguments)]
 fn cmd_map_summary(
     conn: &rusqlite::Connection,
     stats: &db::DbStats,
     project: Option<&str>,
+    scope: &db::SearchScope,
+    resolver: &super::PathResolver,
     limit: usize,
     depth: usize,
     format: &str,
 ) -> Result<()> {
-    // Count files per directory
     let mut dir_file_counts: HashMap<String, i64> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT path FROM files")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for path in rows.flatten() {
-            let dir = dir_prefix(&path, depth);
-            *dir_file_counts.entry(dir).or_insert(0) += 1;
-        }
-    }
-
-    // Count symbols by kind per directory
+    db::visit_insight_files_scoped(conn, scope, |path, owner| {
+        *dir_file_counts
+            .entry(map_directory(path, owner, depth, resolver))
+            .or_insert(0) += 1;
+        Ok(())
+    })?;
     let mut dir_kind_counts: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT f.path, s.kind
-            FROM symbols s
-            JOIN files f ON s.file_id = f.id
-            WHERE s.parent_id IS NULL
-              AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
-            "#,
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows.flatten() {
-            let dir = dir_prefix(&row.0, depth);
-            *dir_kind_counts
-                .entry(dir)
-                .or_default()
-                .entry(row.1)
-                .or_insert(0) += 1;
-        }
-    }
+    db::visit_project_map_symbols_scoped(conn, scope, |sym| {
+        *dir_kind_counts
+            .entry(map_directory(&sym.path, &sym.root_path, depth, resolver))
+            .or_default()
+            .entry(sym.kind)
+            .or_insert(0) += 1;
+        Ok(())
+    })?;
 
     // Build groups, sort by file_count desc
     let mut groups: Vec<SummaryGroup> = dir_file_counts
@@ -199,11 +230,7 @@ fn cmd_map_summary(
         .map(|(dir, fc)| {
             let kinds = dir_kind_counts.remove(&dir).unwrap_or_default();
             SummaryGroup {
-                path: if dir.is_empty() {
-                    ".".to_string()
-                } else {
-                    format!("{}/", dir)
-                },
+                path: dir,
                 file_count: fc,
                 kinds,
             }
@@ -286,148 +313,31 @@ fn cmd_map_detailed(
     conn: &rusqlite::Connection,
     stats: &db::DbStats,
     project: Option<&str>,
-    module: Option<&str>,
+    scope: &db::SearchScope,
+    resolver: &super::PathResolver,
     per_dir: usize,
     limit: usize,
     depth: usize,
     format: &str,
 ) -> Result<()> {
-    // A module path is a literal, case-sensitive prefix, not a SQL LIKE pattern.
-    let module_filter = module.map(str::to_string);
-    let sql = if module_filter.is_some() {
-        r#"
-        SELECT s.id, s.name, s.kind, s.line, f.path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE s.parent_id IS NULL
-          AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
-          AND substr(f.path, 1, length(?1)) = ?1 COLLATE BINARY
-        ORDER BY f.path, s.line
-        "#
-    } else {
-        r#"
-        SELECT s.id, s.name, s.kind, s.line, f.path
-        FROM symbols s
-        JOIN files f ON s.file_id = f.id
-        WHERE s.parent_id IS NULL
-          AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
-        ORDER BY f.path, s.line
-        "#
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-
-    struct RawSym {
-        id: i64,
-        name: String,
-        kind: String,
-        line: i64,
-        path: String,
-    }
-
-    let rows: Vec<RawSym> = if let Some(ref mf) = module_filter {
-        stmt.query_map(params![mf], |row| {
-            Ok(RawSym {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                line: row.get(3)?,
-                path: row.get(4)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    } else {
-        stmt.query_map([], |row| {
-            Ok(RawSym {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                line: row.get(3)?,
-                path: row.get(4)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    };
-
-    // Batch-load inheritance (deduplicated)
-    let mut inheritance_map: HashMap<i64, Vec<String>> = HashMap::new();
-    {
-        let inh_sql = if module_filter.is_some() {
-            r#"
-            SELECT DISTINCT s.id, i.parent_name
-            FROM inheritance i
-            JOIN symbols s ON i.child_id = s.id
-            JOIN files f ON s.file_id = f.id
-            WHERE s.parent_id IS NULL AND substr(f.path, 1, length(?1)) = ?1 COLLATE BINARY
-            ORDER BY s.id, i.parent_name COLLATE BINARY
-            "#
-        } else {
-            r#"
-            SELECT DISTINCT s.id, i.parent_name
-            FROM inheritance i
-            JOIN symbols s ON i.child_id = s.id
-            WHERE s.parent_id IS NULL
-            ORDER BY s.id, i.parent_name COLLATE BINARY
-            "#
-        };
-        let mut inh_stmt = conn.prepare(inh_sql)?;
-        let inh_rows = if let Some(ref mf) = module_filter {
-            inh_stmt
-                .query_map(params![mf], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .filter_map(|r| r.ok())
-                .collect::<Vec<_>>()
-        } else {
-            inh_stmt
-                .query_map([], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                })?
-                .filter_map(|r| r.ok())
-                .collect::<Vec<_>>()
-        };
-        for (id, parent) in inh_rows {
-            let parents = inheritance_map.entry(id).or_default();
-            if !parents.contains(&parent) {
-                parents.push(parent);
-            }
+    // Stream declarations in presentation order, retaining only a bounded
+    // per-directory slice. Parents are loaded only for the final page.
+    let mut groups_map: HashMap<String, Vec<db::ProjectMapSymbol>> = HashMap::new();
+    db::visit_project_map_symbols_scoped(conn, scope, |sym| {
+        let dir = map_directory(&sym.path, &sym.root_path, depth, resolver);
+        let group = groups_map.entry(dir).or_default();
+        if group.len() < per_dir {
+            group.push(sym);
         }
-    }
-
-    // Group by directory prefix
-    let mut groups_map: HashMap<String, Vec<&RawSym>> = HashMap::new();
-    for sym in &rows {
-        let dir = dir_prefix(&sym.path, depth);
-        groups_map.entry(dir).or_default().push(sym);
-    }
-
-    // Count files per directory (filtered if module)
+        Ok(())
+    })?;
     let mut dir_file_counts: HashMap<String, i64> = HashMap::new();
-    {
-        let fc_sql = if module_filter.is_some() {
-            "SELECT path FROM files WHERE substr(path, 1, length(?1)) = ?1 COLLATE BINARY"
-        } else {
-            "SELECT path FROM files"
-        };
-        let mut fc_stmt = conn.prepare(fc_sql)?;
-        let file_rows: Vec<String> = if let Some(ref mf) = module_filter {
-            fc_stmt
-                .query_map(params![mf], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect()
-        } else {
-            fc_stmt
-                .query_map([], |row| row.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        for path in &file_rows {
-            let dir = dir_prefix(path, depth);
-            *dir_file_counts.entry(dir).or_insert(0) += 1;
-        }
-    }
+    db::visit_insight_files_scoped(conn, scope, |path, owner| {
+        *dir_file_counts
+            .entry(map_directory(path, owner, depth, resolver))
+            .or_insert(0) += 1;
+        Ok(())
+    })?;
 
     // Build groups sorted by file_count desc, apply limit
     let mut dir_keys: Vec<String> = groups_map.keys().cloned().collect();
@@ -440,39 +350,19 @@ fn cmd_map_detailed(
 
     let mut groups: Vec<DetailGroup> = Vec::new();
     for dir in &dir_keys {
-        let syms = &groups_map[dir];
-        let mut sorted: Vec<&RawSym> = syms.clone();
-        sorted.sort_by(|a, b| {
-            kind_priority(&a.kind)
-                .cmp(&kind_priority(&b.kind))
-                .then(a.name.cmp(&b.name))
-                .then(a.path.cmp(&b.path))
-                .then(a.line.cmp(&b.line))
-                .then(a.id.cmp(&b.id))
-        });
-        sorted.truncate(per_dir);
-
-        let map_syms: Vec<MapSymbol> = sorted
-            .iter()
-            .map(|s| {
-                let parents = inheritance_map.get(&s.id).cloned().unwrap_or_default();
-                let file = s.path.rsplit('/').next().unwrap_or(&s.path).to_string();
-                MapSymbol {
-                    name: s.name.clone(),
-                    kind: s.kind.clone(),
-                    parents,
-                    file,
-                }
-            })
-            .collect();
+        let mut map_syms = Vec::new();
+        for s in &groups_map[dir] {
+            map_syms.push(MapSymbol {
+                name: s.name.clone(),
+                kind: s.kind.clone(),
+                parents: db::project_map_parents(conn, s.id)?,
+                file: s.path.rsplit('/').next().unwrap_or(&s.path).to_string(),
+            });
+        }
 
         let fc = dir_file_counts.get(dir).copied().unwrap_or(0);
         groups.push(DetailGroup {
-            path: if dir.is_empty() {
-                ".".to_string()
-            } else {
-                format!("{}/", dir)
-            },
+            path: dir.clone(),
             file_count: fc,
             symbols: map_syms,
         });
@@ -692,6 +582,10 @@ fn import_matches_rule(import: &str, prefix: &str) -> bool {
 }
 
 pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
+    cmd_conventions_scoped(root, format, &db::SearchScope::none())
+}
+
+pub fn cmd_conventions_scoped(root: &Path, format: &str, scope: &db::SearchScope) -> Result<()> {
     if !db::db_exists(root) {
         println!(
             "{}",
@@ -704,56 +598,28 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
 
     // A. Naming patterns — suffix counts from symbols
     let mut naming: Vec<NamingPattern> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id
-            WHERE kind IN ('class','interface','struct','enum','object','protocol','trait','actor')
-              AND ((substr(f.path,-5)='.java' AND substr(s.name,-length(?2))=?2)
-                OR (substr(f.path,-5)!='.java' AND s.name LIKE ?1))
-            "#,
-        )?;
-        for &suffix in NAMING_SUFFIXES {
-            let pattern = format!("%{}", suffix);
-            let count: i64 = stmt.query_row(params![pattern, suffix], |row| row.get(0))?;
-            if count >= 3 {
-                naming.push(NamingPattern {
-                    suffix: suffix.to_string(),
-                    count,
-                });
-            }
+    for &suffix in NAMING_SUFFIXES {
+        let count = db::insight_naming_count(&conn, scope, suffix)?;
+        if count >= 3 {
+            naming.push(NamingPattern {
+                suffix: suffix.to_string(),
+                count,
+            });
         }
     }
     naming.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.suffix.cmp(&b.suffix)));
 
     // B. Frameworks — from refs WHERE context LIKE 'import%'
     let mut fw_map: HashMap<String, HashMap<String, i64>> = HashMap::new();
-    {
-        let mut stmt = conn.prepare(
-            r#"
-            SELECT name, COUNT(*) as cnt FROM (
-                SELECT r.name FROM refs r JOIN files f ON f.id=r.file_id
-                WHERE r.context LIKE 'import%' AND substr(f.path,-5)!='.java'
-                UNION ALL
-                SELECT s.name FROM symbols s JOIN files f ON f.id=s.file_id
-                WHERE s.kind = 'import' AND substr(f.path,-5)!='.java'
-            )
-            GROUP BY name
-            "#,
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-
-        for row in rows.flatten() {
-            let (import_name, cnt) = row;
-            for &(prefix, category, display) in FRAMEWORK_RULES {
-                if import_matches_rule(&import_name, prefix) {
-                    let cat_map = fw_map.entry(category.to_string()).or_default();
-                    *cat_map.entry(display.to_string()).or_insert(0) += cnt;
-                    break;
-                }
+    for (import_name, cnt) in db::insight_foreign_imports(&conn, scope)? {
+        for &(prefix, category, display) in FRAMEWORK_RULES {
+            if import_matches_rule(&import_name, prefix) {
+                *fw_map
+                    .entry(category.to_string())
+                    .or_default()
+                    .entry(display.to_string())
+                    .or_insert(0) += cnt;
+                break;
             }
         }
     }
@@ -761,7 +627,10 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
     // Navigation imports use short names and omit wildcards. Framework
     // detection needs the actual package, once per import declaration.
     let resolver = super::PathResolver::try_from_conn(root, &conn)?;
-    db::visit_java_profile_files(&conn, |path, root_path| {
+    db::visit_insight_files_scoped(&conn, scope, |path, root_path| {
+        if !path.ends_with(".java") {
+            return Ok(());
+        }
         let source_path = root.join(resolver.resolve_with_root_raw(path, Some(root_path)));
         use std::io::Read;
         let mut source = String::new();
@@ -804,10 +673,9 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
     // C. Architecture detection from file paths
     let mut arch: Vec<String> = Vec::new();
     {
-        let mut path_stmt = conn.prepare("SELECT path FROM files")?;
         let mut found = std::collections::HashSet::new();
-        for path in path_stmt.query_map([], |row| row.get::<_, String>(0))? {
-            let path = format!("/{}/", path?.to_lowercase());
+        db::visit_insight_files_scoped(&conn, scope, |path, _| {
+            let path = format!("/{}/", path.to_lowercase());
             for &(markers, _) in ARCH_PATTERNS {
                 for marker in markers {
                     if path.contains(marker) {
@@ -815,7 +683,8 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
                     }
                 }
             }
-        }
+            Ok(())
+        })?;
 
         for &(markers, label) in ARCH_PATTERNS {
             if arch.contains(&label.to_string()) {

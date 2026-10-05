@@ -1815,8 +1815,25 @@ fn main() -> Result<()> {
             module,
             per_dir,
             limit,
-        } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
-        Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
+        } => commands::project_info::cmd_map_scoped(
+            &root,
+            module.as_deref(),
+            per_dir,
+            limit,
+            format,
+            &db::SearchScope {
+                dir_prefix: dir_prefix_ref,
+                ..db::SearchScope::none()
+            },
+        ),
+        Commands::Conventions => commands::project_info::cmd_conventions_scoped(
+            &root,
+            format,
+            &db::SearchScope {
+                dir_prefix: dir_prefix_ref,
+                ..db::SearchScope::none()
+            },
+        ),
         Commands::UnusedSymbols {
             module,
             export_only,

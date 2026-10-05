@@ -4290,19 +4290,130 @@ impl Drop for RebuildSwap {
     }
 }
 
+/// Visit indexed files within the literal path and owning-root selection.
+pub(crate) fn visit_insight_files_scoped(
+    conn: &Connection,
+    scope: &SearchScope,
+    mut visit: impl FnMut(&str, &str) -> Result<()>,
+) -> Result<()> {
+    let (condition, values) = scope.path_condition();
+    let sql = format!(
+        "SELECT f.path, f.root_path FROM files f WHERE 1=1{condition} ORDER BY f.root_path,f.path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+    while let Some(row) = rows.next()? {
+        visit(&row.get::<_, String>(0)?, &row.get::<_, String>(1)?)?;
+    }
+    Ok(())
+}
+
 /// Indexed Java source scope for source-based project profiling.
 pub fn visit_java_profile_files(
     conn: &Connection,
     mut visit: impl FnMut(&str, &str) -> Result<()>,
 ) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT path, root_path FROM files WHERE substr(path,-5)='.java' ORDER BY root_path,path",
-    )?;
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        visit(&row.get::<_, String>(0)?, &row.get::<_, String>(1)?)?;
+    visit_insight_files_scoped(conn, &SearchScope::none(), |path, root| {
+        if path.ends_with(".java") {
+            visit(path, root)?;
+        }
+        Ok(())
+    })
+}
+
+pub(crate) struct ProjectMapSymbol {
+    pub id: i64,
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub root_path: String,
+}
+
+/// Top-level project map declarations, selected before grouping and page limits.
+pub(crate) fn visit_project_map_symbols_scoped(
+    conn: &Connection,
+    scope: &SearchScope,
+    mut visit: impl FnMut(ProjectMapSymbol) -> Result<()>,
+) -> Result<()> {
+    let (condition, values) = scope.path_condition();
+    let sql = format!(
+        "SELECT s.id,s.name,s.kind,f.path,f.root_path
+         FROM symbols s JOIN files f ON s.file_id=f.id
+         WHERE s.parent_id IS NULL
+         AND s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor','package')
+         {condition} ORDER BY CASE s.kind WHEN 'class' THEN 0 WHEN 'interface' THEN 1
+         WHEN 'protocol' THEN 1 WHEN 'trait' THEN 1 WHEN 'struct' THEN 2 WHEN 'enum' THEN 3
+         WHEN 'object' THEN 4 WHEN 'actor' THEN 5 ELSE 10 END,
+         s.name COLLATE BINARY,f.path COLLATE BINARY,s.line,s.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok(ProjectMapSymbol {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get(2)?,
+            path: row.get(3)?,
+            root_path: row.get(4)?,
+        })
+    })?;
+    for row in rows {
+        visit(row?)?;
     }
     Ok(())
+}
+
+/// Explicit parents retain declaration identity across colliding files and roots.
+pub(crate) fn project_map_parents(conn: &Connection, symbol_id: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT parent_name FROM inheritance WHERE child_id=?1 ORDER BY parent_name COLLATE BINARY",
+    )?;
+    let rows = stmt.query_map([symbol_id], |row| row.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Count naming suffixes within the same file scope as architecture and imports.
+pub(crate) fn insight_naming_count(
+    conn: &Connection,
+    scope: &SearchScope,
+    suffix: &str,
+) -> Result<i64> {
+    let (condition, values) = scope.path_condition();
+    let sql = format!(
+        "SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id
+         WHERE s.kind IN ('class','interface','struct','enum','object','protocol','trait','actor')
+         AND ((substr(f.path,-5)='.java' AND substr(s.name,-length(?2))=?2)
+         OR (substr(f.path,-5)!='.java' AND s.name LIKE ?1)){condition}"
+    );
+    let mut parameters = vec![format!("%{suffix}"), suffix.to_string()];
+    parameters.extend(values);
+    Ok(
+        conn.query_row(&sql, rusqlite::params_from_iter(parameters), |row| {
+            row.get(0)
+        })?,
+    )
+}
+
+/// Preserve foreign aggregate behavior while composing the shared file scope.
+pub(crate) fn insight_foreign_imports(
+    conn: &Connection,
+    scope: &SearchScope,
+) -> Result<Vec<(String, i64)>> {
+    let (condition, values) = scope.path_condition();
+    let sql = format!(
+        "SELECT name,COUNT(*) FROM (
+         SELECT r.name FROM refs r JOIN files f ON f.id=r.file_id
+         WHERE r.context LIKE 'import%' AND substr(f.path,-5)!='.java'{condition}
+         UNION ALL
+         SELECT s.name FROM symbols s JOIN files f ON f.id=s.file_id
+         WHERE s.kind='import' AND substr(f.path,-5)!='.java'{condition}) GROUP BY name"
+    );
+    let mut parameters = values.clone();
+    parameters.extend(values);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(parameters), |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 fn create_base_schema(conn: &Connection) -> Result<()> {
