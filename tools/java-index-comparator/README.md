@@ -53,6 +53,12 @@ Commands without an equivalent Index MCP operation use separately labelled
 independent source/state or internal CLI checks. Synthetic Java fixtures complement
 live project checks; they do not replace unresolved target or syntax contracts.
 
+The Java search-format fixture executes literal and ranked search against authored
+Java sources in colliding roots. It checks all four sections, source snippets,
+reference counts, Unicode escaping, literal OR terms, empty/missing inputs and
+zero/limited/full JSON and text pages. These are independent source/state checks,
+not MCP equivalence. Intent fallback and exploration formats remain pending.
+
 The Java file-view format fixture executes `file`, `outline`, `imports` and
 `api` against small authored Java sources. It checks source identities, import
 syntax, snippets, limits, empty/missing inputs and text/JSON rendering without

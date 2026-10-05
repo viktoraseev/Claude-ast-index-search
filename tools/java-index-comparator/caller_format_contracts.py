@@ -216,7 +216,16 @@ def exercise(binary, base):
              'new Caller().step(1)', 'new Caller().step("wrong")', 5, 9),
             ('same-line-overloads', 'class Caller {\n void step(int n) { new Target().leaf(); }'
                                     ' void step(String s) {}\n}\n',
-             'new Caller().step(1)', 'new Caller().step("wrong")', 5, 8)):
+             'new Caller().step(1)', 'new Caller().step("wrong")', 5, 8),
+            ('same-line-overloads-reversed', 'class Caller {\n void step(String s) {}'
+                                             ' void step(int n) { new Target().leaf(); }\n}\n',
+             'new Caller().step(1)', 'new Caller().step("wrong")', 5, 8),
+            ('same-line-methods', 'class Caller {\n void decoy() {}'
+                                  ' void step(int n) { new Target().leaf(); }\n}\n',
+             'new Caller().step(1)', 'new Caller().decoy()', 5, 8),
+            ('same-line-constructors-reversed', 'class Caller {\n Caller(String s) {}'
+                                                ' Caller(int n) { new Target().leaf(); }\n}\n',
+             'new Caller(1)', 'new Caller("wrong")', 5, 8)):
         case = directory / ('identity-' + label)
         case.mkdir()
         identity = Runner(binary, case)
@@ -232,7 +241,8 @@ def exercise(binary, base):
             for limit in (1, 100):
                 _, output = identity.command('--format', format, 'call-tree', 'leaf',
                                              '--depth', '2', '--limit', str(limit))
-                want = [(1, 'step', 'project/Probe.java', step_line, 'shown'),
+                owner = 'Caller' if label == 'same-line-constructors-reversed' else 'step'
+                want = [(1, owner, 'project/Probe.java', step_line, 'shown'),
                         (2, 'good', 'project/Probe.java', good_line, 'shown')]
                 record('global:format:java-call-tree', f'identity:{label}:{format}:{limit}', want,
                        tree_rows(output, format, identity, 'leaf', 2, limit))

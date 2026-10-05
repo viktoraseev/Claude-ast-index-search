@@ -34,6 +34,13 @@ pub(super) enum InvocationArgument {
 type InvocationArguments = Vec<Option<InvocationArgument>>;
 type InvocationSignature = (Vec<Option<String>>, bool);
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct InvocationOwner {
+    pub name: String,
+    pub line: i64,
+    pub ordinal: usize,
+}
+
 #[derive(Default)]
 pub(super) struct JavaSource {
     pub package: String,
@@ -66,7 +73,7 @@ pub(super) struct JavaSource {
     expressions: HashMap<(String, i64, i64, String), Option<ExpressionCall>>,
     expression_variants: HashMap<(String, i64, i64, String), Vec<ExpressionCall>>,
     constructors: HashMap<(String, i64, i64, String), Option<ConstructorCall>>,
-    constructor_types: HashMap<(String, i64), Vec<String>>,
+    constructor_types: HashMap<(String, i64), Vec<Vec<String>>>,
     callback_parameters: HashMap<(String, i64), Vec<Option<JavaReceiver>>>,
     reference_parameters: HashMap<(String, i64), Vec<Option<JavaReceiver>>>,
     static_methods: HashSet<(String, i64)>,
@@ -77,6 +84,8 @@ pub(super) struct JavaSource {
     invocation_parameters: HashMap<(String, i64), Vec<Option<String>>>,
     /// Declaration order distinguishes overloads with the same name and line.
     invocation_signatures: HashMap<(String, i64), Vec<InvocationSignature>>,
+    /// Syntax owners of call sites, before reference rows collapse byte positions.
+    invocation_owners: HashMap<(i64, String), Vec<InvocationOwner>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -702,6 +711,71 @@ fn callable(mut node: Node<'_>) -> Option<Node<'_>> {
         node = parent;
     }
     None
+}
+
+/// Retain source-order callable identities instead of breaking line-range ties.
+fn invocation_owners(root: Node<'_>, source: &str) -> HashMap<(i64, String), Vec<InvocationOwner>> {
+    let mut declarations = HashMap::new();
+    let mut ordinals: HashMap<(String, i64), usize> = HashMap::new();
+    let mut sites: HashMap<(i64, String), Vec<InvocationOwner>> = HashMap::new();
+    walk_tree_preorder(&root, |node| {
+        if matches!(
+            node.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "compact_constructor_declaration"
+                | "annotation_type_element_declaration"
+        ) {
+            if let Some(name) = node.child_by_field_name("name") {
+                let line = name.start_position().row as i64 + 1;
+                let name = text(name, source).to_owned();
+                let next = ordinals.entry((name.clone(), line)).or_default();
+                declarations.insert(
+                    node.id(),
+                    InvocationOwner {
+                        name,
+                        line,
+                        ordinal: *next,
+                    },
+                );
+                *next += 1;
+            }
+        }
+        if node.has_error() {
+            return WalkControl::Continue;
+        }
+        let identifier = match node.kind() {
+            "method_invocation" => node.child_by_field_name("name"),
+            "method_reference" => node
+                .named_child(node.named_child_count().saturating_sub(1) as u32)
+                .filter(|name| name.kind() == "identifier"),
+            "object_creation_expression" => node.child_by_field_name("type").map(|mut ty| {
+                while let Some(child) = ty.child_by_field_name("name").or_else(|| ty.named_child(0))
+                {
+                    ty = child;
+                }
+                ty
+            }),
+            "explicit_constructor_invocation" => node.child_by_field_name("constructor"),
+            _ => None,
+        };
+        if let (Some(identifier), Some(owner)) = (
+            identifier,
+            callable(node).and_then(|owner| declarations.get(&owner.id())),
+        ) {
+            let owners = sites
+                .entry((
+                    identifier.start_position().row as i64 + 1,
+                    text(identifier, source).to_owned(),
+                ))
+                .or_default();
+            if !owners.contains(owner) {
+                owners.push(owner.clone());
+            }
+        }
+        WalkControl::Continue
+    });
+    sites
 }
 
 fn type_parameter(mut owner: Node<'_>, name: &str, source: &str) -> bool {
@@ -1972,7 +2046,10 @@ impl JavaSource {
     pub fn parse(source: &str) -> Result<Self> {
         let tree = parse_tree(source, &LANGUAGE)?;
         let scopes = variable_scopes(tree.root_node(), source);
-        let mut result = Self::default();
+        let mut result = Self {
+            invocation_owners: invocation_owners(tree.root_node(), source),
+            ..Self::default()
+        };
         let mut cursor = tree.root_node().walk();
         for declaration in tree.root_node().named_children(&mut cursor) {
             match declaration.kind() {
@@ -2807,13 +2884,14 @@ impl JavaSource {
                                     .and_then(|ty| type_name(ty, source))
                             })
                             .collect();
-                        result.constructor_types.insert(
-                            (
+                        result
+                            .constructor_types
+                            .entry((
                                 text(name, source).to_owned(),
                                 name.start_position().row as i64 + 1,
-                            ),
-                            types,
-                        );
+                            ))
+                            .or_default()
+                            .push(types);
                     }
                 }
             }
@@ -3200,6 +3278,12 @@ impl JavaSource {
         self.static_methods.contains(&(name.to_owned(), line))
     }
 
+    pub fn invocation_owners(&self, line: i64, name: &str) -> Option<&[InvocationOwner]> {
+        self.invocation_owners
+            .get(&(line, name.to_owned()))
+            .map(Vec::as_slice)
+    }
+
     pub fn callback_parameter(&self, name: &str, line: i64, index: usize) -> Option<&JavaReceiver> {
         self.callback_parameters
             .get(&(name.to_owned(), line))?
@@ -3244,14 +3328,14 @@ impl JavaSource {
 
     pub fn accepts_creation(
         &self,
-        name: &str,
-        line: i64,
+        declaration: (&str, i64, usize),
         call_file: &Self,
         owner: &str,
         owner_line: i64,
         call_line: i64,
     ) -> bool {
-        let Some(parameters) = self.constructor_types.get(&(name.to_owned(), line)) else {
+        let (name, line, ordinal) = declaration;
+        let Some(parameters) = self.constructor_parameters(name, line, ordinal) else {
             return true;
         };
         let canonical_collision = self.canonical_types.get(name).is_some_and(|canonical| {
@@ -3287,9 +3371,15 @@ impl JavaSource {
             })
     }
 
-    pub fn constructor_parameters(&self, name: &str, line: i64) -> Option<&[String]> {
+    pub fn constructor_parameters(
+        &self,
+        name: &str,
+        line: i64,
+        ordinal: usize,
+    ) -> Option<&[String]> {
         self.constructor_types
             .get(&(name.to_owned(), line))
+            .and_then(|types| types.get(ordinal))
             .map(Vec::as_slice)
     }
 

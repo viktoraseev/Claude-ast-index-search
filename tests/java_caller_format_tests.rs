@@ -84,6 +84,60 @@ class Top {
             6,
             10,
         ),
+        (
+            "same-line overloads reversed",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    void step(String value) {} void step(int value) { new Target().leaf(); }
+}
+
+class Top {
+    void good() { new Caller().step(1); }
+    void wrong() { new Caller().step("wrong"); }
+}
+"#,
+            6,
+            10,
+        ),
+        (
+            "same-line distinct methods",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    void decoy() {} void step(int value) { new Target().leaf(); }
+}
+
+class Top {
+    void good() { new Caller().step(1); }
+    void wrong() { new Caller().decoy(); }
+}
+"#,
+            6,
+            10,
+        ),
+        (
+            "same-line constructors reversed",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    Caller(String value) {} Caller(int value) { new Target().leaf(); }
+}
+
+class Top {
+    void good() { new Caller(1); }
+    void wrong() { new Caller("wrong"); }
+}
+"#,
+            6,
+            10,
+        ),
     ];
     let mut failures = Vec::new();
     for (label, source, step_line, good_line) in cases {
@@ -109,7 +163,7 @@ class Top {
         ))
         .unwrap();
         let expected = json!([
-            {"depth": 1, "name": "step", "path": "Probe.java", "line": step_line, "status": "shown"},
+            {"depth": 1, "name": if label == "same-line constructors reversed" { "Caller" } else { "step" }, "path": "Probe.java", "line": step_line, "status": "shown"},
             {"depth": 2, "name": "good", "path": "Probe.java", "line": good_line, "status": "shown"},
         ]);
         if tree["items"] != expected || tree["count"] != 2 {
@@ -119,6 +173,40 @@ class Top {
     assert!(
         failures.is_empty(),
         "deep caller identity failed: {failures:?}"
+    );
+}
+
+#[test]
+fn same_line_java_call_sites_retain_each_syntax_owner() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(
+        project.path().join("Probe.java"),
+        r#"class Target { void leaf() {} }
+class Caller {
+    void decoy() {} void first() { new Target().leaf(); } void second() { new Target().leaf(); }
+}
+"#,
+    )
+    .unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let tree: Value = serde_json::from_str(&run(
+        project.path(),
+        cache.path(),
+        &["--format", "json", "call-tree", "leaf", "--depth", "1"],
+    ))
+    .unwrap();
+    assert_eq!(tree["count"], 2);
+    assert_eq!(
+        tree["items"],
+        json!([
+            {"depth": 1, "name": "first", "path": "Probe.java", "line": 3, "status": "shown"},
+            {"depth": 1, "name": "second", "path": "Probe.java", "line": 3, "status": "shown"},
+        ])
     );
 }
 

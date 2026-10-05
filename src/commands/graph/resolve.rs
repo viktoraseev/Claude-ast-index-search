@@ -4669,7 +4669,7 @@ impl Builder {
                             .is_some_and(|java| {
                                 node.java.as_ref().is_some_and(|call_java| {
                                     if !java.is_constructor(&symbol.name, symbol.line) { return false; }
-                                    let compatible = java.constructor_parameters(&symbol.name, symbol.line)
+                                    let compatible = java.constructor_parameters(&symbol.name, symbol.line, symbol.java_callable_ordinal)
                                         .zip(call_java.creation_arguments(&owner.name, owner.line, line, name))
                                         .is_none_or(|(parameters, arguments)| parameters.iter().zip(arguments).all(|(parameter, argument)| {
                                             let Some(argument) = argument else { return true; };
@@ -4689,8 +4689,7 @@ impl Builder {
                                             true
                                         }));
                                     compatible && java.accepts_creation(
-                                        &symbol.name,
-                                        symbol.line,
+                                        (&symbol.name, symbol.line, symbol.java_callable_ordinal),
                                         call_java,
                                         &owner.name,
                                         owner.line,
@@ -5199,6 +5198,57 @@ impl Builder {
             sym.line <= line && is_node_kind(&sym.kind)
         })
     }
+
+    /// Bind Java call sites by syntax identity, including same-line overloads.
+    fn reference_owners(&self, file: &FileNode, name: &str, line: i64) -> Vec<u32> {
+        if let Some(owners) = file
+            .java
+            .as_ref()
+            .and_then(|java| java.invocation_owners(line, name))
+        {
+            return owners
+                .iter()
+                .filter_map(|owner| {
+                    let mut candidates = file.symbols.iter().copied().filter(|&candidate| {
+                        let symbol = &self.syms[candidate as usize];
+                        symbol.kind == "function"
+                            && symbol.name == owner.name
+                            && symbol.line == owner.line
+                            && symbol.java_callable_ordinal == owner.ordinal
+                    });
+                    let first = candidates.next();
+                    // Never fall back to a different line-range owner if syntax and
+                    // indexed declarations cannot establish the same identity.
+                    if candidates.next().is_none() {
+                        first
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+        }
+        let owner = match file
+            .java
+            .as_ref()
+            .and_then(|java| java.type_reference_owner(line, name))
+        {
+            Some(Some((qualified, owner_line))) => {
+                let mut owners = file.symbols.iter().copied().filter(|&candidate| {
+                    let symbol = &self.syms[candidate as usize];
+                    symbol.qual == *qualified && symbol.line == *owner_line
+                });
+                let first = owners.next();
+                if owners.next().is_none() {
+                    first
+                } else {
+                    None
+                }
+            }
+            Some(None) => None,
+            None => self.owner(file, line),
+        };
+        owner.into_iter().collect()
+    }
 }
 
 /// The type a block reopens: a Rust `impl Type` / `impl Trait for Type`, a
@@ -5347,98 +5397,83 @@ fn resolve_file(
     batch.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     for (name, line, context) in batch {
         out.references_seen += 1;
-        let source = match file_node
-            .java
-            .as_ref()
-            .and_then(|java| java.type_reference_owner(line, &name))
-        {
-            Some(Some((qualified, owner_line))) => {
-                let mut owners = file_node.symbols.iter().copied().filter(|&candidate| {
-                    let symbol = &builder.syms[candidate as usize];
-                    symbol.qual == *qualified && symbol.line == *owner_line
-                });
-                let first = owners.next();
-                if owners.next().is_none() {
-                    first
-                } else {
-                    None
-                }
-            }
-            Some(None) => None,
-            None => builder.owner(file_node, line),
-        };
-        let Some(source) = source else {
+        let sources = builder.reference_owners(file_node, &name, line);
+        if sources.is_empty() {
             *out.dropped.entry(DropReason::NoOwner).or_default() += 1;
             continue;
-        };
-        JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().clear());
-        let outcome = builder
-            .resolve_reference(file, source, &name, line, context.as_deref())
-            .and_then(|mut resolution| {
-                let owner = &builder.syms[source as usize];
-                if let Some(java) = &file_node.java {
-                    let invocation = java
-                        .expression_call(&owner.name, owner.line, line, &name)
-                        .is_some()
-                        || java
-                            .bare_arguments(&owner.name, owner.line, line, &name)
+        }
+        // One stored name/line row may represent calls in distinct declarations.
+        out.references_seen += sources.len().saturating_sub(1) as u64;
+        for source in sources {
+            JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().clear());
+            let outcome = builder
+                .resolve_reference(file, source, &name, line, context.as_deref())
+                .and_then(|mut resolution| {
+                    let owner = &builder.syms[source as usize];
+                    if let Some(java) = &file_node.java {
+                        let invocation = java
+                            .expression_call(&owner.name, owner.line, line, &name)
                             .is_some()
-                        || java
-                            .constructor_call(&owner.name, owner.line, line, &name)
-                            .is_some();
-                    if !invocation {
-                        resolution
-                            .targets
-                            .retain(|&target| builder.syms[target as usize].kind != "function");
+                            || java
+                                .bare_arguments(&owner.name, owner.line, line, &name)
+                                .is_some()
+                            || java
+                                .constructor_call(&owner.name, owner.line, line, &name)
+                                .is_some();
+                        if !invocation {
+                            resolution
+                                .targets
+                                .retain(|&target| builder.syms[target as usize].kind != "function");
+                        }
                     }
-                }
-                let recursive_java_call = owner.kind == "function"
-                    && owner.name == name
-                    && file_node.java.as_ref().is_some_and(|java| {
-                        java.recursive_arguments(&owner.name, owner.line, line)
-                            .is_some()
-                    });
-                resolution
-                    .targets
-                    .retain(|&t| t != source || recursive_java_call);
-                if resolution.targets.is_empty() {
-                    Err(DropReason::SelfReference)
-                } else if !resolution.confidence.is_resolved()
-                    && resolution.targets.len() > AMBIGUITY_CAP
-                {
-                    Err(DropReason::TooAmbiguous)
-                } else {
-                    Ok(resolution)
-                }
-            });
-        JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().clear());
-        match outcome {
-            Err(reason) => *out.dropped.entry(reason).or_default() += 1,
-            Ok(resolution) => {
-                *out.refs_by_level.entry(resolution.confidence).or_default() += 1;
-                if resolution.confidence.is_resolved()
-                    && builder.syms[resolution.targets[0] as usize].kind == "column"
-                {
-                    out.column_references += 1;
-                }
-                let candidates = if resolution.confidence.is_resolved() {
-                    1
-                } else {
-                    resolution.targets.len() as u32
-                };
-                for target in resolution.targets {
-                    let entry = out.edges.entry((source, target)).or_insert(EdgeAcc {
-                        confidence: resolution.confidence,
-                        candidates,
-                        refs: 0,
-                        line,
-                    });
-                    if resolution.confidence < entry.confidence {
-                        entry.confidence = resolution.confidence;
-                        entry.candidates = candidates;
+                    let recursive_java_call = owner.kind == "function"
+                        && owner.name == name
+                        && file_node.java.as_ref().is_some_and(|java| {
+                            java.recursive_arguments(&owner.name, owner.line, line)
+                                .is_some()
+                        });
+                    resolution
+                        .targets
+                        .retain(|&t| t != source || recursive_java_call);
+                    if resolution.targets.is_empty() {
+                        Err(DropReason::SelfReference)
+                    } else if !resolution.confidence.is_resolved()
+                        && resolution.targets.len() > AMBIGUITY_CAP
+                    {
+                        Err(DropReason::TooAmbiguous)
+                    } else {
+                        Ok(resolution)
                     }
-                    entry.refs += 1;
-                    entry.line = entry.line.min(line);
+                });
+            JAVA_VALUE_CACHE.with(|cache| cache.borrow_mut().clear());
+            match outcome {
+                Err(reason) => *out.dropped.entry(reason).or_default() += 1,
+                Ok(resolution) => {
+                    *out.refs_by_level.entry(resolution.confidence).or_default() += 1;
+                    if resolution.confidence.is_resolved()
+                        && builder.syms[resolution.targets[0] as usize].kind == "column"
+                    {
+                        out.column_references += 1;
+                    }
+                    let candidates = if resolution.confidence.is_resolved() {
+                        1
+                    } else {
+                        resolution.targets.len() as u32
+                    };
+                    for target in resolution.targets {
+                        let entry = out.edges.entry((source, target)).or_insert(EdgeAcc {
+                            confidence: resolution.confidence,
+                            candidates,
+                            refs: 0,
+                            line,
+                        });
+                        if resolution.confidence < entry.confidence {
+                            entry.confidence = resolution.confidence;
+                            entry.candidates = candidates;
+                        }
+                        entry.refs += 1;
+                        entry.line = entry.line.min(line);
+                    }
                 }
             }
         }

@@ -116,11 +116,7 @@ pub fn cmd_search(
 ) -> Result<()> {
     let preset = rank.map(Preset::parse).transpose()?;
     let exclude_tests = exclude_tests && preset.is_some();
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !navigation_index_available(root, format)? {
         return Ok(());
     }
 
@@ -197,26 +193,22 @@ pub fn cmd_search(
     let ref_matches = db::search_ref_terms_scoped(&conn, &terms, probe_limit, scope)?;
 
     // 4. Search in file contents (grep)
-    let pattern = if terms.len() > 1 {
+    let pattern = if terms.is_empty() {
+        // An empty OR query has no candidates, including content lines.
+        r"\b\B".to_string()
+    } else {
         terms
             .iter()
             .map(|t| regex::escape(t))
             .collect::<Vec<_>>()
             .join("|")
-    } else {
-        regex::escape(query)
     };
 
-    // The pattern is the query, or each comma-separated term, as a literal.
-    let literals: Vec<&str> = if terms.len() > 1 {
-        terms.clone()
-    } else {
-        vec![query]
-    };
+    // Use the same trimmed OR terms for indexed and lexical categories.
     let word_index = super::WordIndex::load(root, &conn)?;
     let prefilter = word_index
         .as_ref()
-        .and_then(|words| words.prefilter(&literals));
+        .and_then(|words| words.prefilter(&terms));
     let resolver = PathResolver::try_from_conn(root, &conn)?;
     let content_page = super::search_files_page_prefiltered(
         root,
@@ -311,10 +303,10 @@ pub fn cmd_search(
             symbol.result.path =
                 resolver.resolve_with_root(&symbol.result.path, symbol.result.root_path.as_deref());
         }
-        let nothing_found = ranked_files.is_empty()
-            && ranked_symbols.is_empty()
-            && ref_matches.is_empty()
-            && content_matches.is_empty();
+        let nothing_found = files_total == 0
+            && symbols_total == 0
+            && refs_total == 0
+            && content_page.pagination.total == 0;
         if nothing_found && is_multi_term_query(query) {
             return super::explore::cmd_search_fallback(root, query, format, scope);
         }
@@ -351,10 +343,8 @@ pub fn cmd_search(
     let content_pagination =
         Pagination::new(content_page.pagination.total, content_matches.len(), limit);
 
-    let nothing_found = files_page.items.is_empty()
-        && symbols_page.items.is_empty()
-        && refs_page.items.is_empty()
-        && content_matches.is_empty();
+    let nothing_found =
+        files_total == 0 && symbols_total == 0 && refs_total == 0 && content_pagination.total == 0;
 
     // A multi-word query is almost always an intent ("how is auth handled"),
     // not an identifier. Literal matching returns nothing for it, and an agent
@@ -394,7 +384,7 @@ pub fn cmd_search(
     // Output results
     println!("{}", format!("Search results for '{}':", query).bold());
 
-    if !files_page.items.is_empty() {
+    if files_page.pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -409,7 +399,7 @@ pub fn cmd_search(
         print_truncation_notice(files_page.pagination);
     }
 
-    if !symbols_page.items.is_empty() {
+    if symbols_page.pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -433,7 +423,7 @@ pub fn cmd_search(
         print_truncation_notice(symbols_page.pagination);
     }
 
-    if !refs_page.items.is_empty() {
+    if refs_page.pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -448,7 +438,7 @@ pub fn cmd_search(
         print_truncation_notice(refs_page.pagination);
     }
 
-    if !content_matches.is_empty() {
+    if content_pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -537,7 +527,7 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
         println!("  {line}");
     }
 
-    if !report.files.items.is_empty() {
+    if report.files.pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -557,7 +547,7 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
         print_truncation_notice(report.files.pagination);
     }
 
-    if !report.symbols.items.is_empty() {
+    if report.symbols.pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -587,7 +577,7 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
         print_truncation_notice(report.symbols.pagination);
     }
 
-    if !report.refs.items.is_empty() {
+    if report.refs.pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -602,7 +592,7 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
         print_truncation_notice(report.refs.pagination);
     }
 
-    if !report.content_matches.is_empty() {
+    if content_pagination.total > 0 {
         println!(
             "\n{}",
             format!(
@@ -618,10 +608,10 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
         print_truncation_notice(content_pagination);
     }
 
-    if report.files.items.is_empty()
-        && report.symbols.items.is_empty()
-        && report.refs.items.is_empty()
-        && report.content_matches.is_empty()
+    if report.files.pagination.total == 0
+        && report.symbols.pagination.total == 0
+        && report.refs.pagination.total == 0
+        && content_pagination.total == 0
     {
         println!("  No results found.");
     }
@@ -632,6 +622,10 @@ fn render_ranked_search(report: RankedSearch<'_>) -> Result<()> {
 /// tokenizer used by `explore`, so a query that qualifies here always yields
 /// usable terms there.
 fn is_multi_term_query(query: &str) -> bool {
+    // Commas explicitly request literal OR search, not an intent query.
+    if query.contains(',') {
+        return false;
+    }
     query
         .split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .filter(|t| t.chars().count() >= 3)
