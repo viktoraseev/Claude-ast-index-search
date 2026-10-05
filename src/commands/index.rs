@@ -308,7 +308,14 @@ pub fn cmd_search(
             && refs_total == 0
             && content_page.pagination.total == 0;
         if nothing_found && is_multi_term_query(query) {
-            return super::explore::cmd_search_fallback(root, query, format, scope);
+            return super::explore::cmd_search_fallback(
+                root,
+                query,
+                format,
+                scope,
+                kind_filter,
+                limit,
+            );
         }
         let content_pagination =
             Pagination::new(content_page.pagination.total, content_matches.len(), limit);
@@ -351,7 +358,7 @@ pub fn cmd_search(
     // then falls back to grep. Hand the same query to the ranking engine
     // instead of reporting an empty page.
     if nothing_found && is_multi_term_query(query) {
-        return super::explore::cmd_search_fallback(root, query, format, scope);
+        return super::explore::cmd_search_fallback(root, query, format, scope, kind_filter, limit);
     }
 
     if format == "json" {

@@ -36,6 +36,8 @@ const MAX_SYMBOLS_LISTED: usize = 15;
 /// Source files shown when `explore` runs as the `search` fallback; matches
 /// the CLI default so both paths return the same amount of context.
 const DEFAULT_MAX_FILES: usize = 6;
+const FALLBACK_REASON: &str =
+    "no literal matches for a multi-word query; results are ranked by relevance";
 /// Hard cap on lines per source snippet (god-file / minified protection).
 const SNIPPET_CAP_LINES: usize = 60;
 /// Hard cap on outline rows shown for one definition.
@@ -102,6 +104,11 @@ struct Cand {
     link: Option<&'static str>,
 }
 
+struct SearchFallback<'a> {
+    kind: Option<&'a str>,
+    limit: usize,
+}
+
 pub fn cmd_explore(
     root: &Path,
     query: &[String],
@@ -120,9 +127,12 @@ fn run_explore(
     use_rwr: bool,
     format: &str,
     scope: &SearchScope,
-    fallback_reason: Option<&str>,
+    fallback: Option<SearchFallback<'_>>,
 ) -> Result<()> {
     if !db::db_exists(root) {
+        if format == "json" {
+            anyhow::bail!("Index not found. Run 'ast-index rebuild' first.");
+        }
         println!(
             "{}",
             "Index not found. Run 'ast-index rebuild' first.".red()
@@ -132,6 +142,8 @@ fn run_explore(
 
     let conn = db::open_db_leased(root)?;
     let resolver = PathResolver::try_from_conn(root, &conn)?;
+    let fallback_reason = fallback.as_ref().map(|_| FALLBACK_REASON);
+    let kind = fallback.as_ref().and_then(|options| options.kind);
 
     let raw = query.join(" ");
     let query = Query::parse(&raw);
@@ -146,35 +158,52 @@ fn run_explore(
     // 1. Seed within scope, then dedup by declaration identity: one bm25 ranking over all terms,
     //    compound names, files whose path spells the query out, and a per-term
     //    sample with a fuzzy fallback when a term is thin.
-    let mut hits = db::search_symbol_seeds_ranked_scoped(&conn, &query.terms, RANKED_SEEDS, scope)?;
+    let mut hits =
+        db::search_symbol_seeds_ranked_filtered(&conn, &query.terms, kind, RANKED_SEEDS, scope)?;
     for compound in &query.compounds {
-        hits.extend(db::search_symbols_scoped(
-            &conn,
-            &format!("{compound}*"),
-            SEED_PER_TERM,
-            scope,
-        )?);
+        let pattern = format!("{compound}*");
+        hits.extend(if kind.is_some() {
+            db::search_symbols_for_command(
+                &conn,
+                &pattern,
+                kind,
+                SEED_PER_TERM,
+                scope,
+                false,
+                false,
+            )?
+        } else {
+            db::search_symbols_scoped(&conn, &pattern, SEED_PER_TERM, scope)?
+        });
     }
     if query.terms.len() >= 2 {
-        hits.extend(db::search_symbols_in_matching_paths_scoped(
+        hits.extend(db::search_symbols_in_matching_paths_filtered(
             &conn,
             &query.terms,
+            kind,
             PATH_SEEDS_PER_FILE,
             PATH_SEEDS,
             scope,
         )?);
     }
     for term in &query.terms {
-        let term_hits = db::search_symbol_seeds_scoped(&conn, term, SEED_PER_TERM, scope)?;
+        let term_hits = db::search_symbol_seeds_filtered(&conn, term, kind, SEED_PER_TERM, scope)?;
         let thin = term_hits.len() < 3;
         hits.extend(term_hits);
         if thin {
-            hits.extend(db::search_symbols_fuzzy_scoped(
-                &conn,
-                term,
-                SEED_PER_TERM,
-                scope,
-            )?);
+            hits.extend(if kind.is_some() {
+                db::search_symbols_for_command(
+                    &conn,
+                    term,
+                    kind,
+                    SEED_PER_TERM,
+                    scope,
+                    true,
+                    false,
+                )?
+            } else {
+                db::search_symbols_fuzzy_scoped(&conn, term, SEED_PER_TERM, scope)?
+            });
         }
     }
     let mut cands: Vec<Cand> = Vec::new();
@@ -218,6 +247,12 @@ fn run_explore(
     // Stage B: re-rank by RWR over an in-memory call/inheritance graph.
     if use_rwr {
         apply_rwr(&conn, &resolver, scope, dom_lang.as_deref(), &mut cands)?;
+    }
+
+    // The fallback inherits search's result budget, including an empty page.
+    // Pick source files only from declarations actually returned to the caller.
+    if let Some(options) = &fallback {
+        cands.truncate(options.limit.min(MAX_SYMBOLS_LISTED));
     }
 
     // 4. Pick distinct source files from the top non-vendor candidates.
@@ -296,9 +331,9 @@ pub fn cmd_search_fallback(
     query: &str,
     format: &str,
     scope: &SearchScope,
+    kind: Option<&str>,
+    limit: usize,
 ) -> Result<()> {
-    const REASON: &str =
-        "no literal matches for a multi-word query; results are ranked by relevance";
     if format != "json" {
         println!(
             "{}",
@@ -313,11 +348,11 @@ pub fn cmd_search_fallback(
     run_explore(
         root,
         &[query.to_string()],
-        DEFAULT_MAX_FILES,
+        DEFAULT_MAX_FILES.min(limit),
         false,
         format,
         scope,
-        Some(REASON),
+        Some(SearchFallback { kind, limit }),
     )
 }
 
@@ -712,7 +747,15 @@ fn emit_text(
         let disp = resolver.resolve_with_root(&c.sym.path, c.sym.root_path.as_deref());
         println!("\n{} {} — {}", "####".dimmed(), disp, c.sym.display_name());
         match context {
-            Some(FileContext::Body(snip)) => print!("{}", snip),
+            Some(FileContext::Body(snip)) => {
+                print!("{}", snip.content);
+                if snip.truncated {
+                    println!(
+                        "  (source truncated at line {}; ends at line {})",
+                        snip.displayed_end_line, snip.end_line
+                    );
+                }
+            }
             Some(FileContext::Outline {
                 rows,
                 hidden,
@@ -797,7 +840,12 @@ fn emit_json(
                     file["outline"] = json!(rows);
                     file["outline_hidden"] = json!(hidden);
                 }
-                Some(FileContext::Body(source)) => file["source"] = json!(source),
+                Some(FileContext::Body(source)) => {
+                    file["source"] = json!(source.content);
+                    file["truncated"] = json!(source.truncated);
+                    file["end_line"] = json!(source.end_line);
+                    file["displayed_end_line"] = json!(source.displayed_end_line);
+                }
                 None => file["source"] = json!(""),
             }
             file
@@ -846,7 +894,7 @@ fn emit_json(
 /// What `explore` shows of a chosen file.
 enum FileContext {
     /// Source of a function-like symbol: its body is the answer.
-    Body(String),
+    Body(SourceSnippet),
     /// Definitions inside the type or module around the symbol, with line
     /// ranges: a few lines of a class or of a `has_many` explain nothing,
     /// while the member list says where to read next.
@@ -872,7 +920,7 @@ fn file_context(conn: &Connection, root: &Path, sym: &SearchResult) -> Option<Fi
             return Some(outline);
         }
     }
-    read_snippet(root, sym).map(FileContext::Body)
+    read_symbol_source(root, sym).map(FileContext::Body)
 }
 
 /// Outline of the innermost type or module holding `sym` (`sym` itself when
@@ -902,10 +950,6 @@ fn read_outline(conn: &Connection, sym: &SearchResult) -> Option<FileContext> {
         hidden,
         focus,
     })
-}
-
-fn read_snippet(root: &Path, sym: &SearchResult) -> Option<String> {
-    read_symbol_source(root, sym).map(|snippet| snippet.content)
 }
 
 pub(crate) struct SourceSnippet {

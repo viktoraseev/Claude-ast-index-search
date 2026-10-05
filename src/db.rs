@@ -6344,10 +6344,25 @@ pub fn search_symbol_seeds_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
+    search_symbol_seeds_filtered(conn, query, None, limit, scope)
+}
+
+/// Apply a requested symbol kind before sampling exploration candidates.
+pub fn search_symbol_seeds_filtered(
+    conn: &Connection,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
     if query.trim().is_empty() || query.contains("::") {
-        return search_symbols_scoped(conn, query, limit, scope);
+        return if kind.is_some() {
+            search_symbols_for_command(conn, query, kind, limit, scope, false, false)
+        } else {
+            search_symbols_scoped(conn, query, limit, scope)
+        };
     }
-    let (scope_clause, scope_params) = scope.path_condition();
+    let (scope_clause, scope_params) = scope.symbol_condition(kind);
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
@@ -6396,6 +6411,17 @@ pub fn search_symbol_seeds_ranked_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
+    search_symbol_seeds_ranked_filtered(conn, terms, None, limit, scope)
+}
+
+/// Apply a requested symbol kind before the ranked exploration budget.
+pub fn search_symbol_seeds_ranked_filtered(
+    conn: &Connection,
+    terms: &[String],
+    kind: Option<&str>,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
     let query = terms
         .iter()
         .filter(|term| !term.trim().is_empty())
@@ -6405,7 +6431,7 @@ pub fn search_symbol_seeds_ranked_scoped(
     if query.is_empty() {
         return Ok(vec![]);
     }
-    let (scope_clause, scope_params) = scope.path_condition();
+    let (scope_clause, scope_params) = scope.symbol_condition(kind);
     let sql = format!(
         r#"
         SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
@@ -6458,6 +6484,18 @@ pub fn search_symbols_in_matching_paths_scoped(
     limit: usize,
     scope: &SearchScope,
 ) -> Result<Vec<SearchResult>> {
+    search_symbols_in_matching_paths_filtered(conn, terms, None, per_file, limit, scope)
+}
+
+/// Apply symbol kind before both path candidate budgets.
+pub fn search_symbols_in_matching_paths_filtered(
+    conn: &Connection,
+    terms: &[String],
+    kind: Option<&str>,
+    per_file: usize,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<Vec<SearchResult>> {
     use rusqlite::types::Value;
     let terms: Vec<String> = terms
         .iter()
@@ -6471,7 +6509,7 @@ pub fn search_symbols_in_matching_paths_scoped(
         .map(|n| format!("instr(lower(f.path), ?{n}) > 0"))
         .collect::<Vec<_>>()
         .join(" AND ");
-    let (scope_clause, scope_params) = scope.path_condition();
+    let (scope_clause, scope_params) = scope.symbol_condition(kind);
     let per_file_at = terms.len() + scope_params.len() + 1;
     let limit_at = per_file_at + 1;
     let sql = format!(
@@ -8402,6 +8440,16 @@ pub struct SearchScope<'a> {
 }
 
 impl<'a> SearchScope<'a> {
+    /// Add a bound kind predicate to the path/root scope before SQL limits.
+    fn symbol_condition(&self, kind: Option<&str>) -> (String, Vec<String>) {
+        let (mut clause, mut params) = self.path_condition();
+        if let Some(kind) = kind {
+            clause.push_str(FTS_KIND_FILTER);
+            params.push(kind.to_string());
+        }
+        (clause, params)
+    }
+
     pub fn none() -> Self {
         SearchScope {
             in_file: None,

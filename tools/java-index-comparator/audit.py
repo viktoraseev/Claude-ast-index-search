@@ -75,6 +75,7 @@ import search_format_contracts
 import module_format_contracts
 import insight_scope_contracts
 import analysis_scope_contracts
+import exploration_format_contracts
 import module_scope_contracts
 import module_root_contracts
 import graph_root_contracts
@@ -539,6 +540,7 @@ class Fixture:
         self._search_format_results = None
         self._insight_scope_results = None
         self._analysis_scope_results = None
+        self._exploration_format_results = None
         self._module_format_results = None
         self._module_scope_results = None
         self._module_root_results = None
@@ -1888,6 +1890,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def exploration_format_check(self, check: sqlite3.Row):
+        if self._exploration_format_results is None:
+            self._exploration_format_results = exploration_format_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._exploration_format_results)
+        return {'source': exploration_format_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def analysis_scope_check(self, check: sqlite3.Row):
         if self._analysis_scope_results is None:
             self._analysis_scope_results = analysis_scope_contracts.exercise(self.binary, self.database.parent)
@@ -2065,6 +2075,8 @@ class Fixture:
                 handler = self.insight_scope_check
             if check['feature'] in analysis_scope_contracts.FEATURES:
                 handler = self.analysis_scope_check
+            if check['feature'] in exploration_format_contracts.FEATURES:
+                handler = self.exploration_format_check
             if check['feature'] in graph_root_contracts.FEATURES:
                 handler = self.graph_root_check
             if check['feature'] in graph_directory_contracts.FEATURES:
@@ -2184,6 +2196,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_parent_contracts.FEATURES)
     features.update(insight_scope_contracts.FEATURES | insight_scope_contracts.PENDING.keys())
     features.update(analysis_scope_contracts.FEATURES)
+    features.update(exploration_format_contracts.FEATURES)
     features.update(module_format_contracts.FEATURES)
     features.update(module_scope_contracts.FEATURES)
     features.update(module_root_contracts.FEATURES)
@@ -2339,6 +2352,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     navigation_format_contracts.plan_formats(state, root)
     caller_format_contracts.plan_formats(state, root)
     search_format_contracts.plan_formats(state, root)
+    exploration_format_contracts.plan_formats(state, root)
     java_parent_contracts.plan_parents(state, root)
     insight_scope_contracts.plan_scope(state, root)
     module_scope_contracts.plan_scope(state, root)
