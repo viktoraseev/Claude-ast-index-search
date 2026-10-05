@@ -79,6 +79,7 @@ import exploration_format_contracts
 import management_format_contracts
 import lifecycle_format_contracts
 import mutation_format_contracts
+import project_format_contracts
 import module_scope_contracts
 import module_root_contracts
 import graph_root_contracts
@@ -547,6 +548,7 @@ class Fixture:
         self._management_format_results = None
         self._lifecycle_format_results = None
         self._mutation_format_results = None
+        self._project_format_results = None
         self._module_format_results = None
         self._module_scope_results = None
         self._module_root_results = None
@@ -1936,6 +1938,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def project_format_check(self, check: sqlite3.Row):
+        if self._project_format_results is None:
+            self._project_format_results = project_format_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._project_format_results)
+        return {'source': project_format_contracts.REASONS[check['feature']], 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def graph_root_check(self, check: sqlite3.Row):
         if self._graph_root_results is None:
             self._graph_root_results = graph_root_contracts.exercise(self.binary, self.database.parent)
@@ -2111,6 +2121,8 @@ class Fixture:
                 handler = self.lifecycle_format_check
             if check['feature'] in mutation_format_contracts.FEATURES:
                 handler = self.mutation_format_check
+            if check['feature'] in project_format_contracts.FEATURES:
+                handler = self.project_format_check
             if check['feature'] in management_format_contracts.FEATURES:
                 handler = self.management_format_check
             if check['feature'] in graph_root_contracts.FEATURES:
@@ -2236,6 +2248,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(management_format_contracts.FEATURES)
     features.update(lifecycle_format_contracts.FEATURES)
     features.update(mutation_format_contracts.FEATURES)
+    features.update(project_format_contracts.FEATURES)
     features.update(module_format_contracts.FEATURES)
     features.update(module_scope_contracts.FEATURES)
     features.update(module_root_contracts.FEATURES)
@@ -2402,6 +2415,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     management_format_contracts.plan_formats(state, root)
     lifecycle_format_contracts.plan_formats(state, root)
     mutation_format_contracts.plan_formats(state, root)
+    project_format_contracts.plan_formats(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

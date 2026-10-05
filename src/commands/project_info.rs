@@ -126,11 +126,7 @@ pub fn cmd_map_scoped(
     format: &str,
     scope: &db::SearchScope,
 ) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 
@@ -308,15 +304,19 @@ fn cmd_map_summary(
     for g in &groups {
         // Build compact kind summary: "12 cls, 3 iface, 2 enum"
         let mut kind_pairs: Vec<(&str, i64)> =
-            g.kinds.iter().map(|(k, &v)| (kind_label(k), v)).collect();
-        kind_pairs.sort_by(|a, b| kind_priority(a.0).cmp(&kind_priority(b.0)));
+            g.kinds.iter().map(|(k, &v)| (k.as_str(), v)).collect();
+        kind_pairs.sort_by(|a, b| {
+            kind_priority(a.0)
+                .cmp(&kind_priority(b.0))
+                .then(a.0.cmp(b.0))
+        });
 
         let kinds_str = if kind_pairs.is_empty() {
             String::new()
         } else {
             let items: Vec<String> = kind_pairs
                 .iter()
-                .map(|(k, v)| format!("{} {}", v, k))
+                .map(|(k, v)| format!("{} {}", v, kind_label(k)))
                 .collect();
             format!(" | {}", items.join(", "))
         };
@@ -622,11 +622,7 @@ pub fn cmd_conventions(root: &Path, format: &str) -> Result<()> {
 }
 
 pub fn cmd_conventions_scoped(root: &Path, format: &str, scope: &db::SearchScope) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 

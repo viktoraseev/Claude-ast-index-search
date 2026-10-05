@@ -66,6 +66,14 @@ using native DB rows as expected declarations. This is independent source/state
 coverage, not MCP equivalence. Other command formats, diagram-format selection
 and attached-root API scope remain pending.
 
+The Java project-format fixture checks map/conventions declarations, aggregate
+counts, ordered pages, empty/missing indexes, unreadable sources and JSON/text
+rendering. It also exercises `agrep` global-format/`--json` composition, fallback
+and exit propagation through a disposable provider. These are independent
+source/state and internal CLI contracts, not MCP or external parser equivalence.
+Ambiguous Java graph rendering and remaining global-selector failure composition
+keep the aggregate format contract pending.
+
 The Java navigation-scope fixture executes class, symbol, implementations,
 refs, usages, hierarchy and search on disposable sources in colliding roots.
 It checks literal file/module/cwd selector intersections, case, wildcard

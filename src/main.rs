@@ -1896,7 +1896,9 @@ fn main() -> Result<()> {
             pattern,
             lang,
             json,
-        } => commands::grep::cmd_ast_grep(&root, &pattern, lang.as_deref(), json),
+        } => {
+            commands::grep::cmd_ast_grep(&root, &pattern, lang.as_deref(), json || format == "json")
+        }
         Commands::Query { sql, limit } => commands::management::cmd_query(&root, &sql, limit),
         Commands::DbPath => commands::management::cmd_db_path_with_format(&root, format),
         Commands::Schema => commands::management::cmd_schema(&root),
