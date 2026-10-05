@@ -75,15 +75,13 @@ pub fn cmd_watch_status(root: &Path, quiet: bool, format: &str) -> Result<bool> 
 
 /// Watch for file changes and incrementally update the index
 pub fn cmd_watch(root: &Path) -> Result<()> {
+    let json = super::management::lifecycle_json();
     // Held for the complete watch loop. The lease file lives outside the
     // project cache directory, so stale-cache GC cannot unlink this index
     // while the watcher is idle between SQLite connections.
     let _cache_lease = db::acquire_project_lease(root)?;
     let Some(initial) = db::open_existing_db_leased(root)? else {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+        super::index_available(root, if json { "json" } else { "text" })?;
         return Ok(());
     };
     drop(initial);
@@ -93,20 +91,33 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
         Some(lock) => lock,
         None => {
             eprintln!("{}", "Another ast-index watch is already running.".yellow());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"command": "watch", "status": "already-running"})
+                );
+            }
             return Ok(());
         }
     };
-
-    println!(
-        "{}",
-        format!("Watching for changes in {}...", root.display()).cyan()
-    );
-    println!("{}", "Press Ctrl+C to stop.".dimmed());
 
     let (tx, rx) = mpsc::channel();
 
     let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
     debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"command": "watch", "status": "watching", "root": root})
+        );
+    } else {
+        println!(
+            "{}",
+            format!("Watching for changes in {}...", root.display()).cyan()
+        );
+        println!("{}", "Press Ctrl+C to stop.".dimmed());
+    }
+    std::io::stdout().flush()?;
 
     loop {
         match rx.recv() {
@@ -157,6 +168,16 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 
                 match update_index(root) {
                     Ok((updated, deleted)) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "command": "watch", "status": "updated",
+                                    "updated": updated, "deleted": deleted
+                                })
+                            );
+                            std::io::stdout().flush()?;
+                        }
                         if updated > 0 || deleted > 0 {
                             eprintln!(
                                 "{}",

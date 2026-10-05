@@ -17,6 +17,33 @@ use colored::Colorize;
 use crate::db;
 use crate::indexer;
 
+/// Keep lifecycle diagnostics out of machine-readable responses.
+pub(super) fn lifecycle_json() -> bool {
+    std::env::var("AST_INDEX_FORMAT").is_ok_and(|value| value == "json")
+}
+
+macro_rules! lifecycle_progress {
+    ($($argument:tt)*) => {
+        if lifecycle_json() {
+            eprintln!($($argument)*);
+        } else {
+            println!($($argument)*);
+        }
+    };
+}
+
+/// Report the published index, rather than a staging generation or queued work.
+fn print_lifecycle_summary(root: &Path, mut response: serde_json::Value) -> Result<()> {
+    let conn = db::open_existing_db_leased(root)?.context("published index is missing")?;
+    let stats = db::get_stats(&conn)?;
+    response["files"] = stats.file_count.into();
+    response["symbols"] = stats.symbol_count.into();
+    response["refs"] = stats.refs_count.into();
+    response["modules"] = stats.module_count.into();
+    println!("{}", serde_json::to_string(&response)?);
+    Ok(())
+}
+
 /// File count threshold for auto-switching to sub-projects mode
 const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
 /// A root with this many sub-projects is treated as a monorepo immediately and
@@ -89,7 +116,7 @@ fn carry_git_history(conn: &rusqlite::Connection, root: &Path, verbose: bool) ->
     })?;
     match carry {
         db::GitHistoryCarry::Absent => {}
-        db::GitHistoryCarry::Kept(history) => println!(
+        db::GitHistoryCarry::Kept(history) => lifecycle_progress!(
             "{}",
             format!(
                 "Kept the collected git history ({} commit(s) analyzed)",
@@ -97,7 +124,7 @@ fn carry_git_history(conn: &rusqlite::Connection, root: &Path, verbose: bool) ->
             )
             .dimmed()
         ),
-        db::GitHistoryCarry::Dropped(reason) => println!(
+        db::GitHistoryCarry::Dropped(reason) => lifecycle_progress!(
             "{}",
             format!(
                 "Collected git history not kept: {reason}. \
@@ -225,6 +252,49 @@ pub fn cmd_rebuild(
     cli_exclude: &[String],
     extra_paths: &[String],
 ) -> Result<()> {
+    anyhow::ensure!(
+        matches!(index_type, "all" | "files" | "symbols" | "modules" | "deps"),
+        "Unknown index type: {}",
+        index_type
+    );
+    let rebuilt = rebuild_index(
+        root,
+        index_type,
+        index_deps,
+        no_ignore,
+        sub_projects,
+        verbose,
+        experimental_fast_rebuild,
+        cli_include,
+        cli_exclude,
+        extra_paths,
+    )?;
+    if lifecycle_json() {
+        let response = serde_json::json!({
+            "command": "rebuild", "index_type": index_type,
+            "status": if rebuilt { "complete" } else { "no-sub-projects" }
+        });
+        if rebuilt {
+            print_lifecycle_summary(root, response)?;
+        } else {
+            println!("{}", serde_json::to_string(&response)?);
+        }
+    }
+    Ok(())
+}
+
+fn rebuild_index(
+    root: &Path,
+    index_type: &str,
+    index_deps: bool,
+    no_ignore: bool,
+    sub_projects: bool,
+    verbose: bool,
+    experimental_fast_rebuild: bool,
+    cli_include: &[String],
+    cli_exclude: &[String],
+    extra_paths: &[String],
+) -> Result<bool> {
     let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
         "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
         experimental_fast_rebuild,
@@ -502,7 +572,7 @@ pub fn cmd_rebuild(
             [],
         )
         .ok();
-        println!(
+        lifecycle_progress!(
             "{}",
             "Including gitignored files (build/, etc.)...".yellow()
         );
@@ -516,7 +586,7 @@ pub fn cmd_rebuild(
             [],
         )
         .ok();
-        println!(
+        lifecycle_progress!(
             "{}",
             "Persisted --force opt-in for this project. Future `rebuild` runs \
              will not hit the candidate-file cap on this root."
@@ -536,7 +606,7 @@ pub fn cmd_rebuild(
 
     match index_type {
         "all" => {
-            println!("{}", "Rebuilding full index...".cyan());
+            lifecycle_progress!("{}", "Rebuilding full index...".cyan());
             if verbose {
                 eprintln!("[verbose] starting file walk + parse...");
             }
@@ -594,7 +664,7 @@ pub fn cmd_rebuild(
                             t.elapsed()
                         );
                     }
-                    println!(
+                    lifecycle_progress!(
                         "{}",
                         format!(
                             "Indexed {} files from extra root: {}",
@@ -635,7 +705,7 @@ pub fn cmd_rebuild(
                     );
                 }
                 if pkg_count > 0 {
-                    println!(
+                    lifecycle_progress!(
                         "{}",
                         format!("Indexed {} CocoaPods/Carthage deps", pkg_count).dimmed()
                     );
@@ -648,7 +718,7 @@ pub fn cmd_rebuild(
             // Android/Gradle, Maven, ya.make, and Python projects — previously this
             // step was gated on Android detection, silently skipping other build systems.
             if index_deps && module_count > 0 {
-                println!("{}", "Indexing module dependencies...".cyan());
+                lifecycle_progress!("{}", "Indexing module dependencies...".cyan());
                 if verbose {
                     eprintln!("[verbose] indexing module deps...");
                 }
@@ -685,7 +755,7 @@ pub fn cmd_rebuild(
                     );
                 }
                 if dts_count > 0 {
-                    println!(
+                    lifecycle_progress!(
                         "{}",
                         format!(
                             "Indexed {} .d.ts type declarations from node_modules",
@@ -701,7 +771,7 @@ pub fn cmd_rebuild(
             let mut res_count = 0;
             let mut res_usage_count = 0;
             if is_android {
-                println!("{}", "Indexing XML layouts...".cyan());
+                lifecycle_progress!("{}", "Indexing XML layouts...".cyan());
                 let t = Instant::now();
                 xml_count =
                     indexer::index_xml_usages(&mut conn, root, &walk.xml_layout_files, true)?;
@@ -709,7 +779,7 @@ pub fn cmd_rebuild(
                     eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
                 }
 
-                println!("{}", "Indexing resources...".cyan());
+                lifecycle_progress!("{}", "Indexing resources...".cyan());
                 let t = Instant::now();
                 let (rc, ruc) = indexer::index_resources(&mut conn, root, &walk.res_files, true)?;
                 res_count = rc;
@@ -729,7 +799,7 @@ pub fn cmd_rebuild(
             let mut asset_count = 0;
             let mut asset_usage_count = 0;
             if is_ios {
-                println!("{}", "Indexing storyboards/xibs...".cyan());
+                lifecycle_progress!("{}", "Indexing storyboards/xibs...".cyan());
                 let t = Instant::now();
                 sb_count = indexer::index_storyboard_usages(
                     &mut conn,
@@ -745,7 +815,7 @@ pub fn cmd_rebuild(
                     );
                 }
 
-                println!("{}", "Indexing iOS assets...".cyan());
+                lifecycle_progress!("{}", "Indexing iOS assets...".cyan());
                 let t = Instant::now();
                 let (ac, auc) =
                     indexer::index_ios_assets(&mut conn, root, &walk.xcassets_dirs, true)?;
@@ -765,7 +835,7 @@ pub fn cmd_rebuild(
             finalize_rebuild_schema(&conn, verbose)?;
 
             if is_android && is_ios {
-                println!(
+                lifecycle_progress!(
                     "{}",
                     format!(
                         "Indexed {} files, {} modules, {} deps, {} XML usages, {} resources, {} storyboard usages, {} assets",
@@ -773,7 +843,7 @@ pub fn cmd_rebuild(
                     ).green()
                 );
             } else if is_ios {
-                println!(
+                lifecycle_progress!(
                     "{}",
                     format!(
                         "Indexed {} files, {} modules, {} storyboard usages, {} assets ({} usages)",
@@ -782,7 +852,7 @@ pub fn cmd_rebuild(
                     .green()
                 );
             } else if dts_count > 0 {
-                println!(
+                lifecycle_progress!(
                     "{}",
                     format!(
                         "Indexed {} files (+{} .d.ts), {} modules, {} deps",
@@ -791,7 +861,7 @@ pub fn cmd_rebuild(
                     .green()
                 );
             } else {
-                println!(
+                lifecycle_progress!(
                     "{}",
                     format!(
                         "Indexed {} files, {} modules, {} deps, {} transitive, {} XML usages, {} resources ({} usages)",
@@ -801,7 +871,7 @@ pub fn cmd_rebuild(
             }
         }
         "files" | "symbols" => {
-            println!("{}", "Rebuilding symbols index...".cyan());
+            lifecycle_progress!("{}", "Rebuilding symbols index...".cyan());
             conn.execute("DELETE FROM symbols", [])?;
             conn.execute("DELETE FROM files", [])?;
             db::bump_index_generation(&conn)?;
@@ -813,10 +883,10 @@ pub fn cmd_rebuild(
                 config_exclude.as_deref(),
             )?;
             finalize_rebuild_schema(&conn, verbose)?;
-            println!("{}", format!("Indexed {} files", walk.file_count).green());
+            lifecycle_progress!("{}", format!("Indexed {} files", walk.file_count).green());
         }
         "modules" => {
-            println!("{}", "Rebuilding modules index...".cyan());
+            lifecycle_progress!("{}", "Rebuilding modules index...".cyan());
             conn.execute("DELETE FROM module_deps", [])?;
             // Sync instead of delete-and-reinsert: resources, XML/storyboard
             // usages and assets reference modules by id with ON DELETE CASCADE.
@@ -841,12 +911,12 @@ pub fn cmd_rebuild(
             )?;
 
             if index_deps {
-                println!("{}", "Indexing module dependencies...".cyan());
+                lifecycle_progress!("{}", "Indexing module dependencies...".cyan());
                 let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
                 let dep_count =
                     indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
                 finalize_rebuild_schema(&conn, verbose)?;
-                println!(
+                lifecycle_progress!(
                     "{}",
                     format!(
                         "Indexed {} modules, {} dependencies",
@@ -856,19 +926,19 @@ pub fn cmd_rebuild(
                 );
             } else {
                 finalize_rebuild_schema(&conn, verbose)?;
-                println!("{}", format!("Indexed {} modules", module_count).green());
+                lifecycle_progress!("{}", format!("Indexed {} modules", module_count).green());
             }
         }
         "deps" => {
-            println!("{}", "Indexing module dependencies...".cyan());
+            lifecycle_progress!("{}", "Indexing module dependencies...".cyan());
             let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
             let dep_count =
                 indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
             finalize_rebuild_schema(&conn, verbose)?;
-            println!("{}", format!("Indexed {} dependencies", dep_count).green());
+            lifecycle_progress!("{}", format!("Indexed {} dependencies", dep_count).green());
         }
         _ => {
-            println!("{}", format!("Unknown index type: {}", index_type).red());
+            lifecycle_progress!("{}", format!("Unknown index type: {}", index_type).red());
         }
     }
 
@@ -893,7 +963,7 @@ pub fn cmd_rebuild(
     db::seal_staged_db(conn, staged.db_path())?;
     let publication = db::acquire_index_publication_guard(root)?;
     publication.install_staged(staged.db_path())?;
-    Ok(())
+    Ok(true)
 }
 
 /// Rebuild index for each sub-project into a single shared DB for root.
@@ -911,7 +981,7 @@ fn cmd_rebuild_sub_projects(
     config_roots: Option<&[String]>,
     extra_paths: &[String],
     exclude_matcher: Option<&ignore::gitignore::Gitignore>,
-) -> Result<()> {
+) -> Result<bool> {
     let start = Instant::now();
 
     // Acquire exclusive lock to prevent concurrent rebuilds
@@ -936,23 +1006,23 @@ fn cmd_rebuild_sub_projects(
         );
     }
     if sub_projects.is_empty() {
-        println!(
+        lifecycle_progress!(
             "{}",
             "No sub-projects found. Use 'rebuild' without --sub-projects.".yellow()
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let total = sub_projects.len();
-    println!(
+    lifecycle_progress!(
         "{}",
         format!("Found {} sub-projects in {}:", total, root.display()).cyan()
     );
     for (path, _) in &sub_projects {
         let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-        println!("  {}", name);
+        lifecycle_progress!("  {}", name);
     }
-    println!();
+    lifecycle_progress!();
 
     let saved_subtrees = snapshot_subtrees(root, verbose)?;
 
@@ -1031,7 +1101,7 @@ fn cmd_rebuild_sub_projects(
                         e
                     );
                 }
-                println!("{}", format!("  Root direct entries failed: {}", e).red());
+                lifecycle_progress!("{}", format!("  Root direct entries failed: {}", e).red());
                 fail_count += 1;
             }
         }
@@ -1039,7 +1109,7 @@ fn cmd_rebuild_sub_projects(
 
     for (i, (path, _)) in sub_projects.iter().enumerate() {
         let name = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-        println!(
+        lifecycle_progress!(
             "{}",
             format!("[{}/{}] Indexing {}...", i + 1, total, name).cyan()
         );
@@ -1079,7 +1149,7 @@ fn cmd_rebuild_sub_projects(
                         t.elapsed()
                     );
                 }
-                println!(
+                lifecycle_progress!(
                     "{}",
                     format!("  {} files indexed", walk.file_count).dimmed()
                 );
@@ -1089,7 +1159,7 @@ fn cmd_rebuild_sub_projects(
                 if verbose {
                     eprintln!("[verbose] {} — FAILED in {:?}: {}", name, t.elapsed(), e);
                 }
-                println!("{}", format!("  Failed: {}", e).red());
+                lifecycle_progress!("{}", format!("  Failed: {}", e).red());
                 fail_count += 1;
             }
         }
@@ -1131,7 +1201,7 @@ fn cmd_rebuild_sub_projects(
                 t.elapsed()
             );
         }
-        println!(
+        lifecycle_progress!(
             "{}",
             format!(
                 "Indexed {} files from extra root: {}",
@@ -1223,8 +1293,8 @@ fn cmd_rebuild_sub_projects(
     db::mark_index_updated(&conn)?;
     db::mark_modules_indexed(&conn)?;
 
-    println!();
-    println!(
+    lifecycle_progress!();
+    lifecycle_progress!(
         "{}",
         format!(
             "Done: {} sub-projects indexed ({} files, {} modules, {} deps, {} transitive), {} failed",
@@ -1239,7 +1309,7 @@ fn cmd_rebuild_sub_projects(
     db::seal_staged_db(conn, staged.db_path())?;
     let publication = db::acquire_index_publication_guard(root)?;
     publication.install_staged(staged.db_path())?;
-    Ok(())
+    Ok(true)
 }
 
 /// Incrementally update the index
@@ -1247,11 +1317,7 @@ fn run_update_once(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
 
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, if lifecycle_json() { "json" } else { "text" })? {
         return Ok(());
     }
 
@@ -1279,7 +1345,7 @@ fn run_update_once(root: &Path, verbose: bool) -> Result<()> {
         }
     }
 
-    println!("{}", "Checking for changes...".cyan());
+    lifecycle_progress!("{}", "Checking for changes...".cyan());
     let (updated, changed, deleted) = indexer::update_directory_incremental(
         &mut conn,
         root,
@@ -1289,9 +1355,9 @@ fn run_update_once(root: &Path, verbose: bool) -> Result<()> {
     )?;
 
     if updated == 0 && deleted == 0 {
-        println!("{}", "Index is up to date.".green());
+        lifecycle_progress!("{}", "Index is up to date.".green());
     } else {
-        println!(
+        lifecycle_progress!(
             "{}",
             format!(
                 "Updated: {} files ({} changed, {} deleted)",
@@ -1458,10 +1524,19 @@ pub fn cmd_update_background(root: &Path, debounce_ms: u64, verbose: bool) -> Re
             return Err(error);
         }
     }
-    println!(
-        "Queued background index update generation {}.",
-        request.generation
-    );
+    if lifecycle_json() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "command": "update", "status": "queued", "generation": request.generation
+            })
+        );
+    } else {
+        println!(
+            "Queued background index update generation {}.",
+            request.generation
+        );
+    }
     Ok(())
 }
 
@@ -1523,11 +1598,7 @@ pub fn cmd_update_coordinator_worker(
 }
 
 pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, if lifecycle_json() { "json" } else { "text" })? {
         return Ok(());
     }
     let request = db::request_update_generation(root)?;
@@ -1536,6 +1607,12 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
         run_update_worker(root, 0, verbose, token)?;
     }
     db::wait_for_update_generation(root, request.generation, default_update_wait_timeout())?;
+    if lifecycle_json() {
+        print_lifecycle_summary(
+            root,
+            serde_json::json!({"command": "update", "status": "complete"}),
+        )?;
+    }
     Ok(())
 }
 
@@ -1564,17 +1641,28 @@ pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
     let publication = db::acquire_index_publication_guard(root)?;
     publication.install_staged(staged.db_path())?;
 
-    println!("{}", format!("Restored index from: {}", db_file).green());
-    println!("DB path: {}", dest.display());
+    if lifecycle_json() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "command": "restore", "status": "complete", "source": db_file, "db_path": dest,
+                "files": stats.file_count, "symbols": stats.symbol_count,
+                "refs": stats.refs_count, "modules": stats.module_count
+            })
+        );
+    } else {
+        println!("{}", format!("Restored index from: {}", db_file).green());
+        println!("DB path: {}", dest.display());
 
-    println!(
-        "{}",
-        format!(
-            "Contains: {} files, {} symbols, {} refs",
-            stats.file_count, stats.symbol_count, stats.refs_count
-        )
-        .dimmed()
-    );
+        println!(
+            "{}",
+            format!(
+                "Contains: {} files, {} symbols, {} refs",
+                stats.file_count, stats.symbol_count, stats.refs_count
+            )
+            .dimmed()
+        );
+    }
 
     Ok(())
 }
@@ -1706,7 +1794,14 @@ fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bo
 pub fn cmd_clear(root: &Path) -> Result<()> {
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
     db::clear_published_index(root)?;
-    println!("Index cleared for {}", root.display());
+    if lifecycle_json() {
+        println!(
+            "{}",
+            serde_json::json!({"command": "clear", "status": "complete", "root": root})
+        );
+    } else {
+        println!("Index cleared for {}", root.display());
+    }
     Ok(())
 }
 
