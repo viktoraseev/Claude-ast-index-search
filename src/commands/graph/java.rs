@@ -9,11 +9,25 @@ use crate::parsers::treesitter::{parse_tree, walk_tree_preorder, WalkControl};
 
 static LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_java::LANGUAGE.into());
 
+#[derive(Clone, Copy)]
+pub(super) enum TypeAccess {
+    Public,
+    Package,
+    Private,
+    Protected,
+}
+
+pub(super) struct TypeDeclaration {
+    pub access: TypeAccess,
+    pub static_member: bool,
+}
+
 #[derive(Default)]
 pub(super) struct JavaSource {
     pub package: String,
     pub imports: Vec<String>,
     pub static_imports: Vec<String>,
+    declarations: HashMap<(String, i64), TypeDeclaration>,
     /// Reference rows carry a line and name, not a byte position. Colliding
     /// paths or value/type uses on one line remain explicit negative evidence.
     types: HashMap<(i64, String), Option<String>>,
@@ -1797,6 +1811,80 @@ impl JavaSource {
                     | "annotation_type_declaration"
             ) {
                 if let Some(name) = node.child_by_field_name("name") {
+                    let mut cursor = node.walk();
+                    let modifiers = node
+                        .named_children(&mut cursor)
+                        .find(|child| child.kind() == "modifiers");
+                    let has_modifier = |value| {
+                        modifiers.is_some_and(|modifiers| {
+                            let mut cursor = modifiers.walk();
+                            let found = modifiers
+                                .children(&mut cursor)
+                                .any(|child| child.kind() == value);
+                            found
+                        })
+                    };
+                    let member = node.parent().filter(|parent| {
+                        matches!(
+                            parent.kind(),
+                            "class_body"
+                                | "interface_body"
+                                | "enum_body"
+                                | "enum_body_declarations"
+                                | "annotation_type_body"
+                        )
+                    });
+                    let interface_member = member.is_some_and(|body| {
+                        matches!(body.kind(), "interface_body" | "annotation_type_body")
+                    });
+                    let access = if has_modifier("public") || interface_member {
+                        TypeAccess::Public
+                    } else if has_modifier("private") {
+                        TypeAccess::Private
+                    } else if has_modifier("protected") {
+                        TypeAccess::Protected
+                    } else {
+                        TypeAccess::Package
+                    };
+                    let mut path = vec![text(name, source)];
+                    let mut ancestor = node.parent();
+                    while let Some(parent) = ancestor {
+                        if matches!(
+                            parent.kind(),
+                            "class_declaration"
+                                | "interface_declaration"
+                                | "annotation_type_declaration"
+                                | "enum_declaration"
+                                | "record_declaration"
+                        ) {
+                            if let Some(name) = parent.child_by_field_name("name") {
+                                path.push(text(name, source));
+                            }
+                        }
+                        ancestor = parent.parent();
+                    }
+                    path.reverse();
+                    let qualified = if result.package.is_empty() {
+                        path.join("::")
+                    } else {
+                        format!("{}::{}", result.package, path.join("::"))
+                    };
+                    result.declarations.insert(
+                        (qualified, name.start_position().row as i64 + 1),
+                        TypeDeclaration {
+                            access,
+                            static_member: member.is_some()
+                                && (has_modifier("static")
+                                    || interface_member
+                                    || matches!(
+                                        node.kind(),
+                                        "interface_declaration"
+                                            | "annotation_type_declaration"
+                                            | "enum_declaration"
+                                            | "record_declaration"
+                                    )),
+                        },
+                    );
                     let mut parents = Vec::new();
                     let mut cursor = node.walk();
                     for branch in node.named_children(&mut cursor) {
@@ -2706,6 +2794,10 @@ impl JavaSource {
         self.type_bounds
             .get(&(name.to_owned(), line, parameter.to_owned()))
             .map(String::as_str)
+    }
+
+    pub fn type_declaration(&self, name: &str, line: i64) -> Option<&TypeDeclaration> {
+        self.declarations.get(&(name.to_owned(), line))
     }
 
     pub fn type_reference(&self, line: i64, name: &str) -> Option<&Option<String>> {

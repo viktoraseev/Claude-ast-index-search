@@ -11,7 +11,7 @@ REASON = ('independent source/state: disposable Java invocations, caller ownersh
           'depth/filter/limits and exploration source/outline/scoped neighbours; not MCP equivalence')
 PENDING = {
     'call-tree:semantic-resolution': 'Name-based caller expansion does not establish Java receiver/overload dispatch, colliding same-name/same-line owners or attached-root scope; separate source/MCP contract required',
-    'explore:semantic-resolution': 'Java local/field/generic receiver and overload type dispatch, same-name overloads sharing a line, type-reference visibility/static imports/local-class shadows and attached-root neighbour resolution remain unresolved; separate syntax type binding/guards, explicit parameter/arity and fresh-graph empty caller contracts do not establish compiler-wide dispatch or MCP equivalence',
+    'explore:semantic-resolution': 'Java local/field/generic receiver and overload type dispatch, same-name overloads sharing a line, compiler-wide type accessibility, inherited static type imports/local-class shadows and attached-root neighbour resolution remain unresolved; separate syntax type binding/guards, type accessibility/direct static imports, explicit parameter/arity and fresh-graph empty caller contracts do not establish compiler-wide dispatch or MCP equivalence',
 }
 
 

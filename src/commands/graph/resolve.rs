@@ -13,7 +13,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::java::{JavaReceiver, JavaSource};
+use super::java::{JavaReceiver, JavaSource, TypeAccess};
 use super::metrics::compute_metrics;
 use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
@@ -1779,6 +1779,80 @@ impl Builder {
         )))
     }
 
+    fn java_nest_host(&self, mut symbol: u32) -> u32 {
+        while let Some(container) = self.syms[symbol as usize].container {
+            symbol = container;
+        }
+        symbol
+    }
+
+    fn java_subclass_of(&self, source: u32, ancestor: u32) -> bool {
+        let mut enclosing = self.class_scope(source);
+        while let Some(class) = enclosing {
+            let mut queue = VecDeque::from([(class, 0)]);
+            let mut visited = HashSet::new();
+            while let Some((candidate, depth)) = queue.pop_front() {
+                if candidate == ancestor {
+                    return true;
+                }
+                if depth < MAX_ANCESTOR_DEPTH && visited.insert(candidate) {
+                    if let Some(parents) = self.parents.get(&self.syms[candidate as usize].qual) {
+                        queue.extend(parents.iter().map(|&parent| (parent, depth + 1)));
+                    }
+                }
+            }
+            enclosing = self.syms[class as usize].container;
+        }
+        false
+    }
+
+    /// A public member type is still inaccessible through a hidden enclosing
+    /// type. Private access belongs to the top-level nest, not the whole file.
+    fn java_type_accessible(&self, source: u32, mut candidate: u32, at_import: bool) -> bool {
+        let source_file = self.syms[source as usize].file;
+        let Some(source_java) = self.files[source_file as usize].java.as_ref() else {
+            return true;
+        };
+        loop {
+            let symbol = &self.syms[candidate as usize];
+            if let Some(java) = self.files[symbol.file as usize].java.as_ref() {
+                let Some(declaration) = java.type_declaration(&symbol.qual, symbol.line) else {
+                    return false;
+                };
+                let allowed = match declaration.access {
+                    TypeAccess::Public => true,
+                    TypeAccess::Package => source_java.package == java.package,
+                    TypeAccess::Private => {
+                        !at_import && self.java_nest_host(source) == self.java_nest_host(candidate)
+                    }
+                    TypeAccess::Protected => {
+                        source_java.package == java.package
+                            || !at_import
+                                && symbol
+                                    .container
+                                    .is_some_and(|owner| self.java_subclass_of(source, owner))
+                    }
+                };
+                if !allowed {
+                    return false;
+                }
+            }
+            match symbol.container {
+                Some(container) => candidate = container,
+                None => return true,
+            }
+        }
+    }
+
+    fn java_static_type(&self, candidate: u32) -> bool {
+        let symbol = &self.syms[candidate as usize];
+        self.files[symbol.file as usize]
+            .java
+            .as_ref()
+            .and_then(|java| java.type_declaration(&symbol.qual, symbol.line))
+            .is_some_and(|declaration| declaration.static_member)
+    }
+
     /// Java syntax name binding, shared by type references and receiver calls.
     /// An explicit external import binds even when no indexed declaration exists.
     fn resolve_java_type(
@@ -1803,6 +1877,7 @@ impl Builder {
                         && is_container_kind(&self.syms[candidate as usize].kind)
                         && self.family_of(candidate) == "jvm"
                         && self.visible_from(file, candidate)
+                        && self.java_type_accessible(source, candidate, false)
                 })
                 .collect()
         };
@@ -1833,6 +1908,23 @@ impl Builder {
                 imported.extend(lookup(&qualified));
             }
         }
+        for binding in &java.static_imports {
+            if binding.rsplit("::").next() == Some(head) {
+                explicit_import = true;
+                // An explicit external/invalid static import still reserves
+                // its simple name; never fall back to a same-package class.
+                for class in lookup(binding).into_iter().filter(|&class| {
+                    self.java_static_type(class) && self.java_type_accessible(source, class, true)
+                }) {
+                    if tail.is_empty() {
+                        imported.push(class);
+                    } else {
+                        imported
+                            .extend(lookup(&join_path(&self.syms[class as usize].qual, &[tail])));
+                    }
+                }
+            }
+        }
         imported.sort_unstable();
         imported.dedup();
         // An external explicit import still binds the name. Its absence
@@ -1854,6 +1946,24 @@ impl Builder {
         for binding in &java.imports {
             if let Some(package) = binding.strip_suffix("::*") {
                 on_demand.extend(lookup(&join_path(package, &[declared])));
+            }
+        }
+        for binding in &java.static_imports {
+            if let Some(owner) = binding.strip_suffix("::*") {
+                for class in lookup(&join_path(owner, &[head]))
+                    .into_iter()
+                    .filter(|&class| {
+                        self.java_static_type(class)
+                            && self.java_type_accessible(source, class, true)
+                    })
+                {
+                    if tail.is_empty() {
+                        on_demand.push(class);
+                    } else {
+                        on_demand
+                            .extend(lookup(&join_path(&self.syms[class as usize].qual, &[tail])));
+                    }
+                }
             }
         }
         on_demand.sort_unstable();
