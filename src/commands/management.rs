@@ -1866,12 +1866,13 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
 
 /// Add an extra source root
 pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
+    cmd_add_root_with_format(root, path, force, "text")
+}
+
+/// Add an extra source root and report its canonical identity.
+pub fn cmd_add_root_with_format(root: &Path, path: &str, force: bool, format: &str) -> Result<()> {
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 
@@ -1889,6 +1890,17 @@ pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
         .unwrap_or_else(|_| std::path::PathBuf::from(&abs_path));
 
     if !force {
+        if format == "json"
+            && (canonical_new.starts_with(&canonical_root)
+                || canonical_root.starts_with(&canonical_new))
+        {
+            println!(
+                "{}",
+                serde_json::json!({"command": "add-root",
+                "status": "overlap-refused", "path": canonical_new})
+            );
+            return Ok(());
+        }
         if canonical_new.starts_with(&canonical_root) {
             println!(
                 "{}",
@@ -1914,18 +1926,27 @@ pub fn cmd_add_root(root: &Path, path: &str, force: bool) -> Result<()> {
 
     let conn = db::open_db_leased(root)?;
     db::add_extra_root(&conn, &abs_path)?;
-    println!("{}", format!("Added source root: {}", abs_path).green());
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({"command": "add-root",
+            "status": "complete", "path": canonical_new})
+        );
+    } else {
+        println!("{}", format!("Added source root: {}", abs_path).green());
+    }
     Ok(())
 }
 
 /// Remove an extra source root
 pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
+    cmd_remove_root_with_format(root, path, "text")
+}
+
+/// Remove an extra source root with a machine-readable outcome.
+pub fn cmd_remove_root_with_format(root: &Path, path: &str, format: &str) -> Result<()> {
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 
@@ -1937,7 +1958,14 @@ pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
     };
 
     let conn = db::open_db_leased(root)?;
-    if db::remove_extra_root(&conn, &abs_path)? {
+    let removed = db::remove_extra_root(&conn, &abs_path)?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({"command": "remove-root", "removed": removed,
+            "path": db::safe_canonicalize(Path::new(&abs_path))})
+        );
+    } else if removed {
         println!("{}", format!("Removed source root: {}", abs_path).green());
     } else {
         println!("{}", format!("Root not found: {}", abs_path).yellow());
@@ -1949,17 +1977,6 @@ pub fn cmd_remove_root(root: &Path, path: &str) -> Result<()> {
 /// New code should prefer `subtree list`, which also shows names.
 pub fn cmd_list_roots(root: &Path, format: &str) -> Result<()> {
     cmd_subtree_list(root, format)
-}
-
-fn ensure_index_exists(root: &Path) -> bool {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
-        return false;
-    }
-    true
 }
 
 /// Resolve a user-supplied path into (canonical_path, original_path).
@@ -1981,13 +1998,30 @@ fn resolve_subtree_path(path: &str) -> (String, String) {
 }
 
 /// Reject obvious overlaps with the primary project root unless --force.
-fn reject_overlap_with_root(root: &Path, canonical_new: &str, force: bool) -> Result<bool> {
+fn reject_overlap_with_root(
+    root: &Path,
+    canonical_new: &str,
+    force: bool,
+    format: &str,
+) -> Result<bool> {
     if force {
         return Ok(true);
     }
     let canonical_root = db::safe_canonicalize(root).to_string_lossy().into_owned();
     let canonical_new_pb = std::path::Path::new(canonical_new);
     let canonical_root_pb = std::path::Path::new(&canonical_root);
+
+    if format == "json"
+        && (canonical_new_pb.starts_with(canonical_root_pb)
+            || canonical_root_pb.starts_with(canonical_new_pb))
+    {
+        println!(
+            "{}",
+            serde_json::json!({"command": "subtree-add",
+            "status": "overlap-refused", "path": canonical_new})
+        );
+        return Ok(false);
+    }
 
     if canonical_new_pb.starts_with(canonical_root_pb) {
         println!(
@@ -2027,16 +2061,25 @@ pub fn cmd_subtree_add(
     format: &str,
 ) -> Result<()> {
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
-    if !ensure_index_exists(root) {
+    if !super::index_available(root, format)? {
         return Ok(());
     }
     let (canonical, original) = resolve_subtree_path(path);
-    if !reject_overlap_with_root(root, &canonical, force)? {
+    if !reject_overlap_with_root(root, &canonical, force, format)? {
         return Ok(());
     }
 
     let conn = db::open_db_leased(root)?;
     if let Some(existing) = db::find_subtree_by_name(&conn, name)? {
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::json!({"command": "subtree-add",
+                "status": "name-conflict", "name": existing.name,
+                "canonical_path": existing.canonical_path})
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             format!(
@@ -2049,6 +2092,15 @@ pub fn cmd_subtree_add(
         return Ok(());
     }
     if let Some(existing) = db::find_subtree_by_root_path(&conn, &canonical)? {
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::json!({"command": "subtree-add",
+                "status": "path-conflict", "name": existing.name,
+                "canonical_path": existing.canonical_path})
+            );
+            return Ok(());
+        }
         println!(
             "{}",
             format!(
@@ -2082,7 +2134,7 @@ pub fn cmd_subtree_add(
 
 pub fn cmd_subtree_remove(root: &Path, name: &str, format: &str) -> Result<()> {
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
-    if !ensure_index_exists(root) {
+    if !super::index_available(root, format)? {
         return Ok(());
     }
     let conn = db::open_db_leased(root)?;

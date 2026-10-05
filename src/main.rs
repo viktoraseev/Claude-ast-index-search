@@ -1850,9 +1850,11 @@ fn main() -> Result<()> {
             },
         ),
         Commands::AddRoot { path, force } => {
-            commands::management::cmd_add_root(&root, &path, force)
+            commands::management::cmd_add_root_with_format(&root, &path, force, format)
         }
-        Commands::RemoveRoot { path } => commands::management::cmd_remove_root(&root, &path),
+        Commands::RemoveRoot { path } => {
+            commands::management::cmd_remove_root_with_format(&root, &path, format)
+        }
         Commands::ListRoots => commands::management::cmd_list_roots(&root, format),
         Commands::Subtree { action } => match action {
             SubtreeAction::Add { name, path, force } => {
@@ -1883,11 +1885,11 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
-        Commands::InstallCodexMcp { dry_run } => cmd_install_codex_mcp(&root, dry_run),
+        Commands::InstallClaudePlugin => cmd_install_claude_plugin(format),
+        Commands::InstallCodexMcp { dry_run } => cmd_install_codex_mcp(&root, dry_run, format),
         Commands::DetectStacks => cmd_detect_stacks(&root, format),
         Commands::InstallGitHooks { force, dry_run } => {
-            cmd_install_git_hooks(&root, force, dry_run)
+            cmd_install_git_hooks(&root, force, dry_run, format)
         }
         // Programmatic access
         Commands::Agrep {
@@ -1901,42 +1903,71 @@ fn main() -> Result<()> {
     }
 }
 
-fn cmd_install_claude_plugin() -> Result<()> {
+/// Check installation child status without mixing its progress into JSON stdout.
+fn installation_status(
+    command: &mut Command,
+    format: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    if format == "json" {
+        command.stdout(std::io::stderr());
+    }
+    command.status()
+}
+
+fn cmd_install_claude_plugin(format: &str) -> Result<()> {
     use std::process::Command;
 
-    println!("Adding ast-index marketplace...");
-    let status = Command::new("claude")
-        .args([
+    if format != "json" {
+        println!("Adding ast-index marketplace...");
+    }
+    let status = installation_status(
+        Command::new("claude").args([
             "plugin",
             "marketplace",
             "add",
             "defendend/Claude-ast-index-search",
-        ])
-        .status();
+        ]),
+        format,
+    );
 
-    match status {
+    let marketplace_added = match status {
         Ok(s) if s.success() => {
-            println!("Marketplace added successfully.");
+            if format != "json" {
+                println!("Marketplace added successfully.");
+            }
+            true
         }
         Ok(s) => {
             eprintln!("Warning: marketplace add exited with {}", s);
+            false
         }
         Err(e) => {
             eprintln!("Error: could not run 'claude' CLI: {}", e);
             eprintln!("Make sure Claude Code is installed: https://docs.anthropic.com/en/docs/claude-code");
             return Err(anyhow::anyhow!("claude CLI not found"));
         }
-    }
+    };
 
-    println!("Installing ast-index plugin...");
-    let status = Command::new("claude")
-        .args(["plugin", "install", "ast-index"])
-        .status();
+    if format != "json" {
+        println!("Installing ast-index plugin...");
+    }
+    let status = installation_status(
+        Command::new("claude").args(["plugin", "install", "ast-index"]),
+        format,
+    );
 
     match status {
         Ok(s) if s.success() => {
-            println!("Plugin installed successfully.");
-            println!("\nRestart Claude Code to activate the plugin.");
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::json!({"command": "install-claude-plugin",
+                    "status": "complete", "marketplace_added": marketplace_added})
+                );
+            } else {
+                println!("Plugin installed successfully.");
+                println!("\nRestart Claude Code to activate the plugin.");
+            }
         }
         Ok(s) => {
             return Err(anyhow::anyhow!("Plugin install exited with {}", s));
@@ -2018,22 +2049,32 @@ impl CodexMcpInstall {
     }
 }
 
-fn cmd_install_codex_mcp(root: &Path, dry_run: bool) -> Result<()> {
+fn cmd_install_codex_mcp(root: &Path, dry_run: bool, format: &str) -> Result<()> {
     let install = CodexMcpInstall::from_env(root)?;
 
     if dry_run {
-        print!("{}", install.dry_run_output());
+        if format == "json" {
+            print_codex_install_json(&install, "dry-run");
+        } else {
+            print!("{}", install.dry_run_output());
+        }
         return Ok(());
     }
 
-    println!("Registering ast-index MCP server in Codex...");
+    if format != "json" {
+        println!("Registering ast-index MCP server in Codex...");
+    }
     let args = install.codex_args();
-    let status = Command::new("codex").args(&args).status();
+    let status = installation_status(Command::new("codex").args(&args), format);
 
     match status {
         Ok(s) if s.success() => {
-            println!("Codex MCP server 'ast-index' registered.");
-            println!("Run `ast-index rebuild` in this project before querying it from Codex.");
+            if format == "json" {
+                print_codex_install_json(&install, "complete");
+            } else {
+                println!("Codex MCP server 'ast-index' registered.");
+                println!("Run `ast-index rebuild` in this project before querying it from Codex.");
+            }
             Ok(())
         }
         Ok(s) => {
@@ -2049,6 +2090,15 @@ fn cmd_install_codex_mcp(root: &Path, dry_run: bool) -> Result<()> {
             Err(anyhow::anyhow!("codex CLI not found or not executable"))
         }
     }
+}
+
+fn print_codex_install_json(install: &CodexMcpInstall, status: &str) {
+    println!(
+        "{}",
+        serde_json::json!({"command": "install-codex-mcp", "status": status,
+        "program": "codex", "args": install.codex_args(),
+        "fallback_config": install.fallback_config_toml()})
+    );
 }
 
 fn print_codex_fallback(install: &CodexMcpInstall) {
@@ -2095,12 +2145,20 @@ fn cmd_detect_stacks(root: &Path, format: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> {
+fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool, format: &str) -> Result<()> {
     let git_dir = resolve_git_hooks_dir(root)?;
     let events = ["post-checkout", "post-merge", "post-rewrite"];
     let script_body = git_hook_script();
 
     if dry_run {
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::json!({"command": "install-git-hooks", "status": "dry-run",
+                "hooks_dir": git_dir, "hooks": events, "script": script_body})
+            );
+            return Ok(());
+        }
         println!(
             "Would write the following hooks under {}:",
             git_dir.display()
@@ -2114,7 +2172,9 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
 
     std::fs::create_dir_all(&git_dir)?;
     let mut wrote = 0;
+    let mut written: Vec<String> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+    let mut preserved: Vec<String> = Vec::new();
     for event in events {
         let path = git_dir.join(event);
         if path.exists() && !force {
@@ -2128,6 +2188,7 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
                 "Hook {} already exists; rerun with --force to overwrite.",
                 path.display()
             );
+            preserved.push(event.to_string());
             continue;
         }
         std::fs::write(&path, &script_body)?;
@@ -2139,8 +2200,18 @@ fn cmd_install_git_hooks(root: &Path, force: bool, dry_run: bool) -> Result<()> 
             std::fs::set_permissions(&path, perms)?;
         }
         wrote += 1;
+        written.push(event.to_string());
     }
 
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({"command": "install-git-hooks", "status": "complete",
+            "hooks_dir": git_dir, "written": written, "already_installed": skipped,
+            "preserved": preserved})
+        );
+        return Ok(());
+    }
     println!(
         "{}",
         format!("Installed {} hook(s) into {}.", wrote, git_dir.display()).green()
