@@ -70,6 +70,7 @@ import file_view_contracts
 import file_scope_contracts
 import navigation_scope_contracts
 import caller_scope_contracts
+import caller_format_contracts
 import module_format_contracts
 import insight_scope_contracts
 import module_scope_contracts
@@ -532,6 +533,7 @@ class Fixture:
         self._file_scope_results = None
         self._navigation_scope_results = None
         self._caller_scope_results = None
+        self._caller_format_results = None
         self._insight_scope_results = None
         self._module_format_results = None
         self._module_scope_results = None
@@ -1858,6 +1860,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def caller_format_check(self, check: sqlite3.Row):
+        if self._caller_format_results is None:
+            self._caller_format_results = caller_format_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._caller_format_results)
+        return {'source': caller_format_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def insight_scope_check(self, check: sqlite3.Row):
         if self._insight_scope_results is None:
             self._insight_scope_results = insight_scope_contracts.exercise(self.binary, self.database.parent)
@@ -2025,6 +2035,8 @@ class Fixture:
                 handler = self.type_binding_check
             if check['feature'] in navigation_format_contracts.FEATURES:
                 handler = self.navigation_format_check
+            if check['feature'] in caller_format_contracts.FEATURES:
+                handler = self.caller_format_check
             if check['feature'] in format_contracts.FEATURES:
                 handler = self.format_check
             if check['feature'] in insight_scope_contracts.FEATURES:
@@ -2143,6 +2155,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(file_scope_contracts.FEATURES)
     features.update(navigation_scope_contracts.FEATURES)
     features.update(caller_scope_contracts.FEATURES)
+    features.update(caller_format_contracts.FEATURES)
     features.update(java_parent_contracts.FEATURES)
     features.update(insight_scope_contracts.FEATURES | insight_scope_contracts.PENDING.keys())
     features.update(module_format_contracts.FEATURES)
@@ -2298,6 +2311,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     caller_scope_contracts.plan_scope(state, root)
     module_format_contracts.plan_formats(state, root)
     navigation_format_contracts.plan_formats(state, root)
+    caller_format_contracts.plan_formats(state, root)
     java_parent_contracts.plan_parents(state, root)
     insight_scope_contracts.plan_scope(state, root)
     module_scope_contracts.plan_scope(state, root)

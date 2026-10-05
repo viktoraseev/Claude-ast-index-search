@@ -1245,7 +1245,7 @@ fn main() -> Result<()> {
                 module: None,
                 dir_prefix: dir_prefix_ref,
             };
-            commands::grep::cmd_call_tree(&root, &function_name, depth, limit, &scope)
+            commands::grep::cmd_call_tree(&root, &function_name, depth, limit, format, &scope)
         }
         Commands::Provides { type_name, limit } => {
             commands::grep::cmd_provides(&root, &type_name, limit, format)

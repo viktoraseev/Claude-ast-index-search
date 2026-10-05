@@ -476,11 +476,9 @@ pub fn cmd_call_tree(
     function_name: &str,
     max_depth: usize,
     limit_per_level: usize,
+    format: &str,
     scope: &db::SearchScope<'_>,
 ) -> Result<()> {
-    println!("{}", format!("Call tree for '{}':", function_name).bold());
-    println!("  {}", function_name.cyan());
-
     // A missing or unreadable index is not fatal here: attribution falls back
     // to the textual scan that predates the index.
     let conn = db::open_db_leased(root).ok();
@@ -492,7 +490,40 @@ pub fn cmd_call_tree(
         max_depth,
         limit_per_level,
         scope,
+        format != "json",
     )?;
+    if format == "json" {
+        let mut items = Vec::new();
+        walk_call_tree(
+            function_name,
+            max_depth,
+            &callers,
+            &mut |depth, (caller, path, line), node| {
+                let status = match node {
+                    TreeNode::Shown => "shown",
+                    TreeNode::ExpandedAbove => "expanded_above",
+                    TreeNode::Recursive => "recursive",
+                };
+                items.push(serde_json::json!({
+                    "depth": depth, "name": caller, "path": path, "line": line,
+                    "status": status,
+                }));
+            },
+        );
+        let result = serde_json::json!({
+            "schema_version": super::PAGINATED_JSON_SCHEMA_VERSION,
+            "function": function_name,
+            "max_depth": max_depth,
+            "limit_per_level": limit_per_level,
+            "count": items.len(),
+            "items": items,
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!("{}", format!("Call tree for '{}':", function_name).bold());
+    println!("  {}", function_name.cyan());
     walk_call_tree(
         function_name,
         max_depth,
@@ -559,6 +590,7 @@ fn collect_tree_callers(
     max_depth: usize,
     limit: usize,
     scope: &db::SearchScope<'_>,
+    decorate_paths: bool,
 ) -> Result<HashMap<String, CallerSites>> {
     let mut callers = HashMap::new();
     if limit == 0 {
@@ -600,7 +632,15 @@ fn collect_tree_callers(
         let prefilter = word_index
             .as_ref()
             .and_then(|words| words.prefilter(&names));
-        let found = find_caller_functions(root, conn, files, &missing, limit, prefilter.as_ref())?;
+        let found = find_caller_functions(
+            root,
+            conn,
+            files,
+            &missing,
+            limit,
+            prefilter.as_ref(),
+            decorate_paths,
+        )?;
         callers.extend(missing.into_iter().zip(found));
     }
 }
@@ -736,13 +776,15 @@ fn find_caller_functions(
     function_names: &[String],
     limit: usize,
     prefilter: Option<&super::WordPrefilter<'_>>,
+    decorate_paths: bool,
 ) -> Result<Vec<CallerSites>> {
     // Java syntax distinguishes calls from prose, declarations and method
     // references, and attributes calls even when declarations share a line.
     // Parse one file at a time; retain at most `limit` owners per requested name.
     let mut java_callers: Vec<CallerSites> = vec![Vec::new(); function_names.len()];
     let mut graph_answered = vec![false; function_names.len()];
-    let resolver = conn.map(|conn| PathResolver::from_conn(root, conn).with_decoration(true));
+    let resolver =
+        conn.map(|conn| PathResolver::from_conn(root, conn).with_decoration(decorate_paths));
     if let Some(conn) = conn {
         let state = db::symbol_graph_state(conn)?;
         if state.built && !state.stale {
