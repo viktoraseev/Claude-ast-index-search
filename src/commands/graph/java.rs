@@ -108,7 +108,8 @@ pub(super) struct ExpressionCall {
     /// A method reference has no invocation argument list.
     pub arguments: Option<usize>,
     pub reference_context: Option<JavaReceiver>,
-    pub reference_is_type: bool,
+    /// A syntax candidate; qualified names must still resolve as types, not fields.
+    pub reference_type: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -773,6 +774,38 @@ fn method_reference_context(node: Node<'_>, source: &str) -> Option<JavaReceiver
             }
             _ => return None,
         }
+    }
+}
+
+/// Check a reference qualifier without confusing a declared value with a type.
+fn method_reference_type(
+    node: Node<'_>,
+    source: &str,
+    scopes: &VariableScopes,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 16 {
+        return None;
+    }
+    match node.kind() {
+        "type_identifier" | "scoped_type_identifier" | "generic_type" => type_name(node, source),
+        "identifier"
+            if variable_type(node, text(node, source), false, scopes, source).is_none()
+                && variable_inferred(node, text(node, source), false, scopes, source).is_none() =>
+        {
+            Some(text(node, source).to_owned())
+        }
+        "field_access" => {
+            let prefix = method_reference_type(
+                node.child_by_field_name("object")?,
+                source,
+                scopes,
+                depth + 1,
+            )?;
+            let name = text(node.child_by_field_name("field")?, source);
+            Some(format!("{prefix}::{name}"))
+        }
+        _ => None,
     }
 }
 
@@ -2312,27 +2345,9 @@ impl JavaSource {
                     reference_context: reference
                         .then(|| method_reference_context(node, source))
                         .flatten(),
-                    reference_is_type: reference
-                        && (matches!(
-                            object.kind(),
-                            "type_identifier" | "scoped_type_identifier" | "generic_type"
-                        ) || (object.kind() == "identifier"
-                            && variable_type(
-                                object,
-                                text(object, source),
-                                false,
-                                &scopes,
-                                source,
-                            )
-                            .is_none()
-                            && variable_inferred(
-                                object,
-                                text(object, source),
-                                false,
-                                &scopes,
-                                source,
-                            )
-                            .is_none())),
+                    reference_type: reference
+                        .then(|| method_reference_type(object, source, &scopes, 0))
+                        .flatten(),
                 });
                 if let Some(call) = &call {
                     let variants = result.expression_variants.entry(key.clone()).or_default();

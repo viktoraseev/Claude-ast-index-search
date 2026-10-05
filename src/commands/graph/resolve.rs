@@ -3442,7 +3442,36 @@ impl Builder {
         };
         let mut common = None;
         for call in calls {
-            let classes = self.java_receiver_classes(source, &call.receiver, 0);
+            let type_classes = call.reference_type.as_deref().map(|path| {
+                // Tree-sitter represents qualified type references as field
+                // accesses. Resolve the full name, but preserve any value
+                // that shadows a nested type along the qualified path.
+                let mut prefix = String::new();
+                for part in path.split("::") {
+                    if !prefix.is_empty() {
+                        if !self
+                            .java_field_targets(
+                                source,
+                                &JavaReceiver::Type(prefix.clone()),
+                                part,
+                                0,
+                            )
+                            .is_empty()
+                        {
+                            return Vec::new();
+                        }
+                        prefix.push_str("::");
+                    }
+                    prefix.push_str(part);
+                }
+                self.resolve_java_type(source, self.namespace_of(source), path, None)
+            });
+            let reference_is_type = type_classes
+                .as_ref()
+                .is_some_and(|classes| !classes.is_empty());
+            let classes = type_classes
+                .filter(|classes| !classes.is_empty())
+                .unwrap_or_else(|| self.java_receiver_classes(source, &call.receiver, 0));
             let mut targets = self.java_receiver_members(source, &classes, name, call.arguments);
             if let Some(context) = &call.reference_context {
                 if let Some(inputs) = self.java_functional_arity(source, context) {
@@ -3451,8 +3480,8 @@ impl Builder {
                         let Some(java) = &self.files[symbol.file as usize].java else {
                             return false;
                         };
-                        let unbound = call.reference_is_type
-                            && !java.is_static_method(&symbol.name, symbol.line);
+                        let unbound =
+                            reference_is_type && !java.is_static_method(&symbol.name, symbol.line);
                         inputs
                             .checked_sub(usize::from(unbound))
                             .is_some_and(|arguments| {

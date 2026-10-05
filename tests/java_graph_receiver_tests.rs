@@ -296,6 +296,62 @@ class Probe {
 }
 
 #[test]
+fn qualified_nested_type_references_keep_unbound_instance_callers() {
+    check_direct_callers(
+        r#"import java.util.function.*;
+class Outer {
+ static class Item { int leaf() { return 1; } }
+}
+enum Probe {
+ GET(Outer.Item::leaf);
+ Probe(ToIntFunction<Outer.Item> callback) {}
+}
+class Use {
+ ToIntFunction<Outer.Item> unbound = Outer.Item::leaf;
+}
+"#,
+        "leaf",
+        &[("GET", 6), ("unbound", 10)],
+    );
+}
+
+#[test]
+fn qualified_field_references_keep_bound_instance_callers() {
+    check_direct_callers(
+        r#"import java.util.function.*;
+class Outer {
+ static class Item { int leaf() { return 1; } }
+ static Item Item;
+}
+class Probe {
+ IntSupplier bound = Outer.Item::leaf;
+ IntSupplier captured(Outer Outer) { return Outer.Item::leaf; }
+}
+"#,
+        "leaf",
+        &[("bound", 7), ("captured", 8)],
+    );
+}
+
+#[test]
+fn fully_qualified_nested_type_references_resolve_the_complete_path() {
+    check_direct_callers(
+        r#"package fixture;
+import java.util.function.*;
+class Outer {
+ static class Inner { static class Item { int leaf() { return 1; } } }
+}
+enum Probe {
+ GET(fixture.Outer.Inner.Item::leaf);
+ Probe(ToIntFunction<fixture.Outer.Inner.Item> callback) {}
+}
+"#,
+        "leaf",
+        &[("GET", 7)],
+    );
+}
+
+#[test]
 fn method_reference_edges_select_compatible_overload_lines() {
     let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
     fs::create_dir_all(&artifacts).unwrap();

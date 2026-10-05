@@ -99,6 +99,33 @@ class JavaCallerOwnerTests(unittest.TestCase):
         with patch.object(contracts, 'native_callers', return_value=set()):
             self.assertEqual(self.check_name('getValue')['verdict'], 'fail')
 
+    def test_qualified_nested_type_reference_remains_an_applicable_caller(self):
+        (self.root / 'Probe.java').write_text('import java.util.function.*;\n'
+            'class Outer {\n static class Item { int leaf() { return 1; } }\n}\n'
+            'enum Probe {\n GET(Outer.Item::leaf);\n'
+            ' Probe(ToIntFunction<Outer.Item> callback) {}\n}\n')
+        self.fixture.text_cli('rebuild', '--force')
+        self.plan()
+        def response(tool, request):
+            if tool == 'ide_call_hierarchy':
+                return {'element': {'file': 'Probe.java', 'line': 3},
+                        'calls': []}
+            self.assertEqual(tool, 'ide_find_references')
+            return {'resolvedSymbol': {'kind': 'method', 'name': 'leaf',
+                                      'file': 'Probe.java', 'line': 3},
+                    'usages': [{'file': 'Probe.java', 'line': 6, 'type': 'METHOD_REFERENCE'}],
+                    'totalIsExact': True, 'hasMore': False}
+        self.oracle.call.side_effect = response
+        result = self.check_name('leaf')
+        self.assertEqual(result['verdict'], 'pass', result['error'])
+        self.assertEqual(json.loads(result['actual_json'])['items'], [['Probe.java', 6, 'GET']])
+        self.assertEqual(self.state.execute('SELECT status FROM coverage WHERE feature=?',
+                                           (contracts.FEATURE,)).fetchone()[0], 'implemented')
+        # A qualified type is applicable even when production drops its caller.
+        from unittest.mock import patch
+        with patch.object(contracts, 'native_callers', return_value=set()):
+            self.assertEqual(self.check_name('leaf')['verdict'], 'fail')
+
 
 if __name__ == '__main__':
     unittest.main()
