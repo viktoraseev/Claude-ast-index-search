@@ -19,6 +19,43 @@ use super::Pagination;
 use crate::db;
 use crate::indexer;
 
+/// Open the induced module graph for the invocation directory.
+/// Connection-local views keep every navigation query on the same selected
+/// graph, including seed resolution, reverse edges, counts and route hops.
+fn open_module_query_db(root: &Path) -> Result<db::LeasedConnection> {
+    let conn = db::open_db_leased(root)?;
+    let cwd = std::env::current_dir()?;
+    if let Ok(relative) = cwd.strip_prefix(root) {
+        if !relative.as_os_str().is_empty() {
+            let prefix = format!("{}/", relative.to_string_lossy());
+            conn.execute_batch("CREATE TEMP TABLE selected_module_ids(id INTEGER PRIMARY KEY);")?;
+            conn.execute(
+                "INSERT INTO selected_module_ids
+                 SELECT id FROM main.modules WHERE instr(path || '/', ?1)=1",
+                params![prefix],
+            )?;
+            conn.execute_batch(
+                "CREATE TEMP VIEW modules AS
+                     SELECT m.* FROM main.modules m JOIN selected_module_ids s ON s.id=m.id;
+                 CREATE TEMP VIEW module_deps AS
+                     SELECT d.* FROM main.module_deps d
+                     JOIN temp.modules src ON src.id=d.module_id
+                     JOIN temp.modules dst ON dst.id=d.dep_module_id;",
+            )?;
+        }
+    }
+    Ok(conn)
+}
+
+/// Readiness belongs to the underlying index, independent of query scope.
+fn module_graph_is_unindexed(conn: &Connection) -> Result<bool> {
+    let has_edges: bool =
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM main.module_deps)", [], |row| {
+            row.get(0)
+        })?;
+    Ok(!has_edges && db::get_metadata_value(conn, "last_modules_indexed_at")?.is_none())
+}
+
 /// Render an empty module result without mixing status prose into JSON.
 fn print_empty_module_result(
     command: &str,
@@ -104,7 +141,7 @@ pub fn cmd_module_with_format(
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_module_query_db(root)?;
 
     let mut stmt = conn.prepare(
         "SELECT name, path FROM modules WHERE name LIKE ?1 ORDER BY name, path LIMIT ?2",
@@ -167,12 +204,10 @@ pub fn cmd_deps_with_format(root: &Path, module: &str, format: &str) -> Result<(
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_module_query_db(root)?;
 
     // Check if module deps are indexed
-    if db::count_module_deps(&conn)? == 0
-        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
-    {
+    if module_graph_is_unindexed(&conn)? {
         if format == "json" {
             return print_empty_module_result("deps", module, 0, "not_indexed");
         }
@@ -250,12 +285,10 @@ pub fn cmd_dependents_with_format(root: &Path, module: &str, format: &str) -> Re
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_module_query_db(root)?;
 
     // Check if module deps are indexed
-    if db::count_module_deps(&conn)? == 0
-        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
-    {
+    if module_graph_is_unindexed(&conn)? {
         if format == "json" {
             return print_empty_module_result("dependents", module, 0, "not_indexed");
         }
@@ -356,12 +389,10 @@ pub fn cmd_unused_deps_with_format(
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_module_query_db(root)?;
 
     // Check if module deps are indexed
-    if db::count_module_deps(&conn)? == 0
-        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
-    {
+    if module_graph_is_unindexed(&conn)? {
         if format == "json" {
             return print_empty_module_result("unused-deps", module, 0, "not_indexed");
         }
@@ -373,16 +404,17 @@ pub fn cmd_unused_deps_with_format(
     }
 
     // Get module id and path
-    let module_info: Option<(i64, String)> = conn
+    let module_info: Option<(i64, String, String)> = conn
         .query_row(
-            "SELECT id, path FROM modules WHERE name = ?1",
+            "SELECT id, path, name FROM modules WHERE name = ?1 OR path = ?1
+             ORDER BY name=?1 DESC, id LIMIT 1",
             params![module],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .ok();
 
-    let (module_id, module_path) = match module_info {
-        Some((id, p)) => (id, p),
+    let (module_id, module_path, module_name) = match module_info {
+        Some(info) => info,
         None => {
             if format == "json" {
                 return print_empty_module_result("unused-deps", module, 0, "missing_module");
@@ -699,7 +731,7 @@ pub fn cmd_unused_deps_with_format(
             });
             if verbose {
                 let consumers = if category == "exported" {
-                    exported_consumers(&conn, name, module)?
+                    exported_consumers(&conn, name, &module_name)?
                 } else {
                     Vec::new()
                 };
@@ -808,7 +840,7 @@ pub fn cmd_unused_deps_with_format(
             println!("  {} {} (api)", "⚡".yellow(), name);
             if verbose {
                 // Find consumers who use this exported dep
-                let consumers = exported_consumers(&conn, name, module)?;
+                let consumers = exported_consumers(&conn, name, &module_name)?;
                 if !consumers.is_empty() {
                     println!("    └─ used by: {}", consumers.join(", "));
                 }
@@ -883,7 +915,7 @@ fn exported_consumers(conn: &Connection, name: &str, module: &str) -> Result<Vec
 const MODULE_FILE_SCOPE: &str = "
     (?1='' OR substr(f.path,1,length(?1)+1)=?1||'/')
     AND NOT EXISTS (
-        SELECT 1 FROM modules child
+        SELECT 1 FROM main.modules child
         WHERE length(child.path)>length(?1)
           AND (?1='' OR substr(child.path,1,length(?1)+1)=?1||'/')
           AND substr(f.path,1,length(child.path)+1)=child.path||'/'
@@ -1637,12 +1669,10 @@ pub fn cmd_module_route(
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_module_query_db(root)?;
 
     // Check module_deps populated.
-    if db::count_module_deps(&conn)? == 0
-        && db::get_metadata_value(&conn, "last_modules_indexed_at")?.is_none()
-    {
+    if module_graph_is_unindexed(&conn)? {
         let msg = "Module dependencies not indexed. Run 'ast-index rebuild'.";
         if format == "json" {
             let result = ModuleRouteResult {

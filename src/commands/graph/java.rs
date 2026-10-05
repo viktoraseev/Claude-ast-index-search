@@ -1,5 +1,6 @@
 //! Conservative syntax evidence for Java graph resolution, not type inference.
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use anyhow::Result;
@@ -20,6 +21,8 @@ pub(super) enum TypeAccess {
 pub(super) struct TypeDeclaration {
     pub access: TypeAccess,
     pub static_member: bool,
+    pub local: bool,
+    pub local_scope: Option<Range<usize>>,
 }
 
 #[derive(Default)]
@@ -28,6 +31,8 @@ pub(super) struct JavaSource {
     pub imports: Vec<String>,
     pub static_imports: Vec<String>,
     declarations: HashMap<(String, i64), TypeDeclaration>,
+    declaration_ranges: HashMap<(String, i64), Option<Range<usize>>>,
+    type_positions: HashMap<(i64, String), Vec<usize>>,
     /// Reference rows carry a line and name, not a byte position. Colliding
     /// paths or value/type uses on one line remain explicit negative evidence.
     types: HashMap<(i64, String), Option<String>>,
@@ -1874,6 +1879,39 @@ impl JavaSource {
                         (qualified, name.start_position().row as i64 + 1),
                         TypeDeclaration {
                             access,
+                            local: node.parent().is_some_and(|parent| {
+                                matches!(
+                                    parent.kind(),
+                                    "block" | "constructor_body" | "switch_block_statement_group"
+                                )
+                            }),
+                            local_scope: {
+                                let mut ancestor = Some(node);
+                                let mut scope = None;
+                                while let Some(declaration) = ancestor {
+                                    if matches!(
+                                        declaration.kind(),
+                                        "class_declaration"
+                                            | "enum_declaration"
+                                            | "record_declaration"
+                                    ) {
+                                        if let Some(block) = declaration.parent().filter(|parent| {
+                                            matches!(
+                                                parent.kind(),
+                                                "block"
+                                                    | "constructor_body"
+                                                    | "switch_block_statement_group"
+                                            )
+                                        }) {
+                                            scope =
+                                                Some(declaration.start_byte()..block.end_byte());
+                                            break;
+                                        }
+                                    }
+                                    ancestor = declaration.parent();
+                                }
+                                scope
+                            },
                             static_member: member.is_some()
                                 && (has_modifier("static")
                                     || interface_member
@@ -1950,6 +1988,21 @@ impl JavaSource {
                         .is_some_and(|name| name.id() == node.id())
             });
             if declaration_name {
+                if let Some(declaration) = parent {
+                    let range = declaration.byte_range();
+                    result
+                        .declaration_ranges
+                        .entry((
+                            text(node, source).to_owned(),
+                            node.start_position().row as i64 + 1,
+                        ))
+                        .and_modify(|previous| {
+                            if previous.as_ref() != Some(&range) {
+                                *previous = None;
+                            }
+                        })
+                        .or_insert(Some(range));
+                }
                 return WalkControl::Continue;
             }
             let annotation = parent
@@ -1961,6 +2014,11 @@ impl JavaSource {
             );
             let binding = if typed {
                 type_sites.insert(key.clone());
+                result
+                    .type_positions
+                    .entry(key.clone())
+                    .or_default()
+                    .push(node.start_byte());
                 // Line ranges cannot distinguish a class header from a method
                 // signature on the same line. Keep syntax ownership for type
                 // sites, and retain collisions as unresolved rather than
@@ -2866,6 +2924,38 @@ impl JavaSource {
 
     pub fn type_declaration(&self, name: &str, line: i64) -> Option<&TypeDeclaration> {
         self.declarations.get(&(name.to_owned(), line))
+    }
+
+    /// Local names must stay inside their declaring block, including members
+    /// of local classes. Byte positions distinguish adjacent scopes on a line.
+    pub fn type_in_scope(
+        &self,
+        declaration: &TypeDeclaration,
+        owner: &str,
+        owner_line: i64,
+        reference: Option<(i64, &str)>,
+    ) -> bool {
+        let Some(scope) = &declaration.local_scope else {
+            return true;
+        };
+        let key = (owner.to_owned(), owner_line);
+        let Some(range) = self.declaration_ranges.get(&key).and_then(Option::as_ref) else {
+            return false;
+        };
+        if let Some(positions) =
+            reference.and_then(|(line, name)| self.type_positions.get(&(line, name.to_owned())))
+        {
+            let mut positions = positions
+                .iter()
+                .filter(|position| range.contains(position))
+                .peekable();
+            return positions.peek().is_some()
+                && positions.all(|position| scope.contains(position));
+        }
+        (scope.start <= range.start && range.end <= scope.end)
+            || (self.parameters.contains_key(&key)
+                && range.start <= scope.start
+                && scope.end <= range.end)
     }
 
     pub fn type_reference(&self, line: i64, name: &str) -> Option<&Option<String>> {

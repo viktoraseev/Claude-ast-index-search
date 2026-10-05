@@ -115,7 +115,7 @@ def text_observation(text, result):
         disclosure = text.strip() == f"Module '{name}' not found in index."
     else:
         disclosure = text.strip() == f"No path found (reason: {reason})."
-    return {'hops': re.findall(r'^    (\w+) → (\w+) \[([^]]+)\]$', text, re.MULTILINE),
+    return {'hops': re.findall(r'^    (.+?) → (.+?) \[([^]]+)\]$', text, re.MULTILINE),
             'lengths': [int(n) for n in re.findall(r'^  Path \d+ \((\d+) hops?\):$', text, re.MULTILINE)],
             'reason': disclosure,
             'count': int(m[1]) if (m := re.search(r'\((\d+) paths?, shortest = ', text)) else 0,

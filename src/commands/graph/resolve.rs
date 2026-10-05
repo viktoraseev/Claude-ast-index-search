@@ -1867,6 +1867,15 @@ impl Builder {
         let Some(declaration) = java.type_declaration(&symbol.qual, symbol.line) else {
             return false;
         };
+        if declaration.local_scope.is_some() {
+            let owner = &self.syms[source as usize];
+            if at_import
+                || symbol.file != source_file
+                || !java.type_in_scope(declaration, &owner.name, owner.line, None)
+            {
+                return false;
+            }
+        }
         match declaration.access {
             TypeAccess::Public => true,
             TypeAccess::Package => source_java.package == java.package,
@@ -1927,7 +1936,13 @@ impl Builder {
                 .copied()
                 .filter(|&candidate| {
                     let member = &self.syms[candidate as usize];
-                    member.container == Some(class) && is_container_kind(&member.kind)
+                    member.container == Some(class)
+                        && is_container_kind(&member.kind)
+                        && !self.files[member.file as usize]
+                            .java
+                            .as_ref()
+                            .and_then(|java| java.type_declaration(&member.qual, member.line))
+                            .is_some_and(|declaration| declaration.local)
                 })
                 .collect();
             if !declared.is_empty() {
@@ -1984,6 +1999,8 @@ impl Builder {
         qualified: &str,
         exclude: Option<u32>,
         at_import: bool,
+        allow_local: bool,
+        reference: Option<(i64, &str)>,
     ) -> Option<Vec<u32>> {
         let file = self.syms[source as usize].file;
         let mut prefix = qualified;
@@ -1996,7 +2013,28 @@ impl Builder {
                 .flatten()
                 .copied()
                 .filter(|&candidate| {
-                    is_container_kind(&self.syms[candidate as usize].kind)
+                    let member = &self.syms[candidate as usize];
+                    let local_visible = self.files[member.file as usize]
+                        .java
+                        .as_ref()
+                        .and_then(|java| {
+                            java.type_declaration(&member.qual, member.line)
+                                .map(|declaration| (java, declaration))
+                        })
+                        .is_none_or(|(java, declaration)| {
+                            (!declaration.local || allow_local && !at_import)
+                                && (declaration.local_scope.is_none()
+                                    || member.file == file
+                                        && !at_import
+                                        && java.type_in_scope(
+                                            declaration,
+                                            &self.syms[source as usize].name,
+                                            self.syms[source as usize].line,
+                                            reference,
+                                        ))
+                        });
+                    local_visible
+                        && is_container_kind(&self.syms[candidate as usize].kind)
                         && self.family_of(candidate) == "jvm"
                         && self.visible_from(file, candidate)
                 })
@@ -2043,16 +2081,27 @@ impl Builder {
         declared: &str,
         exclude: Option<u32>,
     ) -> Vec<u32> {
+        self.resolve_java_type_at(source, namespace, declared, exclude, None)
+    }
+
+    fn resolve_java_type_at(
+        &self,
+        source: u32,
+        namespace: &str,
+        declared: &str,
+        exclude: Option<u32>,
+        line: Option<i64>,
+    ) -> Vec<u32> {
         let file = self.syms[source as usize].file;
         let Some(java) = self.files[file as usize].java.as_ref() else {
             return Vec::new();
         };
         let lookup = |qualified: &str| -> Vec<u32> {
-            self.java_qualified_types(source, qualified, exclude, false)
+            self.java_qualified_types(source, qualified, exclude, false, false, None)
                 .unwrap_or_default()
         };
         let import_lookup = |qualified: &str| -> Vec<u32> {
-            self.java_qualified_types(source, qualified, exclude, true)
+            self.java_qualified_types(source, qualified, exclude, true, false, None)
                 .unwrap_or_default()
         };
         let (head, tail) = declared.split_once("::").unwrap_or((declared, ""));
@@ -2086,6 +2135,8 @@ impl Builder {
                 &join_path(namespace, &[declared]),
                 exclude,
                 false,
+                true,
+                line.map(|line| (line, head)),
             ) {
                 return classes;
             }
@@ -4019,8 +4070,13 @@ impl Builder {
             let owner = &self.syms[source as usize];
             java.constructor_call(&owner.name, owner.line, line, name)
         }) {
-            let classes =
-                self.resolve_java_type(source, self.namespace_of(source), &call.receiver, None);
+            let classes = self.resolve_java_type_at(
+                source,
+                self.namespace_of(source),
+                &call.receiver,
+                None,
+                Some(line),
+            );
             if let [class] = classes.as_slice() {
                 let mut types = classes.clone();
                 let constructors: Vec<_> = self
@@ -4091,7 +4147,13 @@ impl Builder {
             let Some(path) = binding else {
                 return Err(DropReason::QualifiedUnresolved);
             };
-            let types = self.resolve_java_type(source, self.namespace_of(source), path, None);
+            let types = self.resolve_java_type_at(
+                source,
+                self.namespace_of(source),
+                path,
+                None,
+                Some(line),
+            );
             return match types.len() {
                 0 => Err(DropReason::QualifiedUnresolved),
                 1 => Ok(Resolution::new(Confidence::Scoped, types)),
