@@ -59,6 +59,7 @@ import java_receiver_contracts
 import java_type_binding_contracts
 import java_type_access_contracts
 import java_inherited_type_contracts
+import java_parent_contracts
 import unused_dep_contracts
 import java_dependency_contracts
 import android_dependency_contracts
@@ -516,6 +517,7 @@ class Fixture:
         self._receiver_results = None
         self._type_access_results = None
         self._inherited_type_results = None
+        self._parent_results = None
         self._type_binding_results = None
         self._format_results = None
         self._file_view_results = None
@@ -1788,6 +1790,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def parent_check(self, check: sqlite3.Row):
+        if self._parent_results is None:
+            self._parent_results = java_parent_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._parent_results)
+        return {'source': java_parent_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def inherited_type_check(self, check: sqlite3.Row):
         if self._inherited_type_results is None:
             self._inherited_type_results = java_inherited_type_contracts.exercise(self.binary, self.database.parent)
@@ -1939,6 +1949,8 @@ class Fixture:
                 handler = self.android_dependency_check
             if check['feature'] in graph_contracts.FEATURES:
                 handler = self.graph_check
+            if check['feature'] in java_parent_contracts.FEATURES:
+                handler = self.parent_check
             if check['feature'] in java_inherited_type_contracts.FEATURES:
                 handler = self.inherited_type_check
             if check['feature'] in java_type_access_contracts.FEATURES:
@@ -2057,6 +2069,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(file_scope_contracts.FEATURES)
     features.update(navigation_scope_contracts.FEATURES)
     features.update(caller_scope_contracts.FEATURES)
+    features.update(java_parent_contracts.FEATURES)
     features.update(insight_scope_contracts.FEATURES | insight_scope_contracts.PENDING.keys())
     features.update(module_format_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
@@ -2205,6 +2218,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     navigation_scope_contracts.plan_scope(state, root)
     caller_scope_contracts.plan_scope(state, root)
     module_format_contracts.plan_formats(state, root)
+    java_parent_contracts.plan_parents(state, root)
     insight_scope_contracts.plan_scope(state, root)
 
 

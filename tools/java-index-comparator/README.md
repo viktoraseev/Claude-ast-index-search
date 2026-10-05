@@ -41,9 +41,13 @@ positive imports/qualified names/lexical inheritance and rejects access and
 nonstatic-import guards. Hiding and diamond identities are checked directly.
 It also checks public member exports through accessible subclasses of hidden
 owners, retaining declaring identities and rejecting direct hidden-owner access.
-This is independent source/state coverage, not MCP equivalence; member aliases
-in parent declarations, local-class shadows and attached roots remain pending
-in the broader semantic contracts.
+A separate parent-alias fixture checks qualified, static-imported and lexical
+parents through hidden enclosing owners in opposite file orders, inherited
+calls, shadowing precedence, graph pages/reverse edges and exploration callers.
+Javac accepts the positive sources and rejects the access/import guards.
+This is independent source/state coverage, not MCP equivalence; compiler-wide
+dispatch, local-class shadows and attached roots remain pending in the broader
+semantic contracts.
 
 Commands without an equivalent Index MCP operation use separately labelled
 independent source/state or internal CLI checks. Synthetic Java fixtures complement

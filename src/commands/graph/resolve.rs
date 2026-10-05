@@ -1041,6 +1041,7 @@ impl Builder {
                 }
             }
         }
+        let mut java_links = Vec::new();
         for (child, parent_name, namespace, superclass) in links {
             let path = parent_name
                 .trim()
@@ -1058,6 +1059,13 @@ impl Builder {
                     .is_some()
                     && !path.is_empty())
             {
+                continue;
+            }
+            if self.files[self.syms[child as usize].file as usize]
+                .java
+                .is_some()
+            {
+                java_links.push((child, path.to_string(), namespace));
                 continue;
             }
             let types = self.resolve_type(child, &namespace, path, Some(child));
@@ -1080,7 +1088,46 @@ impl Builder {
                 }
             }
         }
-        Ok(())
+        self.resolve_java_parents(&java_links)
+    }
+
+    /// Resolve parent aliases against complete rounds of the inheritance graph.
+    /// Recompute successful bindings too: newly inherited members can shadow a
+    /// same-package fallback or make a previously unique name ambiguous.
+    fn resolve_java_parents(&mut self, links: &[(u32, String, String)]) -> Result<()> {
+        let children: HashSet<_> = links
+            .iter()
+            .map(|(child, _, _)| self.syms[*child as usize].qual.clone())
+            .collect();
+        // Each dependency level needs at most one round plus a stability check.
+        // Keep only two edge maps, without recursive expansion or depth caps.
+        for _ in 0..=links.len() {
+            let mut next: HashMap<String, Vec<u32>> = HashMap::new();
+            for (child, path, namespace) in links {
+                let types = self.resolve_type(*child, namespace, path, Some(*child));
+                if let [parent] = types.as_slice() {
+                    let child_qual = &self.syms[*child as usize].qual;
+                    if self.syms[*parent as usize].qual != *child_qual {
+                        next.entry(child_qual.clone()).or_default().push(*parent);
+                    }
+                }
+            }
+            for parents in next.values_mut() {
+                parents.sort_unstable();
+                parents.dedup();
+            }
+            if children
+                .iter()
+                .all(|child| self.parents.get(child) == next.get(child))
+            {
+                return Ok(());
+            }
+            for child in &children {
+                self.parents.remove(child);
+            }
+            self.parents.extend(next);
+        }
+        anyhow::bail!("Java inherited parent aliases did not converge within the dependency budget")
     }
 
     /// Match Rails models to the tables of `db/schema.rb` (see

@@ -18,9 +18,9 @@ FEATURES = ({'graph:java-selection', 'graph:java-traversal', 'graph:lifecycle'} 
 REASON = ('independent source/state: disposable Java qualified graph seeds, local invocation '
           'edges, traversal caps, graph freshness, rational stationary metrics, ranked '
           'pages, shortest-path pagination and traversal/metrics/top text rendering; not MCP equivalence')
-PENDING_REASON = ('Java compiler-wide type accessibility, local-class shadows, inherited member aliases in parent declarations/hidden enclosing types, local/field/generic receiver and overload type resolution, attached-root traversal, '
+PENDING_REASON = ('Java compiler-wide type accessibility, local-class shadows, local/field/generic receiver and overload type resolution, attached-root traversal, '
                   'ambiguity budgets, ambiguous/attached-root rendering and overlapping path seeds remain unresolved; '
-                  'separate source contracts cover syntax type binding/guards, public/package/private/protected and enclosing type access, direct and inherited static type imports with public owners, lexical inherited member types/hiding/diamond identity and access guards, local invocations and explicit parameter binding/arity/guards, '
+                  'separate source contracts cover syntax type binding/guards, public/package/private/protected and enclosing type access, direct and inherited static type imports with public owners, lexical inherited member types/hiding/diamond identity and access guards, order-independent inherited parent aliases through hidden enclosing owners, local invocations and explicit parameter binding/arity/guards, '
                   'traversal pages/rendering and metrics/top; not full MCP equivalence')
 SOURCE = '''package fixture.{package};
 class Probe {{

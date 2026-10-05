@@ -126,3 +126,81 @@ fn public_subclass_exports_member_without_exposing_the_inaccessible_owner() {
     assert_eq!(negative["pagination"]["total"], 0);
     assert!(negative["items"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn inherited_member_parent_and_calls_do_not_depend_on_file_order() {
+    const SOURCES: [&str; 3] = [
+        "package fixture.base;\nclass HiddenOwner {\n public static class Member {\n  public int marker() { return 1; }\n }\n}\n",
+        "package fixture.base;\npublic class Exported extends HiddenOwner {}\n",
+        "package fixture.client;\nimport static fixture.base.Exported.Member;\nclass Child extends Member {\n int call() { return marker(); }\n}\n",
+    ];
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    for paths in [
+        ["z/HiddenOwner.java", "z/Exported.java", "a/Child.java"],
+        ["a/HiddenOwner.java", "a/Exported.java", "z/Child.java"],
+    ] {
+        let root = tempfile::tempdir_in(&artifacts).unwrap();
+        let cache = tempfile::tempdir_in(&artifacts).unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        for (relative, source) in paths.iter().zip(SOURCES) {
+            let path = root.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, source).unwrap();
+        }
+        run(root.path(), cache.path(), &["rebuild", "--force"]);
+        run(root.path(), cache.path(), &["graph", "build"]);
+        for (seed, source, source_line, source_kind, target, target_line, target_kind) in [
+            (
+                "fixture.client.Child",
+                "Child",
+                3,
+                "class",
+                "Member",
+                3,
+                "class",
+            ),
+            (
+                "fixture.client.Child.call",
+                "call",
+                4,
+                "function",
+                "marker",
+                4,
+                "function",
+            ),
+        ] {
+            let document: serde_json::Value = serde_json::from_slice(&run(
+                root.path(),
+                cache.path(),
+                &[
+                    "--format",
+                    "json",
+                    "graph",
+                    "dependencies",
+                    seed,
+                    "--limit",
+                    "100",
+                    "--include-ambiguous",
+                ],
+            ))
+            .unwrap();
+            assert_eq!(document["matched"].as_array().unwrap().len(), 1);
+            assert_eq!(document["matched"][0]["name"], source);
+            assert_eq!(document["matched"][0]["path"], paths[2]);
+            assert_eq!(document["matched"][0]["line"], source_line);
+            assert_eq!(document["matched"][0]["kind"], source_kind);
+            assert_eq!(
+                document["pagination"]["total"], 1,
+                "inherited parent/call binding depends on file order"
+            );
+            assert_eq!(document["items"].as_array().unwrap().len(), 1);
+            let edge = &document["items"][0];
+            assert_eq!(edge["other"]["name"], target);
+            assert_eq!(edge["other"]["path"], paths[0]);
+            assert_eq!(edge["other"]["line"], target_line);
+            assert_eq!(edge["other"]["kind"], target_kind);
+            assert_eq!(edge["confidence"], "scoped");
+        }
+    }
+}
