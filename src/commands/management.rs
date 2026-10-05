@@ -1712,11 +1712,7 @@ pub fn cmd_clear(root: &Path) -> Result<()> {
 
 /// Show index statistics
 pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 
@@ -2023,7 +2019,7 @@ pub fn cmd_subtree_remove(root: &Path, name: &str, format: &str) -> Result<()> {
 }
 
 pub fn cmd_subtree_list(root: &Path, format: &str) -> Result<()> {
-    if !ensure_index_exists(root) {
+    if !super::index_available(root, format)? {
         return Ok(());
     }
     let conn = db::open_db_leased(root)?;
@@ -2058,6 +2054,8 @@ pub fn cmd_subtree_list(root: &Path, format: &str) -> Result<()> {
 
 /// Execute raw SQL query against the index database (SELECT only)
 pub fn cmd_query(root: &Path, sql: &str, limit: usize) -> Result<()> {
+    // Programmatic reads must never initialize an empty index on demand.
+    super::index_available(root, "json")?;
     // Security: only allow SELECT statements
     let trimmed = sql.trim();
     let upper = trimmed.to_uppercase();
@@ -2124,13 +2122,26 @@ pub fn cmd_query(root: &Path, sql: &str, limit: usize) -> Result<()> {
 
 /// Print path to the SQLite index database
 pub fn cmd_db_path(root: &Path) -> Result<()> {
+    cmd_db_path_with_format(root, "text")
+}
+
+/// Print the selected cache path in the requested output format.
+pub fn cmd_db_path_with_format(root: &Path, format: &str) -> Result<()> {
     let db_path = db::get_db_path(root)?;
-    println!("{}", db_path.display());
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::json!({"db_path": db_path.display().to_string()})
+        );
+    } else {
+        println!("{}", db_path.display());
+    }
     Ok(())
 }
 
 /// Show database schema (tables and columns)
 pub fn cmd_schema(root: &Path) -> Result<()> {
+    super::index_available(root, "json")?;
     let conn = db::open_db_leased(root)?;
 
     let mut stmt = conn.prepare(

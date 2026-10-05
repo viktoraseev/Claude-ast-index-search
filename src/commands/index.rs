@@ -642,15 +642,7 @@ fn is_multi_term_query(query: &str) -> bool {
 
 /// Check that indexed navigation can run without contaminating JSON stdout.
 fn navigation_index_available(root: &Path, format: &str) -> Result<bool> {
-    if db::db_exists(root) {
-        return Ok(true);
-    }
-    let message = "Index not found. Run 'ast-index rebuild' first.";
-    if format == "json" {
-        anyhow::bail!(message);
-    }
-    println!("{}", message.red());
-    Ok(false)
+    super::index_available(root, format)
 }
 
 /// Find symbol by name or glob pattern

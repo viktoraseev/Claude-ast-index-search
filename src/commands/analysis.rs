@@ -36,11 +36,7 @@ pub fn cmd_unused_symbols_scoped(
     format: &str,
     scope: &SearchScope,
 ) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 

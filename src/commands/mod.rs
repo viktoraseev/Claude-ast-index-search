@@ -53,6 +53,19 @@ use crate::db;
 
 pub const PAGINATED_JSON_SCHEMA_VERSION: u8 = 2;
 
+/// Check that an indexed read can run without contaminating JSON stdout.
+pub(crate) fn index_available(root: &Path, format: &str) -> Result<bool> {
+    if db::db_exists(root) {
+        return Ok(true);
+    }
+    let message = "Index not found. Run 'ast-index rebuild' first.";
+    if format == "json" {
+        anyhow::bail!(message);
+    }
+    println!("{}", message.red());
+    Ok(false)
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct Pagination {
     pub total: usize,

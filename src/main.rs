@@ -1873,7 +1873,14 @@ fn main() -> Result<()> {
         }
         Commands::Clear => commands::management::cmd_clear(&root),
         Commands::Version => {
-            println!("ast-index v{}", env!("CARGO_PKG_VERSION"));
+            if format == "json" {
+                println!(
+                    "{}",
+                    serde_json::json!({"name": "ast-index", "version": env!("CARGO_PKG_VERSION")})
+                );
+            } else {
+                println!("ast-index v{}", env!("CARGO_PKG_VERSION"));
+            }
             Ok(())
         }
         Commands::InstallClaudePlugin => cmd_install_claude_plugin(),
@@ -1889,7 +1896,7 @@ fn main() -> Result<()> {
             json,
         } => commands::grep::cmd_ast_grep(&root, &pattern, lang.as_deref(), json),
         Commands::Query { sql, limit } => commands::management::cmd_query(&root, &sql, limit),
-        Commands::DbPath => commands::management::cmd_db_path(&root),
+        Commands::DbPath => commands::management::cmd_db_path_with_format(&root, format),
         Commands::Schema => commands::management::cmd_schema(&root),
     }
 }
