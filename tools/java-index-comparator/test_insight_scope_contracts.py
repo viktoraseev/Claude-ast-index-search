@@ -68,11 +68,13 @@ class InsightScopeTests(unittest.TestCase):
             self.fixture._insight_scope_results = None
             with patch.object(contracts, 'exercise', side_effect=ToolError('incomplete inventory')):
                 self.assertEqual(self.evaluate(feature)['verdict'], 'error')
-        for feature in ('global:scope-command-matrix', 'global:scope:java-map-module-count', 'global:format', 'graph', 'explore:semantic-resolution'):
+        for feature in ('global:scope-command-matrix', 'global:format', 'graph', 'explore:semantic-resolution'):
             self.assertEqual(self.state.execute('SELECT status FROM coverage WHERE feature=?',
                                                (feature,)).fetchone()[0], 'pending')
         with self.assertRaisesRegex(ToolError, 'inside repository'):
             contracts.exercise(self.fixture.binary, Path('/private/tmp'))
+        with self.assertRaisesRegex(ToolError, 'inside repository'):
+            contracts.exercise_module_counts(self.fixture.binary, Path('/private/tmp'))
 
     def test_incomplete_full_inventory_is_error_not_inapplicable(self):
         inventory = contracts.mobile_contracts.inventory
@@ -119,6 +121,20 @@ class InsightScopeTests(unittest.TestCase):
         self.assertEqual(state.execute("SELECT verdict FROM checks WHERE id='0'").fetchone()[0], 'fail')
         self.assertEqual(state.execute('SELECT count(*) FROM oracle_pages').fetchone()[0], 0)
         self.assertIn('not MCP equivalence', state.execute("SELECT reason FROM coverage WHERE feature='map'").fetchone()[0])
+
+    def test_module_count_family_matches_authored_declarations(self):
+        expected, actual = contracts.exercise_module_counts(self.fixture.binary, self.directory)
+        mismatches = [key for key in expected if canonical_json(expected[key]) != canonical_json(actual.get(key))]
+        self.assertEqual(mismatches, [], {'mismatch_count': len(mismatches), 'samples': mismatches[:10]})
+
+    def test_module_inventory_cannot_hide_an_applicable_build_descriptor(self):
+        inventory = contracts.mobile_contracts.inventory
+        def incomplete(state, root):
+            inventory(state, root)
+            state.execute("DELETE FROM file_inventory WHERE path='pom.xml' OR path LIKE '%/pom.xml'")
+        with patch.object(contracts.mobile_contracts, 'inventory', side_effect=incomplete):
+            with self.assertRaisesRegex(ToolError, 'inventory incomplete'):
+                contracts.exercise_module_counts(self.fixture.binary, self.directory)
 
     def test_fixture_changes_invalidate_evidence(self):
         before = adapter_digest()

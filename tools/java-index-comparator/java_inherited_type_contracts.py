@@ -1,6 +1,6 @@
 """Inherited Java member types on authored sources, not MCP equivalence.
 
-Public declaring/qualifying owners, inheritance paths, hiding, diamond identity,
+Accessible qualifying owners, inheritance paths, hiding, diamond identity,
 and import access guards are bounded contracts, not compiler-wide resolution.
 """
 from pathlib import Path
@@ -15,7 +15,7 @@ from java_type_access_contracts import page_observation
 FEATURES = {'graph:java-inherited-types', 'graph:java-inherited-static-type-imports',
             'explore:java-inherited-types'}
 REASON = ('independent source/state: disposable Java inherited member types, qualified/lexical '
-          'names, explicit/on-demand static imports, hiding, diamond identity and access guards; '
+          'names, explicit/on-demand static imports, hidden declaring owners, hiding, diamond identity and access guards; '
           'graph pages/reverse traversal and exploration; not MCP equivalence or compiler-wide binding')
 SOURCES = {
     'base/Base.java': '''package fixture.base;
@@ -97,9 +97,60 @@ class Mixed implements fixture.diamond.Left, Other {
     Shared ambiguous(Shared input) { return input; }
 }
 ''',
+    'export/HiddenOwner.java': '''package fixture.export;
+class HiddenOwner {
+    public static class Member { public static class Deep {} }
+    private static class Private {}
+    protected static class Protected {}
+    public class Instance {}
 }
-NEGATIVE_DIRS = ('guard/', 'nonstatic/', 'ambiguous/')
+''',
+    'export/Exported.java': '''package fixture.export;
+public class Exported extends HiddenOwner {
+    Member lexicalExport(Member input) { return input; }
+}
+''',
+    'exportclient/Client.java': '''package fixture.exportclient;
+import static fixture.export.Exported.Member;
+class Client {
+    Member exportedImport(Member input) { return input; }
+    Member.Deep exportedTail(Member.Deep input) { return input; }
+    fixture.export.Exported.Member qualifiedExport(fixture.export.Exported.Member input) { return input; }
+}
+''',
+    'exportwild/Client.java': '''package fixture.exportwild;
+import static fixture.export.Exported.*;
+class Client {
+    Member wildcardExport(Member input) { return input; }
+}
+''',
+    'exportnormal/Client.java': '''package fixture.exportnormal;
+import fixture.export.Exported.Member;
+class Client extends fixture.export.Exported {
+    Member normalExport(Member input) { return input; }
+}
+''',
+    'exportguard/Client.java': '''package fixture.exportguard;
+class Client {
+    fixture.export.HiddenOwner.Member hiddenOwner(fixture.export.HiddenOwner.Member input) { return input; }
+    fixture.export.Exported.Private privateExport(fixture.export.Exported.Private input) { return input; }
+}
+''',
+    'exportprotected/Child.java': '''package fixture.exportprotected;
+import static fixture.export.Exported.Protected;
+class Child extends fixture.export.Exported {
+    Protected protectedImport(Protected input) { return input; }
+}
+''',
+    'exportnonstatic/Client.java': '''package fixture.exportnonstatic;
+import static fixture.export.Exported.Instance;
+class Client { Instance invalidExport(Instance input) { return input; } }
+''',
+}
+NEGATIVE_DIRS = ('guard/', 'nonstatic/', 'ambiguous/', 'exportguard/', 'exportprotected/',
+                 'exportnonstatic/', 'exportnormal/')
 MEMBER = ('base/Base.java', 3, 'Member')
+EXPORTED_MEMBER = ('export/HiddenOwner.java', 3, 'Member')
 BINDINGS = {
     'fixture.child.Child.lexical': [MEMBER],
     'fixture.child.Child.protectedLexical': [('base/Base.java', 5, 'Protected')],
@@ -115,6 +166,16 @@ BINDINGS = {
     'fixture.guard.Client.packageGuard': [('child/Grand.java', 2, 'Grand')],
     'fixture.guard.Client.protectedGuard': [('child/Grand.java', 2, 'Grand')],
     'fixture.nonstatic.Client.invalid': [],
+    'fixture.export.Exported.lexicalExport': [EXPORTED_MEMBER],
+    'fixture.exportclient.Client.exportedImport': [EXPORTED_MEMBER],
+    'fixture.exportclient.Client.exportedTail': [EXPORTED_MEMBER, ('export/HiddenOwner.java', 3, 'Deep')],
+    'fixture.exportclient.Client.qualifiedExport': [('export/Exported.java', 2, 'Exported'), EXPORTED_MEMBER],
+    'fixture.exportwild.Client.wildcardExport': [EXPORTED_MEMBER],
+    'fixture.exportnormal.Client.normalExport': [],
+    'fixture.exportguard.Client.hiddenOwner': [],
+    'fixture.exportguard.Client.privateExport': [('export/Exported.java', 2, 'Exported')],
+    'fixture.exportprotected.Child.protectedImport': [],
+    'fixture.exportnonstatic.Client.invalidExport': [],
 }
 QUALIFIERS = {MEMBER: 'fixture.base.Base.Member',
               ('base/Base.java', 3, 'Deep'): 'fixture.base.Base.Member.Deep',
@@ -125,6 +186,9 @@ QUALIFIERS = {MEMBER: 'fixture.base.Base.Member',
               ('child/Grand.java', 2, 'Grand'): 'fixture.child.Grand',
               ('hiding/Hiding.java', 2, 'Hiding'): 'fixture.hiding.Hiding'}
 QUALIFIERS[('base/Base.java', 8, 'MAX_VALUE')] = 'fixture.base.Base.MAX_VALUE'
+QUALIFIERS.update({EXPORTED_MEMBER: 'fixture.export.HiddenOwner.Member',
+                   ('export/HiddenOwner.java', 3, 'Deep'): 'fixture.export.HiddenOwner.Member.Deep',
+                   ('export/Exported.java', 2, 'Exported'): 'fixture.export.Exported'})
 
 
 def plan_types(state, root):
@@ -171,7 +235,8 @@ def exercise(binary, base):
     runner.json('graph', 'build')
     for seed, targets in BINDINGS.items():
         feature = ('graph:java-inherited-static-type-imports' if seed.split('.')[1] in
-                   {'client', 'wild', 'namespace', 'guard', 'nonstatic'} else 'graph:java-inherited-types')
+                   {'client', 'wild', 'namespace', 'guard', 'nonstatic', 'exportclient', 'exportwild',
+                    'exportnormal', 'exportprotected', 'exportnonstatic'} else 'graph:java-inherited-types')
         for cap in (0, 1, 100):
             doc = runner.json('graph', 'dependencies', seed, '--limit', cap, '--include-ambiguous')
             record(feature, f'{seed}:{cap}',
@@ -197,10 +262,13 @@ def exercise(binary, base):
     # caller and invalid-source guards; do not claim an exhaustive ranking oracle.
     doc = runner.json('explore', 'Deep', '--rwr', '--max-files', 100)
     callers = [(r['path'], r['line'], r['name']) for r in doc['neighbours'] if r['link'] == 'caller']
-    wanted = [(p, i, seed) for seed, targets in BINDINGS.items() if ('base/Base.java', 3, 'Deep') in targets
+    deep_targets = {('base/Base.java', 3, 'Deep'), ('export/HiddenOwner.java', 3, 'Deep')}
+    wanted = [(p, i, seed) for seed, targets in BINDINGS.items() if deep_targets.intersection(targets)
               for p, text in SOURCES.items() for i, line in enumerate(text.splitlines(), 1)
               if f" {seed.rsplit('.', 1)[-1]}(" in line]
-    guards = {seed for seed in BINDINGS if seed.startswith(('fixture.guard.', 'fixture.nonstatic.'))}
+    guards = {seed for seed in BINDINGS if seed.startswith(('fixture.guard.', 'fixture.nonstatic.',
+                                                          'fixture.exportguard.', 'fixture.exportprotected.',
+                                                          'fixture.exportnonstatic.'))}
     record('explore:java-inherited-types', 'callers',
            {'required': sorted(wanted), 'guards': [], 'duplicates': False},
            {'required': sorted(row for row in callers if row in wanted),

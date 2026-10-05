@@ -8,15 +8,14 @@ from common import ToolError, connect, stable_id
 import mobile_contracts
 from root_contracts import Runner
 
-FEATURES = {'global:scope:java-map', 'global:scope:java-conventions'}
+MODULE_COUNT = 'global:scope:java-map-module-count'
+FEATURES = {'global:scope:java-map', 'global:scope:java-conventions', MODULE_COUNT}
 REASON = ('independent source/state: disposable Java insight directory/root/module intersections, '
           'colliding root identities, aggregate counts, ordered limits and text/JSON rendering; '
-          'not MCP equivalence; module_count remains whole-index metadata')
-PENDING = {'global:scope:java-map-module-count':
-           'Module counts in map still describe the whole index; attached-root module ownership '
-           'and module counts under directory selectors remain unresolved'}
+          'indexed module directory/root counts and text/JSON headers; not MCP equivalence')
+PENDING = {}
 GAP = ('Java file views, navigation, caller/call-tree and map/conventions directory/root '
-       'selectors have separate executed contracts; module/map module-count/analysis/graph/explore scope remains unresolved')
+       'selectors have separate executed contracts; module/analysis/graph/explore scope remains unresolved')
 
 
 def plan_scope(state, root):
@@ -34,12 +33,17 @@ def plan_scope(state, root):
                       (GAP,))
 
 
-def exercise(binary, base):
+def fixture_base(base):
     boundary = Path(__file__).resolve().parents[2] / '.artifacts'
     base = Path(base).resolve()
     if not base.is_relative_to(boundary.resolve()):
         raise ToolError('insight scope fixtures must stay inside repository .artifacts')
     base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def exercise(binary, base):
+    base = fixture_base(base)
     directory = Path(tempfile.mkdtemp(prefix='insight-scope-', dir=base)).resolve()
     runner = Runner(binary, directory)
     runner.environment['AST_INDEX_ROOT'] = str(runner.root)
@@ -175,4 +179,90 @@ def exercise(binary, base):
         if want['naming_patterns']:
             want_text += 'Naming Patterns:\n' + ''.join(f"  {hit['suffix']:20} {hit['count']}\n" for hit in want['naming_patterns']) + '\n'
         record('global:scope:java-conventions', label + ':text', want_text, text)
+    module_expected, module_actual = exercise_module_counts(binary, base)
+    expected[MODULE_COUNT].update(module_expected)
+    actual[MODULE_COUNT].update(module_actual)
+    return expected, actual
+
+
+def exercise_module_counts(binary, base):
+    """Header totals count indexed module locations in the cwd/root scope.
+
+    Like file_count, this context total is independent of the detailed --module
+    display selector and page limits. Empty declared modules still count; a cwd
+    below a module directory does not include that ancestor declaration.
+    """
+    base = fixture_base(base)
+    directory = Path(tempfile.mkdtemp(prefix='map-module-count-', dir=base)).resolve()
+    runner = Runner(binary, directory)
+    runner.environment['AST_INDEX_ROOT'] = str(runner.root)
+    modules = {
+        'project': ['', 'scope_', 'scope_/child', 'scope_/empty', 'scopeX', 'scope%', 'CAPS'],
+        'attached': ['', 'scope_', 'scope_/child', 'scope%'],
+    }
+    for owner, paths in modules.items():
+        for index, path in enumerate(paths):
+            folder = directory / owner / path
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'pom.xml').write_text(
+                '<project><modelVersion>4.0.0</modelVersion><groupId>fixture</groupId>'
+                f'<artifactId>{owner}{index}</artifactId><version>1</version></project>\n')
+            if path != 'scope_/empty':
+                (folder / 'Main.java').write_text(f'class Probe{index} {{}}\n')
+        (directory / owner / 'Inventory.kt').write_text('// inventory only\n')
+        (directory / owner / 'descriptor.xml').write_text('<fixture/>\n')
+    (runner.root / '.git').mkdir()
+    (runner.root / 'unowned').mkdir()
+    (runner.root / 'scope_' / 'src').mkdir()
+    # Inventory every type, including foreign sources and build descriptors.
+    expected, actual = {}, {}
+    for owner, paths in modules.items():
+        state = connect(directory / (owner + '-inventory.sqlite'))
+        try:
+            state.executescript('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);' + mobile_contracts.SCHEMA)
+            mobile_contracts.inventory(state, directory / owner)
+            observed = dict(state.execute("SELECT extension,count(*) FROM file_inventory WHERE kind='file' GROUP BY extension"))
+            want = {'.java': len(paths) - ('scope_/empty' in paths), '.kt': 1, '.xml': len(paths) + 1}
+            expected['full-inventory:' + owner], actual['full-inventory:' + owner] = want, observed
+            if observed != want:
+                raise ToolError('module count fixture full inventory incomplete')
+        finally:
+            state.close()
+    runner.command('rebuild', '--force', '--max-files', '0')
+    runner.command('subtree', 'add', 'attached-label', '../attached')
+    runner.command('rebuild', '--force', '--max-files', '0')
+    scopes = [('all', [], {'project', 'attached'}, ''),
+              ('local', ['--local'], {'project'}, ''),
+              ('attached', ['--subtree', 'attached-label'], {'attached'}, ''),
+              ('unknown-root', ['--subtree', 'absent'], set(), ''),
+              ('underscore', [], {'project', 'attached'}, 'scope_/'),
+              ('local-underscore', ['--local'], {'project'}, 'scope_/'),
+              ('attached-underscore', ['--subtree', 'attached-label'], {'attached'}, 'scope_/'),
+              ('percent', [], {'project', 'attached'}, 'scope%/'),
+              ('case', [], {'project', 'attached'}, 'CAPS/'),
+              ('empty-module', [], {'project', 'attached'}, 'scope_/empty/'),
+              ('below-module', [], {'project', 'attached'}, 'scope_/src/'),
+              ('unowned', [], {'project', 'attached'}, 'unowned/')]
+    for label, flags, owners, prefix in scopes:
+        count = sum(not prefix or (path + '/').startswith(prefix)
+                    for owner in owners for path in modules[owner])
+        for display in (None, '', 'scope_/', 'missing/'):
+            for limit in (0, 1, 100):
+                args = [*flags, 'map', '--limit', str(limit)]
+                if display is not None:
+                    args += ['--module', display, '--per-dir', str(limit)]
+                key = f'{label}:{display}:{limit}'
+                output = runner.json(*args, cwd=runner.root / prefix)
+                _, text = runner.command(*args, cwd=runner.root / prefix)
+                header = re.search(r'(\d+) files \| (\d+) modules', text)
+                expected[key] = {'json': count, 'text': count, 'ansi': False}
+                actual[key] = {'json': output.get('module_count'),
+                               'text': int(header[2]) if header else None, 'ansi': '\x1b' in text}
+    # A modules-only refresh must preserve the same ownership interpretation.
+    runner.command('rebuild', '--type', 'modules')
+    for label, flags, owners in (('all', [], {'project', 'attached'}),
+                                ('local', ['--local'], {'project'}),
+                                ('attached', ['--subtree', 'attached-label'], {'attached'})):
+        expected['refresh-' + label] = sum(len(modules[owner]) for owner in owners)
+        actual['refresh-' + label] = runner.json(*flags, 'map')['module_count']
     return expected, actual

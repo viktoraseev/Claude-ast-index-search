@@ -820,7 +820,20 @@ pub fn cmd_rebuild(
             conn.execute("DELETE FROM module_deps", [])?;
             // Sync instead of delete-and-reinsert: resources, XML/storyboard
             // usages and assets reference modules by id with ON DELETE CASCADE.
-            let module_files = indexer::collect_module_files(root);
+            let mut module_files = indexer::collect_module_files(root);
+            // Match a full rebuild's registered-root inventory. Otherwise a
+            // modules-only refresh deletes every attached module as stale.
+            for extra in db::get_extra_roots(&conn)? {
+                let extra_path = std::path::PathBuf::from(extra);
+                let extra_root = if extra_path.is_absolute() {
+                    extra_path
+                } else {
+                    root.join(extra_path)
+                };
+                module_files.extend(indexer::collect_module_files(&extra_root));
+            }
+            module_files.sort_unstable();
+            module_files.dedup();
             let module_count = indexer::sync_modules_from_files(&conn, root, &module_files)?;
             db::set_build_files_fingerprint(
                 &conn,

@@ -39,9 +39,11 @@ The inherited Java member-type fixture executes graph dependency pages, reverse
 traversal and RWR exploration against compact authored sources. Javac validates
 positive imports/qualified names/lexical inheritance and rejects access and
 nonstatic-import guards. Hiding and diamond identities are checked directly.
-This is independent source/state coverage, not MCP equivalence; hidden enclosing
-owners, member aliases in parent declarations, local-class shadows and attached
-roots remain pending in the broader semantic contracts.
+It also checks public member exports through accessible subclasses of hidden
+owners, retaining declaring identities and rejecting direct hidden-owner access.
+This is independent source/state coverage, not MCP equivalence; member aliases
+in parent declarations, local-class shadows and attached roots remain pending
+in the broader semantic contracts.
 
 Commands without an equivalent Index MCP operation use separately labelled
 independent source/state or internal CLI checks. Synthetic Java fixtures complement

@@ -1806,38 +1806,44 @@ impl Builder {
         false
     }
 
-    /// A public member type is still inaccessible through a hidden enclosing
-    /// type. Private access belongs to the top-level nest, not the whole file.
-    fn java_type_accessible(&self, source: u32, mut candidate: u32, at_import: bool) -> bool {
+    /// Member access is independent of the declaring owner's accessibility
+    /// when the name is inherited through an accessible qualifying type.
+    fn java_member_type_accessible(&self, source: u32, candidate: u32, at_import: bool) -> bool {
         let source_file = self.syms[source as usize].file;
         let Some(source_java) = self.files[source_file as usize].java.as_ref() else {
             return true;
         };
-        loop {
-            let symbol = &self.syms[candidate as usize];
-            if let Some(java) = self.files[symbol.file as usize].java.as_ref() {
-                let Some(declaration) = java.type_declaration(&symbol.qual, symbol.line) else {
-                    return false;
-                };
-                let allowed = match declaration.access {
-                    TypeAccess::Public => true,
-                    TypeAccess::Package => source_java.package == java.package,
-                    TypeAccess::Private => {
-                        !at_import && self.java_nest_host(source) == self.java_nest_host(candidate)
-                    }
-                    TypeAccess::Protected => {
-                        source_java.package == java.package
-                            || !at_import
-                                && symbol
-                                    .container
-                                    .is_some_and(|owner| self.java_subclass_of(source, owner))
-                    }
-                };
-                if !allowed {
-                    return false;
-                }
+        let symbol = &self.syms[candidate as usize];
+        let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
+            return true;
+        };
+        let Some(declaration) = java.type_declaration(&symbol.qual, symbol.line) else {
+            return false;
+        };
+        match declaration.access {
+            TypeAccess::Public => true,
+            TypeAccess::Package => source_java.package == java.package,
+            TypeAccess::Private => {
+                !at_import && self.java_nest_host(source) == self.java_nest_host(candidate)
             }
-            match symbol.container {
+            TypeAccess::Protected => {
+                source_java.package == java.package
+                    || !at_import
+                        && symbol
+                            .container
+                            .is_some_and(|owner| self.java_subclass_of(source, owner))
+            }
+        }
+    }
+
+    /// Direct names require every enclosing owner to be accessible. Private
+    /// access belongs to the top-level nest, not the whole file.
+    fn java_type_accessible(&self, source: u32, mut candidate: u32, at_import: bool) -> bool {
+        loop {
+            if !self.java_member_type_accessible(source, candidate, at_import) {
+                return false;
+            }
+            match self.syms[candidate as usize].container {
                 Some(container) => candidate = container,
                 None => return true,
             }
@@ -1930,6 +1936,7 @@ impl Builder {
         source: u32,
         qualified: &str,
         exclude: Option<u32>,
+        at_import: bool,
     ) -> Option<Vec<u32>> {
         let file = self.syms[source as usize].file;
         let mut prefix = qualified;
@@ -1949,7 +1956,8 @@ impl Builder {
                 .collect();
             if !declared.is_empty() {
                 let mut classes = declared;
-                classes.retain(|&candidate| self.java_type_accessible(source, candidate, false));
+                classes
+                    .retain(|&candidate| self.java_type_accessible(source, candidate, at_import));
                 if classes.is_empty() {
                     return Some(classes);
                 }
@@ -1961,16 +1969,14 @@ impl Builder {
                     if classes.is_empty() {
                         return None;
                     }
-                    classes
-                        .retain(|&candidate| self.java_type_accessible(source, candidate, false));
+                    classes.retain(|&candidate| {
+                        self.java_member_type_accessible(source, candidate, at_import)
+                    });
                     if classes.is_empty() {
                         return Some(classes);
                     }
                 }
-                classes.retain(|&candidate| {
-                    Some(candidate) != exclude
-                        && self.java_type_accessible(source, candidate, false)
-                });
+                classes.retain(|&candidate| Some(candidate) != exclude);
                 classes.sort_unstable();
                 classes.dedup();
                 return Some(classes);
@@ -1995,31 +2001,45 @@ impl Builder {
             return Vec::new();
         };
         let lookup = |qualified: &str| -> Vec<u32> {
-            self.java_qualified_types(source, qualified, exclude)
+            self.java_qualified_types(source, qualified, exclude, false)
+                .unwrap_or_default()
+        };
+        let import_lookup = |qualified: &str| -> Vec<u32> {
+            self.java_qualified_types(source, qualified, exclude, true)
                 .unwrap_or_default()
         };
         let (head, tail) = declared.split_once("::").unwrap_or((declared, ""));
-        // A known rejected type import must not become a valid edge through
-        // lexical inheritance. An external import may instead name a method
-        // or field, so absence alone cannot invalidate a lexical type.
-        for binding in &java.static_imports {
-            let types = lookup(binding);
-            if binding.rsplit("::").next() == Some(head)
-                && !types.is_empty()
-                && !types.iter().any(|&class| {
-                    self.java_static_type(class) && self.java_type_accessible(source, class, true)
-                })
-            {
-                return Vec::new();
+        // A rejected type import must not regain an edge through lexical
+        // inheritance. An unknown static import can instead name a method or
+        // field, so absence alone cannot invalidate a lexical type.
+        for (imports, static_only) in [(&java.imports, false), (&java.static_imports, true)] {
+            for binding in imports {
+                if binding.rsplit("::").next() != Some(head) {
+                    continue;
+                }
+                if !lookup(binding).is_empty()
+                    && !import_lookup(binding).iter().any(|&class| {
+                        if static_only {
+                            self.java_static_type(class)
+                        } else {
+                            self.syms[class as usize].qual == *binding
+                        }
+                    })
+                {
+                    return Vec::new();
+                }
             }
         }
         // Enclosing/nested types shadow imports. Do not broaden named-package
         // lookup into inaccessible classes in the default package.
         let mut namespace = namespace;
         while namespace != java.package {
-            if let Some(classes) =
-                self.java_qualified_types(source, &join_path(namespace, &[declared]), exclude)
-            {
+            if let Some(classes) = self.java_qualified_types(
+                source,
+                &join_path(namespace, &[declared]),
+                exclude,
+                false,
+            ) {
                 return classes;
             }
             let Some((parent, _)) = namespace.rsplit_once("::") else {
@@ -2037,7 +2057,14 @@ impl Builder {
                 } else {
                     join_path(binding, &[tail])
                 };
-                imported.extend(lookup(&qualified));
+                // A single-type import requires a canonical name, unlike
+                // a static import, which can name an inherited member alias.
+                if import_lookup(binding)
+                    .iter()
+                    .any(|&class| self.syms[class as usize].qual == *binding)
+                {
+                    imported.extend(lookup(&qualified));
+                }
             }
         }
         for binding in &java.static_imports {
@@ -2045,14 +2072,14 @@ impl Builder {
                 explicit_import = true;
                 // An explicit external/invalid static import still reserves
                 // its simple name; never fall back to a same-package class.
-                for class in lookup(binding).into_iter().filter(|&class| {
-                    self.java_static_type(class) && self.java_type_accessible(source, class, true)
-                }) {
+                for class in import_lookup(binding)
+                    .into_iter()
+                    .filter(|&class| self.java_static_type(class))
+                {
                     if tail.is_empty() {
                         imported.push(class);
                     } else {
-                        imported
-                            .extend(lookup(&join_path(&self.syms[class as usize].qual, &[tail])));
+                        imported.extend(lookup(&join_path(binding, &[tail])));
                     }
                 }
             }
@@ -2077,23 +2104,23 @@ impl Builder {
         let mut on_demand = lookup(&join_path("java::lang", &[declared]));
         for binding in &java.imports {
             if let Some(package) = binding.strip_suffix("::*") {
-                on_demand.extend(lookup(&join_path(package, &[declared])));
+                let binding = join_path(package, &[head]);
+                if !import_lookup(&binding).is_empty() {
+                    on_demand.extend(lookup(&join_path(package, &[declared])));
+                }
             }
         }
         for binding in &java.static_imports {
             if let Some(owner) = binding.strip_suffix("::*") {
-                for class in lookup(&join_path(owner, &[head]))
+                let binding = join_path(owner, &[head]);
+                for class in import_lookup(&binding)
                     .into_iter()
-                    .filter(|&class| {
-                        self.java_static_type(class)
-                            && self.java_type_accessible(source, class, true)
-                    })
+                    .filter(|&class| self.java_static_type(class))
                 {
                     if tail.is_empty() {
                         on_demand.push(class);
                     } else {
-                        on_demand
-                            .extend(lookup(&join_path(&self.syms[class as usize].qual, &[tail])));
+                        on_demand.extend(lookup(&join_path(&binding, &[tail])));
                     }
                 }
             }

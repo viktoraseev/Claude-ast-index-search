@@ -141,9 +141,8 @@ pub fn cmd_map_scoped(
         stats.file_count += 1;
         Ok(())
     })?;
-    // Modules and project labels describe the whole index; modules do not
-    // carry attached-root ownership. Keep that metadata distinct from files.
     let resolver = super::PathResolver::try_from_conn(root, &conn)?;
+    stats.module_count = count_map_modules(&conn, root, scope, &resolver)?;
 
     let depth = if stats.file_count > 5000 { 3 } else { 2 };
 
@@ -175,6 +174,39 @@ pub fn cmd_map_scoped(
     }
 
     Ok(())
+}
+
+/// Count module declarations in the header's directory/root context, before
+/// the detailed display selector or page limits. Attached module paths are
+/// absolute; primary paths are relative. Never infer ownership by probing a
+/// same-named directory in another root or by the module's display name.
+fn count_map_modules(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    scope: &db::SearchScope,
+    resolver: &super::PathResolver,
+) -> Result<i64> {
+    let primary = std::path::PathBuf::from(db::normalize_root_for_storage(root));
+    let mut stmt = conn.prepare("SELECT path FROM modules")?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        let stored: String = row.get(0)?;
+        let absolute = primary.join(stored);
+        if let Some(relative) = resolver.scoped_relative_path(&absolute) {
+            // A directory selector ending in '/' must include a declaration
+            // at that directory, while retaining literal case and wildcards.
+            let directory = if relative.is_empty() {
+                relative
+            } else {
+                format!("{}/", relative.trim_end_matches('/'))
+            };
+            if scope.matches_path(&directory) {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// `Project: <label> | ` for the header of `map`, empty for an index built
