@@ -544,15 +544,50 @@ pub(crate) fn resolved_dependents_of_filtered(
     resolved_dependents_filtered(conn, seeds, limit, false, keep)
 }
 
-/// Call trees include recursive calls; neighbour expansion deliberately does
-/// not. Keep the difference explicit rather than changing every graph consumer.
+/// Expand Java call-tree declarations by id, including recursive calls.
+/// A name query can union overloads, but deeper expansion keeps the exact id.
 pub(crate) fn resolved_callers_of_filtered(
     conn: &Connection,
-    seeds: &[db::SearchResult],
+    seeds: &[GraphSymbolInfo],
     limit: usize,
     keep: impl Fn(&GraphSymbolInfo) -> bool,
-) -> Result<Option<Vec<Vec<db::SearchResult>>>> {
-    resolved_dependents_filtered(conn, seeds, limit, true, keep)
+) -> Result<Vec<GraphSymbolInfo>> {
+    let ids: Vec<i64> = seeds.iter().map(|seed| seed.id).collect();
+    let edges = db::load_symbol_edges_to(conn, &ids, Confidence::Ambiguous.code())?;
+    let mut union_groups: HashMap<(i64, i64, u32), usize> = HashMap::new();
+    for edge in &edges {
+        if edge.confidence == Confidence::Ambiguous.code() {
+            *union_groups
+                .entry((edge.source_id, edge.line, edge.candidates))
+                .or_default() += 1;
+        }
+    }
+    // An ambiguous call belongs to a name query only if every candidate is
+    // selected. It cannot establish a caller of one particular overload.
+    let sources: HashSet<i64> = edges
+        .iter()
+        .filter(|edge| {
+            edge.confidence != Confidence::Ambiguous.code()
+                || union_groups.get(&(edge.source_id, edge.line, edge.candidates))
+                    == Some(&(edge.candidates as usize))
+        })
+        .map(|edge| edge.source_id)
+        .collect();
+    let mut callers: Vec<GraphSymbolInfo> = infos_for(conn, &sources)?
+        .into_values()
+        .filter(keep)
+        .collect();
+    callers.sort_by(|a, b| {
+        (&a.path, a.line, &a.root_path, &a.name, a.id).cmp(&(
+            &b.path,
+            b.line,
+            &b.root_path,
+            &b.name,
+            b.id,
+        ))
+    });
+    callers.truncate(limit);
+    Ok(callers)
 }
 
 fn resolved_dependents_filtered(

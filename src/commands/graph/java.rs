@@ -32,6 +32,7 @@ pub(super) enum InvocationArgument {
 }
 
 type InvocationArguments = Vec<Option<InvocationArgument>>;
+type InvocationSignature = (Vec<Option<String>>, bool);
 
 #[derive(Default)]
 pub(super) struct JavaSource {
@@ -74,6 +75,8 @@ pub(super) struct JavaSource {
     creation_types: HashMap<(String, i64, i64, String), Vec<Option<String>>>,
     invocation_types: HashMap<(String, i64, i64, String), Option<InvocationArguments>>,
     invocation_parameters: HashMap<(String, i64), Vec<Option<String>>>,
+    /// Declaration order distinguishes overloads with the same name and line.
+    invocation_signatures: HashMap<(String, i64), Vec<InvocationSignature>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -2750,14 +2753,19 @@ impl JavaSource {
                         result.static_methods.insert(key.clone());
                     }
                     let mut cursor = parameters.walk();
-                    result.invocation_parameters.insert(
-                        key.clone(),
-                        parameters
-                            .named_children(&mut cursor)
-                            .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
-                            .map(|p| declared_invocation_type(parameter_type(p)?, p, source))
-                            .collect(),
-                    );
+                    let invocation_parameters: Vec<Option<String>> = parameters
+                        .named_children(&mut cursor)
+                        .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
+                        .map(|p| declared_invocation_type(parameter_type(p)?, p, source))
+                        .collect();
+                    result
+                        .invocation_signatures
+                        .entry(key.clone())
+                        .or_default()
+                        .push((invocation_parameters.clone(), variadic));
+                    result
+                        .invocation_parameters
+                        .insert(key.clone(), invocation_parameters);
                     let mut cursor = parameters.walk();
                     result.reference_parameters.insert(
                         key.clone(),
@@ -3453,6 +3461,26 @@ impl JavaSource {
             })
     }
 
+    pub fn accepts_arguments_at(
+        &self,
+        name: &str,
+        line: i64,
+        ordinal: usize,
+        arguments: usize,
+    ) -> bool {
+        if !self
+            .invocation_signatures
+            .contains_key(&(name.to_owned(), line))
+        {
+            return self.accepts_arguments(name, line, arguments);
+        }
+        self.invocation_signature_at(name, line, ordinal)
+            .is_some_and(|(parameters, variadic)| {
+                arguments == parameters.len()
+                    || (variadic && arguments >= parameters.len().saturating_sub(1))
+            })
+    }
+
     pub fn invocation_arguments(
         &self,
         owner: &str,
@@ -3480,6 +3508,19 @@ impl JavaSource {
             self.invocation_parameters.get(&(name.to_owned(), line))?,
             *variadic,
         ))
+    }
+
+    pub fn invocation_signature_at(
+        &self,
+        name: &str,
+        line: i64,
+        ordinal: usize,
+    ) -> Option<(&[Option<String>], bool)> {
+        let Some(signatures) = self.invocation_signatures.get(&(name.to_owned(), line)) else {
+            return self.invocation_signature(name, line);
+        };
+        let (parameters, variadic) = signatures.get(ordinal)?;
+        Some((parameters, *variadic))
     }
 
     #[cfg(test)]

@@ -1838,12 +1838,16 @@ fn main() -> Result<()> {
             module,
             export_only,
             limit,
-        } => commands::analysis::cmd_unused_symbols(
+        } => commands::analysis::cmd_unused_symbols_scoped(
             &root,
             module.as_deref(),
             export_only,
             limit,
             format,
+            &db::SearchScope {
+                dir_prefix: dir_prefix_ref,
+                ..db::SearchScope::none()
+            },
         ),
         Commands::AddRoot { path, force } => {
             commands::management::cmd_add_root(&root, &path, force)

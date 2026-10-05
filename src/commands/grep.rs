@@ -498,14 +498,14 @@ pub fn cmd_call_tree(
             function_name,
             max_depth,
             &callers,
-            &mut |depth, (caller, path, line), node| {
+            &mut |depth, site, node| {
                 let status = match node {
                     TreeNode::Shown => "shown",
                     TreeNode::ExpandedAbove => "expanded_above",
                     TreeNode::Recursive => "recursive",
                 };
                 items.push(serde_json::json!({
-                    "depth": depth, "name": caller, "path": path, "line": line,
+                    "depth": depth, "name": site.name, "path": site.path, "line": site.line,
                     "status": status,
                 }));
             },
@@ -528,7 +528,8 @@ pub fn cmd_call_tree(
         function_name,
         max_depth,
         &callers,
-        &mut |depth, (caller, file_path, line_num), node| {
+        &mut |depth, site, node| {
+            let (caller, file_path, line_num) = (&site.name, &site.path, site.line);
             let indent = "  ".repeat(depth + 1);
             match node {
                 TreeNode::Shown => println!(
@@ -554,8 +555,32 @@ pub fn cmd_call_tree(
     Ok(())
 }
 
-/// A calling function: `(caller, file, line of the caller)`.
-type CallerSite = (String, String, usize);
+/// Java graph ids retain owner and overload identity through every level.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CallerTarget {
+    Name(String),
+    JavaSymbol(i64),
+}
+
+/// A calling declaration, with a lookup identity separate from its display.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CallerSite {
+    name: String,
+    path: String,
+    line: usize,
+    target: CallerTarget,
+}
+
+impl CallerSite {
+    fn lexical(name: String, path: String, line: usize) -> Self {
+        Self {
+            target: CallerTarget::Name(name.clone()),
+            name,
+            path,
+            line,
+        }
+    }
+}
 
 /// Calling functions of one function.
 type CallerSites = Vec<CallerSite>;
@@ -565,9 +590,7 @@ type CallerSites = Vec<CallerSite>;
 enum TreeNode {
     /// With its callers below it, when it has any within the depth limit.
     Shown,
-    /// Callers are looked up by name, so a caller named like a function the
-    /// tree already expanded has the very callers shown there; repeating
-    /// them would only copy that subtree.
+    /// This lookup identity already has its callers shown in the tree.
     ExpandedAbove,
     /// The same definition as a function on the path above it: a cycle.
     Recursive,
@@ -591,7 +614,7 @@ fn collect_tree_callers(
     limit: usize,
     scope: &db::SearchScope<'_>,
     decorate_paths: bool,
-) -> Result<HashMap<String, CallerSites>> {
+) -> Result<HashMap<CallerTarget, CallerSites>> {
     let mut callers = HashMap::new();
     if limit == 0 {
         return Ok(callers);
@@ -628,10 +651,20 @@ fn collect_tree_callers(
         };
         // Skipping files that hold none of the names keeps the path order of
         // the rest, so each name still gets the same first lines.
-        let names: Vec<&str> = missing.iter().map(String::as_str).collect();
-        let prefilter = word_index
-            .as_ref()
-            .and_then(|words| words.prefilter(&names));
+        let names: Vec<&str> = missing
+            .iter()
+            .filter_map(|target| match target {
+                CallerTarget::Name(name) => Some(name.as_str()),
+                CallerTarget::JavaSymbol(_) => None,
+            })
+            .collect();
+        let prefilter = if names.len() == missing.len() {
+            word_index
+                .as_ref()
+                .and_then(|words| words.prefilter(&names))
+        } else {
+            None
+        };
         let found = find_caller_functions(
             root,
             conn,
@@ -650,9 +683,9 @@ fn collect_tree_callers(
 ///
 /// Every caller is a definition of its own, shown with its file even when a
 /// function of the same name from another file is already in the tree: two
-/// `it "works"` blocks are two callers. Callers are found by name, though,
-/// so each name is expanded once, at its first node; a later node of that
-/// name is [`TreeNode::ExpandedAbove`], and one that is the very definition
+/// `it "works"` blocks are two callers. Each lookup identity is expanded
+/// once, at its first node; a later node of that identity is
+/// [`TreeNode::ExpandedAbove`], and one that is the very definition
 /// of a function on its own path is [`TreeNode::Recursive`]. A caller whose
 /// name no code can call is shown but not expanded; see [`is_callable_name`].
 ///
@@ -662,61 +695,73 @@ fn collect_tree_callers(
 fn walk_call_tree<'a>(
     function_name: &'a str,
     max_depth: usize,
-    callers: &'a HashMap<String, CallerSites>,
+    callers: &'a HashMap<CallerTarget, CallerSites>,
     visit: &mut dyn FnMut(usize, &'a CallerSite, TreeNode),
-) -> Vec<String> {
+) -> Vec<CallerTarget> {
+    let target = CallerTarget::Name(function_name.to_string());
     let mut walk = TreeWalk {
         max_depth,
         callers,
-        expanded: std::collections::HashSet::from([function_name]),
+        expanded: std::collections::HashSet::from([target.clone()]),
+        root_target: target.clone(),
         path: Vec::new(),
         missing: Vec::new(),
         visit,
     };
-    walk.callers_of(function_name, 1);
+    walk.callers_of(&target, 1);
     walk.missing
 }
 
 struct TreeWalk<'a, 'v> {
     max_depth: usize,
-    callers: &'a HashMap<String, CallerSites>,
-    /// Names whose callers the tree shows already.
-    expanded: std::collections::HashSet<&'a str>,
+    callers: &'a HashMap<CallerTarget, CallerSites>,
+    /// Lookup identities whose callers the tree shows already.
+    expanded: std::collections::HashSet<CallerTarget>,
+    /// The initial name query already expands all matching Java declarations.
+    root_target: CallerTarget,
     /// Callers from the root down to the node being expanded.
     path: Vec<&'a CallerSite>,
-    missing: Vec<String>,
+    missing: Vec<CallerTarget>,
     visit: &'v mut dyn FnMut(usize, &'a CallerSite, TreeNode),
 }
 
 impl<'a> TreeWalk<'a, '_> {
-    fn callers_of(&mut self, function_name: &str, depth: usize) {
+    fn callers_of(&mut self, target: &CallerTarget, depth: usize) {
         if depth > self.max_depth {
             return;
         }
         let callers = self.callers;
-        let Some(sites) = callers.get(function_name) else {
-            if !self.missing.iter().any(|name| name == function_name) {
-                self.missing.push(function_name.to_string());
+        let Some(sites) = callers.get(target) else {
+            if !self.missing.contains(target) {
+                self.missing.push(target.clone());
             }
             return;
         };
         for site in sites {
-            let caller = site.0.as_str();
             if self.path.contains(&site) {
                 (self.visit)(depth, site, TreeNode::Recursive);
                 continue;
             }
-            let expandable = depth < self.max_depth && is_callable_name(caller);
-            if expandable && self.expanded.insert(caller) {
+            let expandable = depth < self.max_depth && is_callable_name(&site.name);
+            let expansion = match (&self.root_target, &site.target) {
+                (CallerTarget::Name(name), CallerTarget::JavaSymbol(_)) if name == &site.name => {
+                    &self.root_target
+                }
+                _ => &site.target,
+            };
+            if expandable && self.expanded.insert(expansion.clone()) {
                 (self.visit)(depth, site, TreeNode::Shown);
                 self.path.push(site);
-                self.callers_of(caller, depth + 1);
+                self.callers_of(&site.target, depth + 1);
                 self.path.pop();
                 continue;
             }
             // Expanded earlier, so its callers are known unless this walk is
             // still a draft; a name without callers leaves nothing out.
-            let above = expandable && callers.get(caller).is_some_and(|sites| !sites.is_empty());
+            let above = expandable
+                && callers
+                    .get(expansion)
+                    .is_some_and(|sites| !sites.is_empty());
             let node = if above {
                 TreeNode::ExpandedAbove
             } else {
@@ -755,15 +800,11 @@ fn is_callable_name(name: &str) -> bool {
     has_word
 }
 
-/// Find the functions that call each of `function_names`, in one scan of
-/// `files`.
+/// Find the calling declarations for each target within selected `files`.
 ///
-/// Call sites are still located textually: the regex knows call idioms the
-/// `refs` table does not record (`obj.method` without parentheses, Ruby
-/// `:symbol` callbacks, `await obj.fn(`), so replacing it would cost recall.
-/// Only the "which function is this line inside" step consults the index,
-/// which knows real symbol ranges instead of guessing from the nearest
-/// definition line above.
+/// A fresh Java graph retains declaration ids; Java fallback uses syntax.
+/// The existing text scan handles call idioms not stored in `refs`, with
+/// indexed ranges attributing their owners when available.
 ///
 /// Each function gets the first `limit * 3` call lines in path order. A
 /// definition line or a file outside `in_file` does not count against that:
@@ -773,7 +814,7 @@ fn find_caller_functions(
     root: &Path,
     conn: Option<&rusqlite::Connection>,
     files: &[PathBuf],
-    function_names: &[String],
+    function_targets: &[CallerTarget],
     limit: usize,
     prefilter: Option<&super::WordPrefilter<'_>>,
     decorate_paths: bool,
@@ -781,8 +822,8 @@ fn find_caller_functions(
     // Java syntax distinguishes calls from prose, declarations and method
     // references, and attributes calls even when declarations share a line.
     // Parse one file at a time; retain at most `limit` owners per requested name.
-    let mut java_callers: Vec<CallerSites> = vec![Vec::new(); function_names.len()];
-    let mut graph_answered = vec![false; function_names.len()];
+    let mut resolved_callers: Vec<CallerSites> = vec![Vec::new(); function_targets.len()];
+    let mut graph_answered = vec![false; function_targets.len()];
     let resolver =
         conn.map(|conn| PathResolver::from_conn(root, conn).with_decoration(decorate_paths));
     if let Some(conn) = conn {
@@ -798,54 +839,75 @@ fn find_caller_functions(
                     root.join(path)
                 }
             };
-            for ((name, sites), answered) in function_names
+            for ((target, sites), answered) in function_targets
                 .iter()
-                .zip(java_callers.iter_mut())
+                .zip(resolved_callers.iter_mut())
                 .zip(graph_answered.iter_mut())
             {
                 // A receiver spelling (p.leaf, this.leaf) selects syntax
                 // occurrences, not the declaration name stored in the graph.
-                if name.contains('.') {
-                    continue;
-                }
-                let targets: Vec<db::SearchResult> = db::find_graph_symbols_by_name(conn, name)?
-                    .into_iter()
-                    .filter(|symbol| symbol.kind == "function" && symbol.path.ends_with(".java"))
-                    .map(|symbol| db::SearchResult {
-                        name: symbol.name,
-                        qualified_name: symbol.qualified_name,
-                        kind: symbol.kind,
-                        line: symbol.line,
-                        end_line: symbol.end_line,
-                        signature: None,
-                        path: symbol.path,
-                        root_path: symbol.root_path,
-                    })
-                    .collect();
-                if let Some(callers) =
+                let targets: Vec<db::GraphSymbolInfo> = match target {
+                    CallerTarget::Name(name) if name.contains('.') => continue,
+                    CallerTarget::Name(name) => db::find_graph_symbols_by_name(conn, name)?
+                        .into_iter()
+                        .filter(|symbol| {
+                            symbol.kind == "function" && symbol.path.ends_with(".java")
+                        })
+                        .collect(),
+                    CallerTarget::JavaSymbol(id) => db::load_graph_symbol_infos(conn, &[*id])?
+                        .into_values()
+                        .collect(),
+                };
+                let callers =
                     super::graph::resolved_callers_of_filtered(conn, &targets, limit, |source| {
                         let path = absolute(&source.path, source.root_path.as_deref());
                         matches!(source.kind.as_str(), "function" | "property" | "constant")
                             && source.path.ends_with(".java")
                             && selected.contains(path.as_path())
-                    })?
-                {
-                    for source in callers.into_iter().flatten() {
-                        let path = absolute(&source.path, source.root_path.as_deref());
-                        sites.push((
-                            source.name,
-                            super::display_path(resolver, root, &path),
-                            source.line as usize,
-                        ));
-                    }
-                    sites.sort_by(|a, b| (&a.1, a.2, &a.0).cmp(&(&b.1, b.2, &b.0)));
-                    sites.dedup();
-                    sites.truncate(limit);
-                    *answered = true;
+                            // A forced nested root may leave a second indexed
+                            // row through its parent. Keep the most specific
+                            // owner without merging distinct overload ids.
+                            && resolver
+                                .scoped_relative_path(&path)
+                                .is_some_and(|relative| relative == source.path)
+                    })?;
+                for source in callers {
+                    let path = absolute(&source.path, source.root_path.as_deref());
+                    sites.push(CallerSite {
+                        target: CallerTarget::JavaSymbol(source.id),
+                        name: source.name,
+                        path: super::display_path(resolver, root, &path),
+                        line: source.line as usize,
+                    });
                 }
+                sites.sort_by(|a, b| (&a.path, a.line, &a.name).cmp(&(&b.path, b.line, &b.name)));
+                sites.dedup();
+                sites.truncate(limit);
+                *answered = true;
             }
         }
     }
+    // Only name queries enter lexical matching. Exact Java declarations have
+    // no fallback to similarly named occurrences in Java or another language.
+    let mut lexical_indices = Vec::new();
+    let mut function_names = Vec::new();
+    for (index, target) in function_targets.iter().enumerate() {
+        if let CallerTarget::Name(name) = target {
+            lexical_indices.push(index);
+            function_names.push(name.clone());
+        }
+    }
+    if lexical_indices.is_empty() {
+        return Ok(resolved_callers);
+    }
+    let mut java_callers: Vec<CallerSites> = lexical_indices
+        .iter()
+        .map(|index| std::mem::take(&mut resolved_callers[*index]))
+        .collect();
+    let graph_answered: Vec<bool> = lexical_indices
+        .iter()
+        .map(|index| graph_answered[*index])
+        .collect();
     let mut other_files = Vec::new();
     for path in files {
         if !path
@@ -872,7 +934,7 @@ fn find_caller_functions(
         }
         let content = read_java_syntax_source(path, crate::indexer::max_file_size_bytes())?;
         let owners =
-            crate::parsers::treesitter::java::invocation_callers(&content, function_names, limit)?;
+            crate::parsers::treesitter::java::invocation_callers(&content, &function_names, limit)?;
         for ((sites, owners), answered) in java_callers.iter_mut().zip(owners).zip(&graph_answered)
         {
             if *answered {
@@ -883,7 +945,7 @@ fn find_caller_functions(
                 owners
                     .into_iter()
                     .take(remaining)
-                    .map(|(name, line)| (name, rel.clone(), line)),
+                    .map(|(name, line)| CallerSite::lexical(name, rel.clone(), line)),
             );
         }
     }
@@ -912,7 +974,7 @@ fn find_caller_functions(
     // First pass: find all files and line numbers with calls
     super::search_files_limited_each_prefiltered(
         &other_files,
-        &build_any_caller_pattern(function_names),
+        &build_any_caller_pattern(&function_names),
         &patterns,
         limit * 3,
         prefilter,
@@ -926,9 +988,9 @@ fn find_caller_functions(
     )?;
 
     let root_key = db::normalize_root_for_storage(root);
-    Ok(files_with_calls
+    let lexical_callers: Vec<CallerSites> = files_with_calls
         .into_iter()
-        .zip(function_names)
+        .zip(&function_names)
         .zip(java_callers)
         .map(|((files, name), mut java_sites)| {
             java_sites.extend(attribute_call_lines(
@@ -940,11 +1002,15 @@ fn find_caller_functions(
                 limit,
                 &func_def_re,
             ));
-            java_sites.sort_by(|a, b| (&a.1, a.2, &a.0).cmp(&(&b.1, b.2, &b.0)));
+            java_sites.sort_by(|a, b| (&a.path, a.line, &a.name).cmp(&(&b.path, b.line, &b.name)));
             java_sites.truncate(limit);
             java_sites
         })
-        .collect())
+        .collect();
+    for (index, sites) in lexical_indices.into_iter().zip(lexical_callers) {
+        resolved_callers[index] = sites;
+    }
+    Ok(resolved_callers)
 }
 
 /// Second pass of [`find_caller_functions`]: the function containing each
@@ -1022,9 +1088,9 @@ fn attribute_call_lines(
                 // Avoid adding the same function twice for this target
                 if !results
                     .iter()
-                    .any(|(f, p, _)| f == &func_name && p == &rel_path)
+                    .any(|site| site.name == func_name && site.path == rel_path)
                 {
-                    results.push((func_name, rel_path.clone(), func_line));
+                    results.push(CallerSite::lexical(func_name, rel_path.clone(), func_line));
                 }
             }
         }
@@ -1937,21 +2003,24 @@ mod tests {
     fn sites(entries: &[(&str, &str, usize)]) -> CallerSites {
         entries
             .iter()
-            .map(|(caller, file, line)| (caller.to_string(), file.to_string(), *line))
+            .map(|(caller, file, line)| {
+                CallerSite::lexical(caller.to_string(), file.to_string(), *line)
+            })
             .collect()
     }
 
     fn walk(
         function_name: &str,
         max_depth: usize,
-        callers: &HashMap<String, CallerSites>,
+        callers: &HashMap<CallerTarget, CallerSites>,
     ) -> (Vec<String>, Vec<String>) {
         let mut edges = vec![];
         let missing = walk_call_tree(
             function_name,
             max_depth,
             callers,
-            &mut |depth, (caller, file, line), node| {
+            &mut |depth, site, node| {
+                let (caller, file, line) = (&site.name, &site.path, site.line);
                 edges.push(match node {
                     TreeNode::Shown => format!("{depth} {caller} {file}:{line}"),
                     TreeNode::ExpandedAbove => format!("{depth} {caller} {file}:{line} above"),
@@ -1959,13 +2028,22 @@ mod tests {
                 });
             },
         );
-        (edges, missing)
+        (
+            edges,
+            missing
+                .into_iter()
+                .map(|target| match target {
+                    CallerTarget::Name(name) => name,
+                    CallerTarget::JavaSymbol(_) => panic!("lexical fixture returned a graph id"),
+                })
+                .collect(),
+        )
     }
 
-    fn tree(entries: Vec<(&str, CallerSites)>) -> HashMap<String, CallerSites> {
+    fn tree(entries: Vec<(&str, CallerSites)>) -> HashMap<CallerTarget, CallerSites> {
         entries
             .into_iter()
-            .map(|(name, sites)| (name.to_string(), sites))
+            .map(|(name, sites)| (CallerTarget::Name(name.to_string()), sites))
             .collect()
     }
 
@@ -1977,7 +2055,7 @@ mod tests {
         assert_eq!(missing, ["leaf"]);
 
         callers.insert(
-            "leaf".to_string(),
+            CallerTarget::Name("leaf".to_string()),
             sites(&[("alpha", "a.rb", 2), ("beta", "b.rb", 6)]),
         );
         let (edges, missing) = walk("leaf", 3, &callers);
@@ -2073,10 +2151,12 @@ mod tests {
 
     #[test]
     fn walk_call_tree_needs_no_callers_below_the_depth_limit() {
-        let callers: HashMap<String, CallerSites> =
-            [("leaf".to_string(), sites(&[("alpha", "a.rb", 2)]))]
-                .into_iter()
-                .collect();
+        let callers: HashMap<CallerTarget, CallerSites> = [(
+            CallerTarget::Name("leaf".to_string()),
+            sites(&[("alpha", "a.rb", 2)]),
+        )]
+        .into_iter()
+        .collect();
         let (edges, missing) = walk("leaf", 1, &callers);
         assert_eq!(edges, ["1 alpha a.rb:2"]);
         assert!(missing.is_empty());

@@ -6,9 +6,9 @@ use std::path::Path;
 
 use anyhow::Result;
 use colored::Colorize;
-use rusqlite::params;
 
-use crate::db;
+use super::PathResolver;
+use crate::db::{self, SearchScope};
 
 /// Find potentially unused symbols in a module or project
 pub fn cmd_unused_symbols(
@@ -17,6 +17,24 @@ pub fn cmd_unused_symbols(
     export_only: bool,
     limit: usize,
     format: &str,
+) -> Result<()> {
+    cmd_unused_symbols_scoped(
+        root,
+        module,
+        export_only,
+        limit,
+        format,
+        &SearchScope::none(),
+    )
+}
+
+pub fn cmd_unused_symbols_scoped(
+    root: &Path,
+    module: Option<&str>,
+    export_only: bool,
+    limit: usize,
+    format: &str,
+    scope: &SearchScope,
 ) -> Result<()> {
     if !db::db_exists(root) {
         println!(
@@ -32,129 +50,29 @@ pub fn cmd_unused_symbols(
     // as well as a raw path prefix; names resolve to the module's directory.
     let module_path = match module {
         Some(m) => match db::find_module_id_by_name(&conn, m)? {
-            Some(id) => db::get_module_path(&conn, id)?.map(|p| format!("{}/", p.trim_end_matches('/'))),
+            Some(id) => db::get_module_path(&conn, id)?.map(|p| {
+                let path = p.trim_end_matches('/');
+                if path.is_empty() {
+                    String::new()
+                } else {
+                    format!("{path}/")
+                }
+            }),
             None => Some(m.to_string()),
         },
         None => None,
     };
 
-    // Build query based on filters
-    let (sql, filter_param) = if let Some(mod_path) = module_path.as_deref() {
-        (
-            r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
-            FROM symbols s
-            JOIN files f ON s.file_id = f.id
-            WHERE f.path LIKE ?1
-              AND s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
-            ORDER BY f.path, s.line
-            "#,
-            Some(format!("{}%", mod_path)),
-        )
-    } else if export_only {
-        (
-            r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
-            FROM symbols s
-            JOIN files f ON s.file_id = f.id
-            WHERE s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
-              AND s.name GLOB '[A-Z]*'
-            ORDER BY f.path, s.line
-            "#,
-            None,
-        )
-    } else {
-        (
-            r#"
-            SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path
-            FROM symbols s
-            JOIN files f ON s.file_id = f.id
-            WHERE s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct')
-            ORDER BY f.path, s.line
-            "#,
-            None,
-        )
+    let selected = SearchScope {
+        module: module_path.as_deref().or(scope.module),
+        in_file: scope.in_file,
+        dir_prefix: scope.dir_prefix,
     };
-
-    let mut stmt = conn.prepare(sql)?;
-    let symbols: Vec<db::SearchResult> = if let Some(ref pattern) = filter_param {
-        stmt.query_map(params![pattern], |row| {
-            Ok(db::SearchResult {
-                name: row.get(0)?,
-                qualified_name: row.get(1)?,
-                kind: row.get(2)?,
-                line: row.get(3)?,
-                end_line: None,
-                signature: row.get(4)?,
-                path: row.get(5)?,
-                root_path: None,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    } else {
-        stmt.query_map([], |row| {
-            Ok(db::SearchResult {
-                name: row.get(0)?,
-                qualified_name: row.get(1)?,
-                kind: row.get(2)?,
-                line: row.get(3)?,
-                end_line: None,
-                signature: row.get(4)?,
-                path: row.get(5)?,
-                root_path: None,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
-
-    // Check each symbol for references
-    let mut unused: Vec<&db::SearchResult> = Vec::new();
-
-    for sym in &symbols {
-        // References are recorded under the last segment of a qualified name,
-        // and Ruby indexes `class Billing::Invoice` under its full name.
-        let ref_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM refs WHERE name = ?1 LIMIT 1",
-                params![db::last_name_segment(&sym.name)],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if ref_count > 0 {
-            continue;
-        }
-
-        // Check xml_usages
-        let xml_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM xml_usages WHERE class_name = ?1 LIMIT 1",
-                params![sym.name],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if xml_count > 0 {
-            continue;
-        }
-
-        // Check storyboard_usages
-        let sb_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM storyboard_usages WHERE class_name = ?1 LIMIT 1",
-                params![sym.name],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if sb_count > 0 {
-            continue;
-        }
-
-        unused.push(sym);
-        if unused.len() >= limit {
-            break;
-        }
+    let (mut unused, checked) =
+        db::find_potentially_unused_symbols_scoped(&conn, export_only, limit, &selected)?;
+    let resolver = PathResolver::try_from_conn(root, &conn)?.with_decoration(format != "json");
+    for symbol in &mut unused {
+        symbol.path = resolver.resolve_with_root(&symbol.path, symbol.root_path.as_deref());
     }
 
     if format == "json" {
@@ -169,7 +87,7 @@ pub fn cmd_unused_symbols(
             "Potentially unused symbols in '{}' ({}/{} checked):",
             scope,
             unused.len(),
-            symbols.len()
+            checked
         )
         .bold()
     );

@@ -21,6 +21,108 @@ fn run(root: &Path, cache: &Path, args: &[&str]) -> String {
 }
 
 #[test]
+fn java_deep_caller_expansion_preserves_selected_declaration_identity() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let cases = [
+        (
+            "distinct owners",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    void step() { new Target().leaf(); }
+}
+
+class Decoy {
+    void step() {}
+}
+
+class Top {
+    void good() { new Caller().step(); }
+    void wrong() { new Decoy().step(); }
+}
+"#,
+            6,
+            14,
+        ),
+        (
+            "distinct overloads",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    void step(int value) { new Target().leaf(); }
+    void step(String value) {}
+}
+
+class Top {
+    void good() { new Caller().step(1); }
+    void wrong() { new Caller().step("wrong"); }
+}
+"#,
+            6,
+            11,
+        ),
+        (
+            "same-line overloads",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    void step(int value) { new Target().leaf(); } void step(String value) {}
+}
+
+class Top {
+    void good() { new Caller().step(1); }
+    void wrong() { new Caller().step("wrong"); }
+}
+"#,
+            6,
+            10,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, source, step_line, good_line) in cases {
+        let project = tempfile::tempdir_in(&artifacts).unwrap();
+        let cache = tempfile::tempdir_in(&artifacts).unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        fs::write(project.path().join("Probe.java"), source).unwrap();
+        run(project.path(), cache.path(), &["rebuild", "--force"]);
+        run(project.path(), cache.path(), &["graph", "build"]);
+        let tree: Value = serde_json::from_str(&run(
+            project.path(),
+            cache.path(),
+            &[
+                "--format",
+                "json",
+                "call-tree",
+                "leaf",
+                "--depth",
+                "2",
+                "--limit",
+                "100",
+            ],
+        ))
+        .unwrap();
+        let expected = json!([
+            {"depth": 1, "name": "step", "path": "Probe.java", "line": step_line, "status": "shown"},
+            {"depth": 2, "name": "good", "path": "Probe.java", "line": good_line, "status": "shown"},
+        ]);
+        if tree["items"] != expected || tree["count"] != 2 {
+            failures.push(label);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "deep caller identity failed: {failures:?}"
+    );
+}
+
+#[test]
 fn java_caller_formats_preserve_source_sites_and_tree_states() {
     let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
     fs::create_dir_all(&artifacts).unwrap();

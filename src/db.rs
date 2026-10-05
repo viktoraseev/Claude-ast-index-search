@@ -8467,6 +8467,62 @@ impl<'a> SearchScope<'a> {
     }
 }
 
+/// Select unused candidates within scope, retaining indexed name-based usage checks.
+pub fn find_potentially_unused_symbols_scoped(
+    conn: &Connection,
+    export_only: bool,
+    limit: usize,
+    scope: &SearchScope,
+) -> Result<(Vec<SearchResult>, usize)> {
+    let (scope_clause, scope_params) = scope.path_condition();
+    let mut predicate = format!(
+        "s.kind IN ('class', 'interface', 'function', 'object', 'enum', 'protocol', 'struct'){scope_clause}"
+    );
+    if export_only {
+        predicate.push_str(" AND s.name GLOB '[A-Z]*'");
+    }
+    let candidate_count: usize = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM symbols s JOIN files f ON s.file_id = f.id WHERE {predicate}"
+        ),
+        rusqlite::params_from_iter(&scope_params),
+        |row| row.get(0),
+    )?;
+    let mut unused = Vec::new();
+    if limit == 0 {
+        return Ok((unused, candidate_count));
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT s.name, s.qualified_name, s.kind, s.line, s.signature, f.path, f.root_path, s.end_line
+         FROM symbols s JOIN files f ON s.file_id = f.id WHERE {predicate}
+         ORDER BY f.path, s.line, f.root_path, s.id"
+    ))?;
+    let mut usage = conn.prepare(
+        "SELECT EXISTS(SELECT 1 FROM refs WHERE name = ?1)
+             OR EXISTS(SELECT 1 FROM xml_usages WHERE class_name = ?2)
+             OR EXISTS(SELECT 1 FROM storyboard_usages WHERE class_name = ?2)",
+    )?;
+    // Scope selects declarations, not their users: a call from outside a
+    // selected directory still makes its indexed target potentially used.
+    for row in stmt.query_map(
+        rusqlite::params_from_iter(&scope_params),
+        row_to_search_result,
+    )? {
+        let symbol = row?;
+        let used: bool = usage.query_row(
+            params![last_name_segment(&symbol.name), &symbol.name],
+            |row| row.get(0),
+        )?;
+        if !used {
+            unused.push(symbol);
+            if unused.len() == limit {
+                break;
+            }
+        }
+    }
+    Ok((unused, candidate_count))
+}
+
 fn count_symbol_matches(
     conn: &Connection,
     predicate: &str,

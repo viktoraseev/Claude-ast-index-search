@@ -12,6 +12,7 @@ from root_contracts import Runner
 FEATURES = {'global:format:java-callers', 'global:format:java-call-tree'}
 REASON = ('independent source/state: disposable Java caller snippets/pages and owner '
           'tree identities, JSON/text, depth/limits, cycles/repeated expansion and '
+          'deep declaration/overload identity, '
           'attached-root rendering with fresh/unbuilt graphs; not MCP equivalence '
           'or compiler-wide semantic dispatch')
 FILENAME = 'src/Probe "λ".java'
@@ -204,4 +205,35 @@ def exercise(binary, base):
                     if depth == 1 and isinstance(got, list):
                         want, got = sorted(want), sorted(got)
                     record('global:format:java-call-tree', f'{mode}:{label}:{format}:{query}:{depth}:{limit}', want, got)
+    # The caller at each deeper level is one selected declaration, even when
+    # another owner or overload shares its name (and possibly its line).
+    for label, middle, good, wrong, step_line, good_line in (
+            ('owners', 'class Caller {\n void step() { new Target().leaf(); }\n}\n'
+                       'class Decoy {\n void step() {}\n}\n',
+             'new Caller().step()', 'new Decoy().step()', 5, 11),
+            ('overloads', 'class Caller {\n void step(int n) { new Target().leaf(); }\n'
+                          ' void step(String s) {}\n}\n',
+             'new Caller().step(1)', 'new Caller().step("wrong")', 5, 9),
+            ('same-line-overloads', 'class Caller {\n void step(int n) { new Target().leaf(); }'
+                                    ' void step(String s) {}\n}\n',
+             'new Caller().step(1)', 'new Caller().step("wrong")', 5, 8)):
+        case = directory / ('identity-' + label)
+        case.mkdir()
+        identity = Runner(binary, case)
+        identity.root.mkdir()
+        (identity.root / '.git').mkdir()
+        (identity.root / 'Probe.java').write_text(
+            'class Target {\n void leaf() {}\n}\n' + middle +
+            'class Top {\n void good() { ' + good + '; }\n'
+            ' void wrong() { ' + wrong + '; }\n}\n')
+        identity.command('rebuild', '--force')
+        identity.command('graph', 'build')
+        for format in ('json', 'text'):
+            for limit in (1, 100):
+                _, output = identity.command('--format', format, 'call-tree', 'leaf',
+                                             '--depth', '2', '--limit', str(limit))
+                want = [(1, 'step', 'project/Probe.java', step_line, 'shown'),
+                        (2, 'good', 'project/Probe.java', good_line, 'shown')]
+                record('global:format:java-call-tree', f'identity:{label}:{format}:{limit}', want,
+                       tree_rows(output, format, identity, 'leaf', 2, limit))
     return expected, actual

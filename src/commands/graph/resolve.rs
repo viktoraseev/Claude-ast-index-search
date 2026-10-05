@@ -624,6 +624,8 @@ struct SymNode {
     name: String,
     kind: String,
     line: i64,
+    /// Java syntax and indexed declarations both preserve source order.
+    java_callable_ordinal: usize,
     /// `end_line`, or the start line when the parser reports no range.
     end: i64,
     has_range: bool,
@@ -771,6 +773,7 @@ impl Builder {
 
         let symbol_rows = db::load_graph_symbols(conn)?;
         let mut syms = Vec::with_capacity(symbol_rows.len());
+        let mut java_callable_ordinals: HashMap<(u32, String, i64), usize> = HashMap::new();
         for row in symbol_rows {
             let Some(&file) = file_index.get(&row.file_id) else {
                 continue;
@@ -786,6 +789,16 @@ impl Builder {
                     file_node.imports.push(target);
                 }
             }
+            let java_callable_ordinal = if file_node.java.is_some() && row.kind == "function" {
+                let next = java_callable_ordinals
+                    .entry((file, row.name.clone(), row.line))
+                    .or_default();
+                let ordinal = *next;
+                *next += 1;
+                ordinal
+            } else {
+                0
+            };
             syms.push(SymNode {
                 id: row.id,
                 file,
@@ -794,6 +807,7 @@ impl Builder {
                 name: row.name,
                 kind: row.kind,
                 line: row.line,
+                java_callable_ordinal,
                 container: None,
                 qual: if file_node.java.is_some() {
                     row.qualified_name.unwrap_or_default().replace('.', "::")
@@ -2137,7 +2151,7 @@ impl Builder {
         let (parameters, variadic) = self.files[symbol.file as usize]
             .java
             .as_ref()?
-            .invocation_signature(&symbol.name, symbol.line)?;
+            .invocation_signature_at(&symbol.name, symbol.line, symbol.java_callable_ordinal)?;
         if phase < 2 {
             return (count == parameters.len()).then(|| parameters.to_vec());
         }
@@ -2173,7 +2187,7 @@ impl Builder {
         self.files[symbol.file as usize]
             .java
             .as_ref()?
-            .invocation_signature(&symbol.name, symbol.line)?;
+            .invocation_signature_at(&symbol.name, symbol.line, symbol.java_callable_ordinal)?;
         let Some(parameters) = self.java_invocation_formals(target, arguments.len(), phase) else {
             return Some(false);
         };
@@ -2327,9 +2341,12 @@ impl Builder {
                             .java
                             .as_ref()
                             .is_some_and(|syntax| {
-                                syntax.accepts_arguments(&symbol.name, symbol.line, call.arguments)
-                                    && self
-                                        .java_invocation_compatible(source, candidate, name, line)
+                                syntax.accepts_arguments_at(
+                                    &symbol.name,
+                                    symbol.line,
+                                    symbol.java_callable_ordinal,
+                                    call.arguments,
+                                ) && self.java_invocation_compatible(source, candidate, name, line)
                             })
                 })
                 .collect();
@@ -2787,8 +2804,12 @@ impl Builder {
                     .java
                     .as_ref()
                     .is_some_and(|java| {
-                        java.accepts_arguments(&symbol.name, symbol.line, arguments)
-                            && self.java_invocation_compatible(source, target, name, line)
+                        java.accepts_arguments_at(
+                            &symbol.name,
+                            symbol.line,
+                            symbol.java_callable_ordinal,
+                            arguments,
+                        ) && self.java_invocation_compatible(source, target, name, line)
                     })
         };
         // Enclosing/inherited members take precedence over static imports.
@@ -2847,9 +2868,12 @@ impl Builder {
                                 .java
                                 .as_ref()
                                 .is_some_and(|java| {
-                                    java.accepts_arguments(&symbol.name, symbol.line, arguments)
-                                        && self
-                                            .java_invocation_compatible(source, target, name, line)
+                                    java.accepts_arguments_at(
+                                        &symbol.name,
+                                        symbol.line,
+                                        symbol.java_callable_ordinal,
+                                        arguments,
+                                    ) && self.java_invocation_compatible(source, target, name, line)
                                 })
                     })
                     .collect();
@@ -2901,7 +2925,12 @@ impl Builder {
                             .java
                             .as_ref()
                             .is_some_and(|java| {
-                                java.accepts_arguments(&symbol.name, symbol.line, count)
+                                java.accepts_arguments_at(
+                                    &symbol.name,
+                                    symbol.line,
+                                    symbol.java_callable_ordinal,
+                                    count,
+                                )
                             })
                     })
             })
@@ -4394,25 +4423,27 @@ impl Builder {
                         inputs
                             .checked_sub(usize::from(unbound))
                             .is_some_and(|arguments| {
-                                java.accepts_arguments(&symbol.name, symbol.line, arguments)
-                                    && (0..arguments).all(|index| {
-                                        let Some(input) = Self::java_functional_input(
-                                            context,
-                                            index + usize::from(unbound),
-                                        ) else {
-                                            return true;
-                                        };
-                                        let Some(parameter) = java.reference_parameter(
-                                            &symbol.name,
-                                            symbol.line,
-                                            index,
-                                        ) else {
-                                            return true;
-                                        };
-                                        self.java_reference_input_compatible(
-                                            source, input, target, parameter,
-                                        )
-                                    })
+                                java.accepts_arguments_at(
+                                    &symbol.name,
+                                    symbol.line,
+                                    symbol.java_callable_ordinal,
+                                    arguments,
+                                ) && (0..arguments).all(|index| {
+                                    let Some(input) = Self::java_functional_input(
+                                        context,
+                                        index + usize::from(unbound),
+                                    ) else {
+                                        return true;
+                                    };
+                                    let Some(parameter) =
+                                        java.reference_parameter(&symbol.name, symbol.line, index)
+                                    else {
+                                        return true;
+                                    };
+                                    self.java_reference_input_compatible(
+                                        source, input, target, parameter,
+                                    )
+                                })
                             })
                     });
                 }
@@ -4726,26 +4757,30 @@ impl Builder {
                 // A declaration and its recursive call may share a line.
                 // Syntax and arity must establish the call before the generic
                 // declaration/self-reference filters can discard its row.
-                let mut targets: Vec<u32> =
-                    self.by_qual
-                        .get(&owner.qual)
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .filter(|&candidate| {
-                            let symbol = &self.syms[candidate as usize];
-                            symbol.kind == "function"
-                                && self.visible_from(file, candidate)
-                                && self.files[symbol.file as usize].java.as_ref().is_some_and(
-                                    |java| {
-                                        java.accepts_arguments(&symbol.name, symbol.line, arguments)
-                                            && self.java_invocation_compatible(
-                                                source, candidate, name, line,
-                                            )
-                                    },
-                                )
-                        })
-                        .collect();
+                let mut targets: Vec<u32> = self
+                    .by_qual
+                    .get(&owner.qual)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&candidate| {
+                        let symbol = &self.syms[candidate as usize];
+                        symbol.kind == "function"
+                            && self.visible_from(file, candidate)
+                            && self.files[symbol.file as usize]
+                                .java
+                                .as_ref()
+                                .is_some_and(|java| {
+                                    java.accepts_arguments_at(
+                                        &symbol.name,
+                                        symbol.line,
+                                        symbol.java_callable_ordinal,
+                                        arguments,
+                                    ) && self
+                                        .java_invocation_compatible(source, candidate, name, line)
+                                })
+                    })
+                    .collect();
                 self.java_narrow_invocation_targets(source, name, line, &mut targets);
                 return match targets.len() {
                     0 => Err(DropReason::ReceiverUnresolved),
