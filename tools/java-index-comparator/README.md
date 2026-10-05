@@ -35,6 +35,14 @@ Search reference aggregation, base ranking and navigation options have executabl
 checks. Advanced ranking and other unresolved command contracts remain explicitly
 pending. A passing subset never establishes a complete audit.
 
+The inherited Java member-type fixture executes graph dependency pages, reverse
+traversal and RWR exploration against compact authored sources. Javac validates
+positive imports/qualified names/lexical inheritance and rejects access and
+nonstatic-import guards. Hiding and diamond identities are checked directly.
+This is independent source/state coverage, not MCP equivalence; hidden enclosing
+owners, member aliases in parent declarations, local-class shadows and attached
+roots remain pending in the broader semantic contracts.
+
 Commands without an equivalent Index MCP operation use separately labelled
 independent source/state or internal CLI checks. Synthetic Java fixtures complement
 live project checks; they do not replace unresolved target or syntax contracts.

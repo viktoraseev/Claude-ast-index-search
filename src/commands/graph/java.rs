@@ -31,6 +31,7 @@ pub(super) struct JavaSource {
     /// Reference rows carry a line and name, not a byte position. Colliding
     /// paths or value/type uses on one line remain explicit negative evidence.
     types: HashMap<(i64, String), Option<String>>,
+    type_owners: HashMap<(i64, String), Option<(String, i64)>>,
     /// Graph binding needs the full syntax path; legacy inheritance rows may
     /// contain only its short name.
     parents: HashMap<(String, i64), Vec<String>>,
@@ -1960,6 +1961,73 @@ impl JavaSource {
             );
             let binding = if typed {
                 type_sites.insert(key.clone());
+                // Line ranges cannot distinguish a class header from a method
+                // signature on the same line. Keep syntax ownership for type
+                // sites, and retain collisions as unresolved rather than
+                // attributing several declarations to the first symbol.
+                let mut ancestor = node.parent();
+                let mut path = Vec::new();
+                let mut owner_line = None;
+                while let Some(parent) = ancestor {
+                    if parent.kind() == "field_declaration" && owner_line.is_none() {
+                        let mut cursor = parent.walk();
+                        let names: Vec<_> = parent
+                            .named_children(&mut cursor)
+                            .filter(|child| child.kind() == "variable_declarator")
+                            .filter_map(|child| child.child_by_field_name("name"))
+                            .collect();
+                        if let [name] = names.as_slice() {
+                            owner_line = Some(name.start_position().row as i64 + 1);
+                            path.push(text(*name, source));
+                        } else {
+                            break;
+                        }
+                    }
+                    if matches!(
+                        parent.kind(),
+                        "method_declaration"
+                            | "constructor_declaration"
+                            | "compact_constructor_declaration"
+                            | "class_declaration"
+                            | "interface_declaration"
+                            | "enum_declaration"
+                            | "record_declaration"
+                            | "annotation_type_declaration"
+                    ) {
+                        if let Some(name) = parent.child_by_field_name("name") {
+                            if owner_line.is_none() {
+                                owner_line = Some(name.start_position().row as i64 + 1);
+                                path.push(text(name, source));
+                            } else if !matches!(
+                                parent.kind(),
+                                "method_declaration"
+                                    | "constructor_declaration"
+                                    | "compact_constructor_declaration"
+                            ) {
+                                path.push(text(name, source));
+                            }
+                        }
+                    }
+                    ancestor = parent.parent();
+                }
+                path.reverse();
+                let owner = owner_line.map(|line| {
+                    let qualified = if result.package.is_empty() {
+                        path.join("::")
+                    } else {
+                        format!("{}::{}", result.package, path.join("::"))
+                    };
+                    (qualified, line)
+                });
+                result
+                    .type_owners
+                    .entry(key.clone())
+                    .and_modify(|previous| {
+                        if *previous != owner {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(owner);
                 let mut path = node;
                 while let Some(parent) = path.parent() {
                     if parent.kind() != "scoped_type_identifier"
@@ -2804,6 +2872,10 @@ impl JavaSource {
         self.types.get(&(line, name.to_owned()))
     }
 
+    pub fn type_reference_owner(&self, line: i64, name: &str) -> Option<&Option<(String, i64)>> {
+        self.type_owners.get(&(line, name.to_owned()))
+    }
+
     pub fn parameter_call(
         &self,
         owner: &str,
@@ -2894,6 +2966,30 @@ interface Face extends fixture.a.Base<String>, Other {}
         assert_eq!(
             java.parent_types("Face", 2).unwrap(),
             ["fixture::a::Base", "Other"]
+        );
+    }
+
+    #[test]
+    fn type_reference_ownership_distinguishes_headers_and_same_line_methods() {
+        let java = JavaSource::parse(
+            r#"class Probe extends Base { Member use(Member input) { return input; } }
+class Collision { Member first(Member x) { return x; } Member second(Member x) { return x; } }
+class Fields { Member value; }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            java.type_reference_owner(1, "Base"),
+            Some(&Some(("Probe".to_owned(), 1)))
+        );
+        assert_eq!(
+            java.type_reference_owner(1, "Member"),
+            Some(&Some(("Probe::use".to_owned(), 1)))
+        );
+        assert_eq!(java.type_reference_owner(2, "Member"), Some(&None));
+        assert_eq!(
+            java.type_reference_owner(3, "Member"),
+            Some(&Some(("Fields::value".to_owned(), 3)))
         );
     }
 

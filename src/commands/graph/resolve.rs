@@ -1789,15 +1789,15 @@ impl Builder {
     fn java_subclass_of(&self, source: u32, ancestor: u32) -> bool {
         let mut enclosing = self.class_scope(source);
         while let Some(class) = enclosing {
-            let mut queue = VecDeque::from([(class, 0)]);
+            let mut queue = VecDeque::from([class]);
             let mut visited = HashSet::new();
-            while let Some((candidate, depth)) = queue.pop_front() {
+            while let Some(candidate) = queue.pop_front() {
                 if candidate == ancestor {
                     return true;
                 }
-                if depth < MAX_ANCESTOR_DEPTH && visited.insert(candidate) {
+                if visited.insert(candidate) {
                     if let Some(parents) = self.parents.get(&self.syms[candidate as usize].qual) {
-                        queue.extend(parents.iter().map(|&parent| (parent, depth + 1)));
+                        queue.extend(parents.iter().copied());
                     }
                 }
             }
@@ -1853,6 +1853,134 @@ impl Builder {
             .is_some_and(|declaration| declaration.static_member)
     }
 
+    /// Find member types before access filtering: a declaration hides inherited
+    /// names even when the declaration is inaccessible to the calling source.
+    fn java_member_types(&self, owner: u32, name: &str) -> Vec<u32> {
+        let mut pending = vec![owner];
+        let mut visited = HashSet::new();
+        let mut dependents: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut members: HashMap<u32, HashSet<u32>> = HashMap::new();
+        let mut changes = VecDeque::new();
+        while let Some(class) = pending.pop() {
+            if !visited.insert(class) {
+                continue;
+            }
+            let symbol = &self.syms[class as usize];
+            let declared: HashSet<_> = self
+                .by_qual
+                .get(&join_path(&symbol.qual, &[name]))
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&candidate| {
+                    let member = &self.syms[candidate as usize];
+                    member.container == Some(class) && is_container_kind(&member.kind)
+                })
+                .collect();
+            if !declared.is_empty() {
+                changes.extend(declared.iter().map(|&candidate| (class, candidate)));
+                members.insert(class, declared);
+                continue;
+            }
+            if let Some(parents) = self.parents.get(&symbol.qual) {
+                for &parent in parents {
+                    dependents.entry(parent).or_default().push(class);
+                    pending.push(parent);
+                }
+            }
+        }
+        // Propagate each identity once per class. This preserves diamond and
+        // package-path semantics without a depth cutoff, recursion or repeated
+        // enumeration of exponentially many inheritance paths. Cycles converge.
+        while let Some((parent, candidate)) = changes.pop_front() {
+            let member = &self.syms[candidate as usize];
+            let Some(java) = self.files[member.file as usize].java.as_ref() else {
+                continue;
+            };
+            let Some(declaration) = java.type_declaration(&member.qual, member.line) else {
+                continue;
+            };
+            for &child in dependents.get(&parent).into_iter().flatten() {
+                let inherited_here = match declaration.access {
+                    TypeAccess::Private => false,
+                    TypeAccess::Package => self.files[self.syms[child as usize].file as usize]
+                        .java
+                        .as_ref()
+                        .is_some_and(|child_java| child_java.package == java.package),
+                    TypeAccess::Public | TypeAccess::Protected => true,
+                };
+                if inherited_here && members.entry(child).or_default().insert(candidate) {
+                    changes.push_back((child, candidate));
+                }
+            }
+        }
+        let mut result: Vec<_> = members
+            .remove(&owner)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        result.sort_unstable();
+        result
+    }
+
+    /// Bind a qualified type path through inherited members, preserving the
+    /// declaring identity rather than inventing a subclass-qualified symbol.
+    fn java_qualified_types(
+        &self,
+        source: u32,
+        qualified: &str,
+        exclude: Option<u32>,
+    ) -> Option<Vec<u32>> {
+        let file = self.syms[source as usize].file;
+        let mut prefix = qualified;
+        let mut tail: Vec<&str> = Vec::new();
+        loop {
+            let declared: Vec<_> = self
+                .by_qual
+                .get(prefix)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&candidate| {
+                    is_container_kind(&self.syms[candidate as usize].kind)
+                        && self.family_of(candidate) == "jvm"
+                        && self.visible_from(file, candidate)
+                })
+                .collect();
+            if !declared.is_empty() {
+                let mut classes = declared;
+                classes.retain(|&candidate| self.java_type_accessible(source, candidate, false));
+                if classes.is_empty() {
+                    return Some(classes);
+                }
+                for name in tail.iter().rev() {
+                    classes = classes
+                        .into_iter()
+                        .flat_map(|owner| self.java_member_types(owner, name))
+                        .collect();
+                    if classes.is_empty() {
+                        return None;
+                    }
+                    classes
+                        .retain(|&candidate| self.java_type_accessible(source, candidate, false));
+                    if classes.is_empty() {
+                        return Some(classes);
+                    }
+                }
+                classes.retain(|&candidate| {
+                    Some(candidate) != exclude
+                        && self.java_type_accessible(source, candidate, false)
+                });
+                classes.sort_unstable();
+                classes.dedup();
+                return Some(classes);
+            }
+            let (parent, name) = prefix.rsplit_once("::")?;
+            tail.push(name);
+            prefix = parent;
+        }
+    }
+
     /// Java syntax name binding, shared by type references and receiver calls.
     /// An explicit external import binds even when no indexed declaration exists.
     fn resolve_java_type(
@@ -1867,26 +1995,31 @@ impl Builder {
             return Vec::new();
         };
         let lookup = |qualified: &str| -> Vec<u32> {
-            self.by_qual
-                .get(qualified)
-                .into_iter()
-                .flatten()
-                .copied()
-                .filter(|&candidate| {
-                    Some(candidate) != exclude
-                        && is_container_kind(&self.syms[candidate as usize].kind)
-                        && self.family_of(candidate) == "jvm"
-                        && self.visible_from(file, candidate)
-                        && self.java_type_accessible(source, candidate, false)
-                })
-                .collect()
+            self.java_qualified_types(source, qualified, exclude)
+                .unwrap_or_default()
         };
+        let (head, tail) = declared.split_once("::").unwrap_or((declared, ""));
+        // A known rejected type import must not become a valid edge through
+        // lexical inheritance. An external import may instead name a method
+        // or field, so absence alone cannot invalidate a lexical type.
+        for binding in &java.static_imports {
+            let types = lookup(binding);
+            if binding.rsplit("::").next() == Some(head)
+                && !types.is_empty()
+                && !types.iter().any(|&class| {
+                    self.java_static_type(class) && self.java_type_accessible(source, class, true)
+                })
+            {
+                return Vec::new();
+            }
+        }
         // Enclosing/nested types shadow imports. Do not broaden named-package
         // lookup into inaccessible classes in the default package.
         let mut namespace = namespace;
         while namespace != java.package {
-            let classes = lookup(&join_path(namespace, &[declared]));
-            if !classes.is_empty() {
+            if let Some(classes) =
+                self.java_qualified_types(source, &join_path(namespace, &[declared]), exclude)
+            {
                 return classes;
             }
             let Some((parent, _)) = namespace.rsplit_once("::") else {
@@ -1894,7 +2027,6 @@ impl Builder {
             };
             namespace = parent;
         }
-        let (head, tail) = declared.split_once("::").unwrap_or((declared, ""));
         let mut imported = Vec::new();
         let mut explicit_import = false;
         for binding in &java.imports {
@@ -4498,7 +4630,27 @@ fn resolve_file(
     batch.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     for (name, line, context) in batch {
         out.references_seen += 1;
-        let Some(source) = builder.owner(file_node, line) else {
+        let source = match file_node
+            .java
+            .as_ref()
+            .and_then(|java| java.type_reference_owner(line, &name))
+        {
+            Some(Some((qualified, owner_line))) => {
+                let mut owners = file_node.symbols.iter().copied().filter(|&candidate| {
+                    let symbol = &builder.syms[candidate as usize];
+                    symbol.qual == *qualified && symbol.line == *owner_line
+                });
+                let first = owners.next();
+                if owners.next().is_none() {
+                    first
+                } else {
+                    None
+                }
+            }
+            Some(None) => None,
+            None => builder.owner(file_node, line),
+        };
+        let Some(source) = source else {
             *out.dropped.entry(DropReason::NoOwner).or_default() += 1;
             continue;
         };
