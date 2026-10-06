@@ -49,6 +49,13 @@ This is independent source/state coverage, not MCP equivalence; compiler-wide
 dispatch, local-class shadows and attached roots remain pending in the broader
 semantic contracts.
 
+The local-interface fixture compiles small Java sources with javac and checks
+declaration, block and sibling-method boundaries, nested types and static
+members through graph pages, reverse edges, paths and exploration. It uses a
+complete private file inventory and rejects silent applicability skips. This
+is independent source/state coverage, not MCP equivalence; declaration-site
+receiver binding and compiler-wide local-type/overload dispatch remain pending.
+
 Commands without an equivalent Index MCP operation use separately labelled
 independent source/state or internal CLI checks. Synthetic Java fixtures complement
 live project checks; they do not replace unresolved target or syntax contracts.

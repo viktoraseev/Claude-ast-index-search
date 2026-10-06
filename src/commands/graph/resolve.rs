@@ -866,6 +866,10 @@ impl Builder {
                     let sym = &self.syms[s as usize];
                     (sym.line, sym.end)
                 };
+                let syntax_container = file
+                    .java
+                    .as_ref()
+                    .and_then(|java| java.member_container(&self.syms[s as usize].name, line));
                 while stack
                     .last()
                     .is_some_and(|&top| self.syms[top as usize].end < line)
@@ -874,6 +878,10 @@ impl Builder {
                 }
                 let container = stack.iter().rev().copied().find(|&c| {
                     self.syms[c as usize].end >= end
+                        && syntax_container.is_none_or(|(qual, owner_line)| {
+                            self.syms[c as usize].qual == *qual
+                                && self.syms[c as usize].line == *owner_line
+                        })
                         && java_qual.as_deref().is_none_or(|qual| {
                             qual.rsplit_once("::")
                                 .is_some_and(|(parent, _)| parent == self.syms[c as usize].qual)
@@ -1654,6 +1662,9 @@ impl Builder {
         let mut seen: HashSet<u32> = HashSet::from([class]);
         while let Some((current, depth)) = queue.pop_front() {
             let key = format!("{}::{}", self.syms[current as usize].qual, member);
+            let java_class = self.files[self.syms[current as usize].file as usize]
+                .java
+                .is_some();
             let hits: Vec<u32> = self
                 .by_qual
                 .get(&key)
@@ -1662,7 +1673,10 @@ impl Builder {
                         .iter()
                         .copied()
                         .filter(|&c| {
-                            self.family_of(c) == family && c != source && self.visible_from(file, c)
+                            self.family_of(c) == family
+                                && c != source
+                                && self.visible_from(file, c)
+                                && (!java_class || self.syms[c as usize].container == Some(current))
                         })
                         .collect()
                 })
@@ -4399,6 +4413,27 @@ impl Builder {
                 }
                 self.resolve_java_type(source, self.namespace_of(source), path, None)
             });
+            let type_classes = type_classes.or_else(|| {
+                if call.arguments.is_none() {
+                    return None;
+                }
+                let JavaReceiver::Type(path) = &call.receiver else {
+                    return None;
+                };
+                // Only syntax-confirmed type qualifiers use the call site.
+                // A variable's declared type belongs to its declaration site.
+                java.type_reference(line, path)
+                    .and_then(Option::as_ref)
+                    .map(|_| {
+                        self.resolve_java_type_at(
+                            source,
+                            self.namespace_of(source),
+                            path,
+                            None,
+                            Some(line),
+                        )
+                    })
+            });
             let reference_is_type = type_classes
                 .as_ref()
                 .is_some_and(|classes| !classes.is_empty());
@@ -4714,6 +4749,7 @@ impl Builder {
         if let Some(binding) = node
             .java
             .as_ref()
+            .filter(|java| !java.value_receiver(line, name))
             .and_then(|java| java.type_reference(line, name))
         {
             let Some(path) = binding else {
@@ -4799,6 +4835,13 @@ impl Builder {
             // Callable dependencies require invocation/reference syntax.
             // A component field read must not invent a call to its getter.
             cands.retain(|&candidate| self.syms[candidate as usize].kind != "function");
+            if node
+                .java
+                .as_ref()
+                .is_some_and(|java| java.value_receiver(line, name))
+            {
+                cands.retain(|&candidate| !is_container_kind(&self.syms[candidate as usize].kind));
+            }
         }
         if cands.iter().any(|&c| {
             let sym = &self.syms[c as usize];

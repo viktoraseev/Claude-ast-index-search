@@ -48,7 +48,9 @@ pub(super) struct JavaSource {
     pub static_imports: Vec<String>,
     declarations: HashMap<(String, i64), TypeDeclaration>,
     declaration_ranges: HashMap<(String, i64), Option<Range<usize>>>,
+    member_containers: HashMap<(String, i64), Option<(String, i64)>>,
     type_positions: HashMap<(i64, String), Vec<usize>>,
+    value_receivers: HashSet<(i64, String)>,
     /// Reference rows carry a line and name, not a byte position. Colliding
     /// paths or value/type uses on one line remain explicit negative evidence.
     types: HashMap<(i64, String), Option<String>>,
@@ -2415,6 +2417,7 @@ impl JavaSource {
                                     if matches!(
                                         declaration.kind(),
                                         "class_declaration"
+                                            | "interface_declaration"
                                             | "enum_declaration"
                                             | "record_declaration"
                                     ) {
@@ -2512,6 +2515,48 @@ impl JavaSource {
             });
             if declaration_name {
                 if let Some(declaration) = parent {
+                    let mut ancestor = declaration.parent();
+                    let mut path = Vec::new();
+                    let mut owner_line = None;
+                    while let Some(owner) = ancestor {
+                        if matches!(
+                            owner.kind(),
+                            "class_declaration"
+                                | "interface_declaration"
+                                | "enum_declaration"
+                                | "record_declaration"
+                                | "annotation_type_declaration"
+                        ) {
+                            if let Some(name) = owner.child_by_field_name("name") {
+                                owner_line.get_or_insert(name.start_position().row as i64 + 1);
+                                path.push(text(name, source));
+                            }
+                        }
+                        ancestor = owner.parent();
+                    }
+                    path.reverse();
+                    let container = owner_line.map(|line| {
+                        (
+                            if result.package.is_empty() {
+                                path.join("::")
+                            } else {
+                                format!("{}::{}", result.package, path.join("::"))
+                            },
+                            line,
+                        )
+                    });
+                    result
+                        .member_containers
+                        .entry((
+                            text(node, source).to_owned(),
+                            node.start_position().row as i64 + 1,
+                        ))
+                        .and_modify(|previous| {
+                            if *previous != container {
+                                *previous = None;
+                            }
+                        })
+                        .or_insert(container);
                     let range = declaration.byte_range();
                     result
                         .declaration_ranges
@@ -2530,11 +2575,30 @@ impl JavaSource {
             }
             let annotation = parent
                 .is_some_and(|parent| matches!(parent.kind(), "annotation" | "marker_annotation"));
-            let typed = node.kind() == "type_identifier" || annotation;
+            // An unbound simple invocation qualifier occupies a type-name
+            // site. A variable or captured field with the same spelling does
+            // not, even when its declared type has that name.
+            let invocation_receiver = node.kind() == "identifier"
+                && parent.is_some_and(|parent| {
+                    parent.kind() == "method_invocation"
+                        && parent
+                            .child_by_field_name("object")
+                            .is_some_and(|object| object.id() == node.id())
+                });
+            let type_receiver = invocation_receiver
+                && variable_type(node, text(node, source), false, &scopes, source).is_none()
+                && callable(node).is_some_and(|owner| {
+                    matches!(expression_receiver(node, owner, source, &scopes, 0),
+                        JavaReceiver::Type(path) if path == text(node, source))
+                });
+            let typed = node.kind() == "type_identifier" || annotation || invocation_receiver;
             let key = (
                 node.start_position().row as i64 + 1,
                 text(node, source).to_owned(),
             );
+            if invocation_receiver && !type_receiver {
+                result.value_receivers.insert(key.clone());
+            }
             let binding = if typed {
                 type_sites.insert(key.clone());
                 result
@@ -2622,6 +2686,7 @@ impl JavaSource {
                 }
                 type_name(path, source).filter(|name| {
                     !path.has_error()
+                        && (!invocation_receiver || type_receiver)
                         && !type_parameter(
                             node,
                             name.split("::").next().unwrap_or_default(),
@@ -3511,6 +3576,12 @@ impl JavaSource {
         self.declarations.get(&(name.to_owned(), line))
     }
 
+    pub fn member_container(&self, name: &str, line: i64) -> Option<&(String, i64)> {
+        self.member_containers
+            .get(&(name.to_owned(), line))?
+            .as_ref()
+    }
+
     /// Local names must stay inside their declaring block, including members
     /// of local classes. Byte positions distinguish adjacent scopes on a line.
     pub fn type_in_scope(
@@ -3545,6 +3616,10 @@ impl JavaSource {
 
     pub fn type_reference(&self, line: i64, name: &str) -> Option<&Option<String>> {
         self.types.get(&(line, name.to_owned()))
+    }
+
+    pub fn value_receiver(&self, line: i64, name: &str) -> bool {
+        self.value_receivers.contains(&(line, name.to_owned()))
     }
 
     pub fn type_reference_owner(&self, line: i64, name: &str) -> Option<&Option<(String, i64)>> {

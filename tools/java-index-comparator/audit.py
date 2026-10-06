@@ -57,6 +57,7 @@ import explore_contracts
 import graph_contracts
 import java_receiver_contracts
 import java_exception_scope_contracts
+import java_local_interface_contracts
 import java_pattern_scope_contracts
 import java_type_binding_contracts
 import java_type_access_contracts
@@ -533,6 +534,7 @@ class Fixture:
         self._graph_results = None
         self._receiver_results = None
         self._exception_scope_results = None
+        self._local_interface_results = None
         self._pattern_scope_results = None
         self._type_access_results = None
         self._inherited_type_results = None
@@ -1832,6 +1834,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def local_interface_check(self, check: sqlite3.Row):
+        if self._local_interface_results is None:
+            self._local_interface_results = java_local_interface_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._local_interface_results)
+        return {'source': java_local_interface_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def parent_check(self, check: sqlite3.Row):
         if self._parent_results is None:
             self._parent_results = java_parent_contracts.exercise(self.binary, self.database.parent)
@@ -2127,6 +2137,8 @@ class Fixture:
                 handler = self.type_access_check
             if check['feature'] in java_exception_scope_contracts.FEATURES:
                 handler = self.exception_scope_check
+            if check['feature'] in java_local_interface_contracts.FEATURES:
+                handler = self.local_interface_check
             if check['feature'] in java_pattern_scope_contracts.FEATURES:
                 handler = self.pattern_scope_check
             if check['feature'] in java_receiver_contracts.FEATURES:
@@ -2264,6 +2276,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_receiver_contracts.FEATURES)
     features.update(java_pattern_scope_contracts.FEATURES)
     features.update(java_exception_scope_contracts.FEATURES)
+    features.update(java_local_interface_contracts.FEATURES)
     features.update(java_type_binding_contracts.FEATURES)
     features.update(java_type_access_contracts.FEATURES)
     features.update(java_inherited_type_contracts.FEATURES)
@@ -2428,6 +2441,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     graph_contracts.plan_graph(state, root)
     java_receiver_contracts.plan_receivers(state, root)
     java_exception_scope_contracts.plan_scopes(state, root)
+    java_local_interface_contracts.plan_interfaces(state, root)
     java_pattern_scope_contracts.plan_scopes(state, root)
     java_type_binding_contracts.plan_types(state, root)
     java_type_access_contracts.plan_access(state, root)
