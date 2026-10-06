@@ -2002,6 +2002,12 @@ class Fixture:
         if self._selector_error_results is None:
             self._selector_error_results = selector_error_contracts.exercise(self.binary, self.database.parent)
         expected, actual = (section[check['feature']] for section in self._selector_error_results)
+        required = selector_error_contracts.acceptance_keys(check['feature'])
+        # A fixture returning matching partial samples is still incomplete.
+        # Preserve every comparison and independently require execution keys.
+        expected, actual = dict(expected), dict(actual)
+        complete = required <= expected.keys() and required <= actual.keys()
+        expected['acceptance_complete'], actual['acceptance_complete'] = True, complete
         return {'source': selector_error_contracts.REASON, 'samples': expected}, actual, \
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
