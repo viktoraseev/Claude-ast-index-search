@@ -107,6 +107,35 @@ class Probe {
         self.assertEqual(result['verdict'], 'unsupported')
         self.assertIn('bounded-memory', result['error'])
 
+    def test_same_line_overloads_require_every_selected_declaration(self):
+        self.source = self.source.replace(' static int seed() { return seed(); }',
+            ' static int seed() { return seed(); } static int seed(int value) { return value; }')
+        (self.root / 'Probe.java').write_text(self.source)
+        self.fixture.text_cli('rebuild', '--force')
+        callers.plan_methods(self.state, self.root, [{'path': 'Probe.java'}], self.fixture.structure)
+        self.assertEqual(self.state.execute("SELECT count(*) FROM call_hierarchy_anchors WHERE name='seed'").fetchone()[0], 2)
+        self.assertEqual(self.evaluate()['verdict'], 'pass')
+        original = graph.native_dependents
+        def lose_overload(fixture, check):
+            doc = original(fixture, check)
+            self.assertEqual(len(doc['matched']), 2)
+            doc['matched'].pop()
+            return doc
+        with patch.object(graph, 'native_dependents', side_effect=lose_overload):
+            result = self.evaluate()
+        self.assertEqual(result['verdict'], 'unsupported')
+        self.assertIn('seed identities differ', result['error'])
+        # Keep the injected owner payload below the budget to isolate the
+        # independent declaration-count guard, before any native query.
+        truth = {'source': 'live MCP budget test double', 'items': self.owners[:1]}
+        self.state.execute("UPDATE checks SET expected_json=? WHERE feature=? AND subject='seed'",
+                           (json.dumps(truth), callers.FEATURE))
+        with patch.object(graph, 'MAX_CALLERS', 1), patch.object(graph, 'native_dependents') as native:
+            result = self.evaluate()
+        self.assertEqual(result['verdict'], 'unsupported')
+        self.assertIn('independent callable seed cap', result['error'])
+        native.assert_not_called()
+
     def test_planning_is_resumable_and_supported_feature_is_required(self):
         before = list(self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id'))
         graph.plan(self.state)

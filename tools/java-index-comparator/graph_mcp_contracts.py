@@ -5,6 +5,7 @@ Initializer owners are properties/constants, not necessarily functions.
 Neither native index rows nor graph edges supply oracle expectations.
 """
 import json
+from collections import Counter
 from pathlib import Path
 import subprocess
 import time
@@ -96,11 +97,13 @@ def exercise(fixture, check):
         raise ScopeUnsupported('MCP caller owner cap exceeded')
     root = fixture.root.resolve()
     owners = {identity(item, root) for item in truth['items']}
-    seeds = set()
+    seeds = Counter()
+    seed_total = 0
     for row in fixture.state.execute('SELECT path,line,name FROM call_hierarchy_anchors WHERE name=?',
                                      (check['subject'],)):
-        seeds.add(identity(tuple(row), root))
-        if len(seeds) > MAX_CALLERS:
+        seeds[identity(tuple(row), root)] += 1
+        seed_total += 1
+        if seed_total > MAX_CALLERS:
             raise ScopeUnsupported('independent callable seed cap exceeded')
     if not seeds:
         raise ScopeUnsupported('graph comparison has no independent callable anchors')
@@ -112,11 +115,13 @@ def exercise(fixture, check):
         raise ScopeUnsupported('graph did not select the independently planned callable scope')
     if not isinstance(doc.get('matched'), list) or not isinstance(doc.get('items'), list):
         raise ToolError('malformed graph dependent response')
-    matched = set()
+    if len(doc['matched']) > MAX_CALLERS:
+        raise ScopeUnsupported('native callable seed cap exceeded')
+    matched = Counter()
     for item in doc['matched']:
         if not isinstance(item, dict) or item.get('kind') != 'function':
             raise ScopeUnsupported('graph selected a non-callable entity')
-        matched.add(identity([item.get(key) for key in ('path', 'line', 'name')], root))
+        matched[identity([item.get(key) for key in ('path', 'line', 'name')], root)] += 1
     if matched != seeds:
         raise ScopeUnsupported('graph and MCP callable seed identities differ')
     pagination = doc.get('pagination', {})
@@ -137,7 +142,7 @@ def exercise(fixture, check):
             actual.add(owner)
     # Native graph's public contract excludes ALL edges internal to subjects,
     # not only recursion. Keep raw oracle owners and seeds as durable evidence.
-    expected = owners - seeds
+    expected = owners - set(seeds)
     return {'source': REASON, 'source_case_id': source['id'], 'oracle_owners': sorted(owners),
             'selected_seeds': sorted(seeds), 'items': sorted(expected)}, \
            {'items': sorted(actual)}, expected, actual

@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 use anyhow::Result;
 use tree_sitter::{Language, Node};
 
+use crate::parsers::treesitter::java::pattern_flow_scopes;
 use crate::parsers::treesitter::{parse_tree, walk_tree_preorder, WalkControl};
 
 static LANGUAGE: LazyLock<Language> = LazyLock::new(|| tree_sitter_java::LANGUAGE.into());
@@ -178,120 +179,6 @@ struct VariableBinding {
 }
 
 type VariableScopes = HashMap<usize, HashMap<String, Vec<VariableBinding>>>;
-
-/// Check where a pattern is definitely matched, without lending its type to
-/// the opposite branch or to expressions evaluated before the match.
-fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(Node<'a>, usize)> {
-    let mut scopes = Vec::new();
-    let mut expression = pattern;
-    let (mut on_true, mut on_false) = (true, false);
-    let position = pattern.end_byte();
-    while let Some(parent) = expression.parent() {
-        match parent.kind() {
-            "parenthesized_expression" => {}
-            "unary_expression"
-                if parent
-                    .child_by_field_name("operator")
-                    .is_some_and(|op| text(op, source) == "!") =>
-            {
-                std::mem::swap(&mut on_true, &mut on_false);
-            }
-            "binary_expression" => {
-                let operator = parent.child_by_field_name("operator");
-                let operator = operator.map(|op| text(op, source)).unwrap_or_default();
-                if !matches!(operator, "&&" | "||") {
-                    break;
-                }
-                if parent
-                    .child_by_field_name("left")
-                    .is_some_and(|left| left.id() == expression.id())
-                    && ((operator == "&&" && on_true) || (operator == "||" && on_false))
-                {
-                    if let Some(right) = parent.child_by_field_name("right") {
-                        scopes.push((right, position));
-                    }
-                }
-                // A conjunction can be false without evaluating the pattern;
-                // a disjunction can be true without matching it.
-                if operator == "&&" {
-                    on_false = false;
-                } else {
-                    on_true = false;
-                }
-            }
-            "ternary_expression" | "if_statement" => {
-                if !parent
-                    .child_by_field_name("condition")
-                    .is_some_and(|condition| condition.id() == expression.id())
-                {
-                    break;
-                }
-                let consequence = parent.child_by_field_name("consequence");
-                let alternative = parent.child_by_field_name("alternative");
-                for (branch, matched) in [(consequence, on_true), (alternative, on_false)] {
-                    if matched {
-                        scopes.extend(branch.map(|branch| (branch, position)));
-                    }
-                }
-                if parent.kind() == "if_statement" {
-                    let terminal = |branch: Option<Node<'_>>| {
-                        branch
-                            .and_then(|branch| {
-                                if branch.kind() == "block" {
-                                    branch.named_child(
-                                        branch.named_child_count().saturating_sub(1) as u32
-                                    )
-                                } else {
-                                    Some(branch)
-                                }
-                            })
-                            .is_some_and(|node| {
-                                matches!(node.kind(), "return_statement" | "throw_statement")
-                            })
-                    };
-                    // Retain simple abrupt guards. General reachability,
-                    // labelled breaks and loop-exit flow need more evidence.
-                    if (on_false && terminal(consequence) && alternative.is_none())
-                        || (on_true && terminal(alternative) && !terminal(consequence))
-                    {
-                        if let Some(block) = parent
-                            .parent()
-                            .filter(|node| matches!(node.kind(), "block" | "constructor_body"))
-                        {
-                            scopes.push((block, parent.end_byte()));
-                        }
-                    }
-                }
-                break;
-            }
-            "while_statement" | "for_statement" => {
-                if on_true
-                    && parent
-                        .child_by_field_name("condition")
-                        .is_some_and(|condition| condition.id() == expression.id())
-                {
-                    scopes.extend(
-                        parent
-                            .child_by_field_name("body")
-                            .map(|body| (body, position)),
-                    );
-                    if parent.kind() == "for_statement" {
-                        let mut cursor = parent.walk();
-                        scopes.extend(
-                            parent
-                                .children_by_field_name("update", &mut cursor)
-                                .map(|update| (update, position)),
-                        );
-                    }
-                }
-                break;
-            }
-            _ => break,
-        }
-        expression = parent;
-    }
-    scopes
-}
 
 /// Temporary per-file lexical inventory, discarded after deriving calls.
 /// Index scopes once instead of rescanning every declaration for each call.

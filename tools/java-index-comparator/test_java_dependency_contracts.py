@@ -91,17 +91,19 @@ class JavaDependencyContracts(unittest.TestCase):
 
     def test_shadow_contract_requires_complete_inventory_and_cannot_skip(self):
         self.assertIn(contracts.SHADOWS, required_features())
+        self.assertIn(contracts.FLOW, required_features())
         before = [tuple(row) for row in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')]
         contracts.plan_dependencies(self.state, self.root)
         self.assertEqual(before, [tuple(row) for row in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')])
         coverage = self.state.execute('SELECT * FROM coverage WHERE feature=?', (contracts.SHADOWS,)).fetchone()
         self.assertEqual(coverage['status'], 'implemented')
         self.assertTrue(coverage['reason'].startswith('independent source/state:'))
-        for observed in ({}, {'scope': 'inapplicable'}, {'scope': []}):
-            self.fixture._java_dependency_results = None
-            with patch.object(contracts, 'exercise', return_value=(
-                    {contracts.SHADOWS: {'scope': ['alpha']}}, {contracts.SHADOWS: observed})):
-                self.assertEqual(self.evaluate(contracts.SHADOWS)['verdict'], 'fail')
+        for feature in (contracts.SHADOWS, contracts.FLOW):
+            for observed in ({}, {'scope': 'inapplicable'}, {'scope': []}):
+                self.fixture._java_dependency_results = None
+                with patch.object(contracts, 'exercise', return_value=(
+                        {feature: {'scope': ['alpha']}}, {feature: observed})):
+                    self.assertEqual(self.evaluate(feature)['verdict'], 'fail')
         inventory = mobile_contracts.inventory
         def incomplete(state, root):
             inventory(state, root)

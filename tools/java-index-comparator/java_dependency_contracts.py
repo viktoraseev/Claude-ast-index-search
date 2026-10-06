@@ -10,10 +10,11 @@ from root_contracts import Runner
 from unused_dep_contracts import result
 
 SHADOWS = 'unused-deps:java-lexical-shadows'
-FEATURES = {'unused-deps:java-imports', 'unused-deps:java-qualified-types', SHADOWS}
+FLOW = 'unused-deps:java-flow-shadows'
+FEATURES = {'unused-deps:java-imports', 'unused-deps:java-qualified-types', SHADOWS, FLOW}
 REASON = ('independent source/state: disposable Java explicit/static/import-only and wildcard '
           'imports, qualified/nested/annotation types, package precedence, API exports and '
-          'javac-validated lexical type/value shadow boundaries; '
+          'javac-validated lexical type/value, boolean pattern, loop and resource shadow boundaries; '
           'not MCP equivalence or compiler-wide semantic resolution')
 
 
@@ -27,9 +28,10 @@ def plan_dependencies(state, root):
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
         state.execute("UPDATE coverage SET reason=? WHERE feature='unused-deps:semantic-resolution' AND status='pending'",
-                      ('Java declaration-site lexical type/value shadows have a separate javac-validated '
+                      ('Java declaration-site lexical type/value shadows and boolean-flow/loop/resource '
+                       'receiver boundaries have separate javac-validated '
                        'JSON/text contract; visibility, ambiguous wildcard imports, inherited/nested static '
-                       'members, pattern/resource variable flow, receiver dispatch and attached-root resolution '
+                       'members, compiler-wide pattern reachability, receiver dispatch and attached-root resolution '
                        'remain unresolved; independent source/state coverage is not MCP equivalence',))
 
 
@@ -106,6 +108,40 @@ def exercise(binary, base):
             ('qualified-type-value-shadow', 'class Use { String alpha = ""; alpha.Widget field; }', 'alpha', 'Widget'),
         ]
         cases += shadow_cases
+        # Pattern variables shadow expression receivers only on definitely
+        # matched paths. Resources cover later initializers and the try body,
+        # but not catch/finally or the containing method. All sources compile.
+        flow_cases = [
+            ('pattern-and', 'boolean local(Object x) { return x instanceof String Signal && Signal.isEmpty(); }', False),
+            ('pattern-nested-and', 'boolean local(Object x) { return (x instanceof String Signal && Signal.isEmpty()) && Signal.isBlank(); }', False),
+            ('pattern-negated-or', 'boolean local(Object x) { return !(x instanceof String Signal) || Signal.isEmpty(); }', False),
+            ('pattern-double-not', 'boolean local(Object x) { if (!!(x instanceof String Signal)) return Signal.isEmpty(); return false; }', False),
+            ('pattern-opposite-branch', 'int local(Object x) { if (x instanceof String Signal) return Signal.length(); else return Signal.VALUE; }', True),
+            ('pattern-negated-else', 'int local(Object x) { if (!(x instanceof String Signal)) return 0; else return Signal.length(); }', False),
+            ('pattern-return-guard', 'int local(Object x) { if (!(x instanceof String Signal)) return 0; return Signal.length(); }', False),
+            ('pattern-throw-guard', 'int local(Object x) { if (!(x instanceof String Signal)) throw new IllegalArgumentException(); return Signal.length(); }', False),
+            ('pattern-while', 'void local(Object x) { while (x instanceof String Signal) { Signal.length(); break; } }', False),
+            ('pattern-for', 'void local(Object x) { for (; x instanceof String Signal; x = Signal.trim()) { Signal.length(); break; } }', False),
+            ('pattern-loop-outside', 'int local(Object x) { while (x instanceof String Signal) { Signal.length(); break; } return Signal.VALUE; }', True),
+            ('pattern-ternary', 'int local(Object x) { return x instanceof String Signal ? Signal.length() : 0; }', False),
+            ('pattern-ternary-opposite', 'int local(Object x) { return x instanceof String Signal ? Signal.length() : Signal.VALUE; }', True),
+            ('pattern-do-before', 'void local(Object x) { do { int n = Signal.VALUE; } while (x instanceof String Signal); }', True),
+            ('pattern-disjunction', 'boolean local(Object x) { return x instanceof String Signal || Signal.VALUE > 0; }', True),
+            ('pattern-type-namespace', 'int local(Object x) { if (x instanceof String Signal) { Signal typed = null; return Signal.length(); } return 0; }', True),
+            ('resource-body', 'void local() { try (java.io.StringReader Signal = new java.io.StringReader("")) { Signal.read(); } catch (java.io.IOException e) {} }', False),
+            ('resource-later-initializer', 'void local() { try (java.io.StringReader Signal = new java.io.StringReader(""); java.io.StringReader other = new java.io.StringReader(Signal.toString())) { Signal.read(); } catch (java.io.IOException e) {} }', False),
+            ('resource-earlier-initializer', 'void local() { try (java.io.StringReader first = new java.io.StringReader("" + Signal.VALUE); java.io.StringReader Signal = new java.io.StringReader("")) { Signal.read(); } catch (java.io.IOException e) {} }', True),
+            ('resource-catch', 'int local() { try (java.io.StringReader Signal = new java.io.StringReader("")) { Signal.read(); } catch (java.io.IOException e) { return Signal.VALUE; } return 0; }', True),
+            ('resource-finally', 'void local() { try (java.io.StringReader Signal = new java.io.StringReader("")) { Signal.read(); } catch (java.io.IOException e) {} finally { int n = Signal.VALUE; } }', True),
+            ('resource-outside', 'int local() { try (java.io.StringReader Signal = new java.io.StringReader("")) { Signal.read(); } catch (java.io.IOException e) {} return Signal.VALUE; }', True),
+            ('resource-type-namespace', 'void local() { try (java.io.StringReader Signal = new java.io.StringReader("")) { Signal typed = null; Signal.read(); } catch (java.io.IOException e) {} }', True),
+            ('enhanced-for-body', 'void local(String[] xs) { for (String Signal : xs) { Signal.length(); } }', False),
+            ('enhanced-for-expression', 'void local() { for (String Signal : new String[]{"" + Signal.VALUE}) { Signal.length(); } }', True),
+            ('for-local-boundary', 'int local() { for (String Signal = ""; Signal.isEmpty(); Signal = "x") { Signal.length(); } return Signal.VALUE; }', True),
+        ]
+        cases += [(label, 'import alpha.*; class Use { ' + body + ' }',
+                   'alpha' if used else None, 'Signal' if used else None)
+                  for label, body, used in flow_cases]
         for number, (label, source, owner, names) in enumerate(cases):
             name = f'consumer{number}'
             deps = ('facade', 'beta', 'idle') if owner == 'facade' else ('alpha', 'beta', 'idle')
@@ -121,7 +157,8 @@ def exercise(binary, base):
             want = {'.java': len(cases) + 7, '.gradle': len(cases) + 4, '.txt': 1}
             if counts != want:
                 raise ToolError('Java dependency full inventory incomplete')
-            expected[SHADOWS]['inventory'], actual[SHADOWS]['inventory'] = want, counts
+            for feature in (SHADOWS, FLOW):
+                expected[feature]['inventory'], actual[feature]['inventory'] = want, counts
         finally:
             inventory_state.close()
         # Independently prove the small authored sources are valid Java. The
@@ -137,10 +174,12 @@ def exercise(binary, base):
                 *map(str, sources)], stdout=stdout, stderr=stderr, timeout=30)
         if compilation.returncode:
             raise ToolError('authored Java dependency sources did not compile; see private fixture logs')
-        expected[SHADOWS]['javac'] = {'exit': 0, 'sources': len(cases) + 7}
-        actual[SHADOWS]['javac'] = {'exit': compilation.returncode, 'sources': len(sources)}
+        for feature in (SHADOWS, FLOW):
+            expected[feature]['javac'] = {'exit': 0, 'sources': len(cases) + 7}
+            actual[feature]['javac'] = {'exit': compilation.returncode, 'sources': len(sources)}
         runner.command('rebuild', '--force', '--max-files', '0')
         shadow_labels = {case[0] for case in shadow_cases}
+        flow_labels = {case[0] for case in flow_cases}
         for number, (label, source, owner, names) in enumerate(cases):
             transitive = owner == 'facade'
             feature = 'unused-deps:java-imports' if label in {
@@ -148,6 +187,8 @@ def exercise(binary, base):
             } else 'unused-deps:java-qualified-types'
             if label in shadow_labels:
                 feature = SHADOWS
+            if label in flow_labels:
+                feature = FLOW
             flags = ('--no-xml', '--no-resources', '--verbose') if transitive else ('--strict', '--verbose')
             _, output = runner.command('unused-deps', f'consumer{number}', *flags)
             deps = ['facade', 'beta', 'idle'] if transitive else ['alpha', 'beta', 'idle']
@@ -162,9 +203,9 @@ def exercise(binary, base):
                 'strict': not transitive, 'transitive_section': transitive,
             }
             actual[feature][label] = result(output, True)
-            if feature == SHADOWS:
+            if feature in (SHADOWS, FLOW):
                 document = runner.json('unused-deps', f'consumer{number}', *flags)
-                expected[SHADOWS][label + ':json'] = {
+                expected[feature][label + ':json'] = {
                     'summary': {'unused': 3 - int(owner is not None), 'exported': 0,
                         'used': int(owner is not None), 'total': 3, 'direct': int(owner is not None),
                         'transitive': 0, 'xml': 0, 'resources': 0},
@@ -172,7 +213,7 @@ def exercise(binary, base):
                         len(names.split(', ')) if dep == owner else 0,
                         names.split(', ') if dep == owner else []) for dep in deps),
                 }
-                actual[SHADOWS][label + ':json'] = {
+                actual[feature][label + ':json'] = {
                     'summary': document.get('summary'),
                     'items': sorted((item['name'], item['category'], item['usage']['direct'],
                                      item['examples']['direct']) for item in document['items']),
