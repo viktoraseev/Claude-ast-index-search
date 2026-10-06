@@ -2209,11 +2209,13 @@ fn java_dependency_declaration(
 ) -> Result<Option<crate::parsers::treesitter::java::DependencyImportDeclaration>> {
     let mut statement = conn.prepare_cached(
         "SELECT DISTINCT f.path,f.root_path FROM symbols s JOIN files f ON s.file_id=f.id
+         JOIN temp.java_dependency_scope scope ON scope.file_id=f.id
          WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
-         AND s.kind IN ('class','interface','enum') ORDER BY f.path,f.root_path",
+         AND s.kind IN ('class','interface','enum')
+         ORDER BY scope.is_consumer DESC,f.path,f.root_path LIMIT 1",
     )?;
     let mut rows = statement.query(params![qualified])?;
-    while let Some(row) = rows.next()? {
+    if let Some(row) = rows.next()? {
         let path: String = row.get(0)?;
         let owner: String = row.get(1)?;
         let content = super::grep::read_java_syntax_source(
@@ -2244,6 +2246,34 @@ fn count_symbols_used_in_module(
 ) -> Result<(usize, Vec<String>)> {
     let used = UsedDependencySymbols::new()?;
 
+    // Bind declarations to the selected consumer's classpath before reading
+    // accessibility or member metadata. Unrelated roots/modules cannot supply
+    // a more accessible copy of an identical Java qualified name. Consumer
+    // sources take precedence over dependency classes with that identity.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS java_dependency_scope(
+             file_id INTEGER PRIMARY KEY, is_consumer INTEGER NOT NULL);
+         DELETE FROM temp.java_dependency_scope;",
+    )?;
+    let membership = MODULE_FILE_SCOPE.replace("?1", "m.path");
+    conn.execute(
+        &format!(
+            "WITH RECURSIVE consumer(id) AS (
+                 SELECT id FROM modules WHERE path=?1 AND (?2='' OR root_path=?2)
+             ), classpath(id) AS (
+                 SELECT id FROM consumer
+                 UNION SELECT d.dep_module_id FROM module_deps d JOIN consumer c ON c.id=d.module_id
+                 UNION SELECT d.dep_module_id FROM module_deps d JOIN classpath c ON c.id=d.module_id
+                       WHERE d.dep_kind='api'
+             )
+             INSERT INTO temp.java_dependency_scope
+             SELECT f.id,EXISTS(SELECT 1 FROM consumer c WHERE c.id=m.id)
+             FROM files f JOIN modules m ON (m.root_path='' OR m.root_path=f.root_path)
+             JOIN classpath c ON c.id=m.id WHERE {membership} AND substr(f.path,-5)='.java'"
+        ),
+        params![module_path, module_root],
+    )?;
+
     // Bare refs cannot distinguish alpha.Widget from beta.Widget and omit
     // import-only/static anchors. Stream Java files, retaining one syntax tree
     // at a time, and ask the index only for exact declaration identities.
@@ -2258,13 +2288,20 @@ fn count_symbols_used_in_module(
     )?;
     let mut exists = conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM symbols s JOIN files f ON s.file_id=f.id
+         JOIN temp.java_dependency_scope scope ON scope.file_id=f.id
          WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
          AND s.kind IN ('class','interface','enum'))",
     )?;
     let mut owners = conn.prepare_cached(&format!(
         "SELECT DISTINCT s.name FROM symbols s JOIN files f ON s.file_id=f.id
          WHERE {MODULE_FILE_SCOPE} AND (?3='' OR f.root_path=?3) AND substr(f.path,-5)='.java' AND s.qualified_name=?2
-         AND s.kind IN ('class','interface','enum') ORDER BY s.name"
+         AND s.kind IN ('class','interface','enum')
+         AND s.file_id=(SELECT candidate.file_id FROM symbols candidate
+             JOIN temp.java_dependency_scope scope ON scope.file_id=candidate.file_id
+             JOIN files source ON source.id=candidate.file_id
+             WHERE candidate.qualified_name=?2 AND candidate.kind IN ('class','interface','enum')
+             ORDER BY scope.is_consumer DESC,source.path,source.root_path LIMIT 1)
+         ORDER BY s.name"
     ))?;
     for row in rows {
         let (path, root_path) = row?;

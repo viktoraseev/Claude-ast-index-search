@@ -3063,19 +3063,13 @@ pub fn index_modules_from_files(
             // Android/Gradle modules
             if name_str == "build.gradle" || name_str == "build.gradle.kts" {
                 if let Some(parent) = path.parent() {
-                    let module_path = parent
-                        .strip_prefix(root)
-                        .unwrap_or(parent)
-                        .to_string_lossy()
-                        .to_string();
+                    let (module_name, module_path, owner) =
+                        maven_module_identity(root, &subtrees, parent, "");
 
-                    // Convert path to module name (e.g., features/payments/api -> features.payments.api)
-                    let module_name = module_path.replace('/', ".");
-
-                    if !module_name.is_empty() {
+                    if !module_path.is_empty() {
                         conn.execute(
-                            "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
-                            rusqlite::params![module_name, module_path],
+                            "INSERT OR IGNORE INTO modules (name, path, root_path) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![module_name, module_path, owner],
                         )?;
                         count += 1;
                     }
@@ -3570,24 +3564,30 @@ pub fn index_module_dependencies(
     // generated accessors must be derived from the stored filesystem path:
     // dots in a directory name are word boundaries, while path separators are
     // hierarchy boundaries.
-    let module_rows: Vec<(String, String, i64)> = {
-        let mut stmt = conn.prepare("SELECT name, path, id FROM modules ORDER BY name")?;
+    let module_rows: Vec<(String, String, i64, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT name, path, id, root_path FROM modules ORDER BY name")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let module_ids: HashMap<String, i64> = module_rows
         .iter()
-        .map(|(name, _, id)| (name.clone(), *id))
+        .map(|(name, _, id, _)| (name.clone(), *id))
         .collect();
     let mut gradle_accessor_candidates: HashMap<String, Vec<(String, i64)>> = HashMap::new();
-    for (module_name, module_path, module_id) in &module_rows {
+    for (module_name, module_path, module_id, owner) in &module_rows {
         if let Some(accessor) = gradle_project_accessor(module_path) {
+            let accessor = subtrees
+                .iter()
+                .find(|s| s.canonical_path == *owner)
+                .map_or(accessor.clone(), |s| format!("{}::{accessor}", s.name));
             gradle_accessor_candidates
                 .entry(accessor)
                 .or_default()
@@ -3695,6 +3695,9 @@ pub fn index_module_dependencies(
                         }
 
                         let source_module_name: String = match file_name {
+                            "build.gradle" | "build.gradle.kts" => {
+                                maven_module_identity(&root_buf, &subtrees, parent, "").0
+                            }
                             "pom.xml" => {
                                 let Some(manifest) = fs::read_to_string(path)
                                     .ok()
@@ -3869,9 +3872,24 @@ pub fn index_module_dependencies(
                             _ => {
                                 let mut inserted: std::collections::HashSet<(i64, i64)> =
                                     std::collections::HashSet::new();
+                                // Gradle project references are relative to their build's
+                                // owning root. A primary module is not a fallback dependency
+                                // for an identically named module in an attached build.
+                                let gradle_owner = subtrees
+                                    .iter()
+                                    .filter(|s| parent.starts_with(&s.canonical_path))
+                                    .max_by_key(|s| {
+                                        Path::new(&s.canonical_path).components().count()
+                                    });
+                                let scoped_name = |name: &str| {
+                                    gradle_owner.map_or_else(
+                                        || name.to_owned(),
+                                        |s| format!("{}::{name}", s.name),
+                                    )
+                                };
                                 let resolve_accessor =
                                     |accessor: &str| match resolve_gradle_module_id(
-                                        accessor,
+                                        &scoped_name(accessor),
                                         &module_ids,
                                         &gradle_accessor_candidates,
                                     ) {
@@ -3901,7 +3919,7 @@ pub fn index_module_dependencies(
                                     let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
                                     let dep_name =
                                         dep_path.trim_start_matches(':').replace(':', ".");
-                                    if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                    if let Some(&dep_id) = module_ids.get(&scoped_name(&dep_name)) {
                                         if inserted.insert((module_id, dep_id)) {
                                             edges.push((module_id, dep_id, dep_kind.to_string()));
                                         }
@@ -3914,7 +3932,9 @@ pub fn index_module_dependencies(
                                             caps.get(1).map(|m| m.as_str()).unwrap_or("");
                                         let dep_name =
                                             dep_path.trim_start_matches(':').replace(':', ".");
-                                        if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                        if let Some(&dep_id) =
+                                            module_ids.get(&scoped_name(&dep_name))
+                                        {
                                             if inserted.insert((module_id, dep_id)) {
                                                 edges.push((
                                                     module_id,
