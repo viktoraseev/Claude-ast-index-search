@@ -188,10 +188,19 @@ def exercise(binary, base):
         reverse = runner.json('graph', 'dependents', qualifier + '.' + target[2])
         record('graph:java-parameter-bindings', seed + ':reverse', True,
                source_id in [identity(row.get('other', {})) for row in reverse.get('items', [])])
-        path = runner.json('graph', 'path', seed, target[2], '--max-depth', '1')
+        # A bare target name can also select the caller (e.g. nested -> nested).
+        # Use the declaring type to test the call edge rather than a zero-hop
+        # intersection of endpoint selectors.
+        path = runner.json('graph', 'path', seed, qualifier + '.' + target[2], '--max-depth', '1')
         record('graph:java-parameter-bindings', seed + ':path',
                [(source_id, target)],
                [tuple(identity(hop.get('symbol', {})) for hop in hops) for hops in path.get('items', [])])
+        if source_id[2] == target[2]:
+            overlap = runner.json('graph', 'path', seed, target[2], '--max-depth', '1')
+            record('graph:java-parameter-bindings', seed + ':overlapping-path',
+                   [(source_id,)],
+                   [tuple(identity(hop.get('symbol', {})) for hop in hops)
+                    for hops in overlap.get('items', [])])
     for seed in GUARDS:
         doc = runner.json('graph', 'dependencies', seed)
         record('graph:java-receiver-guards', seed,

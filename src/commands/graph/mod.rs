@@ -1559,6 +1559,22 @@ fn shortest_paths(
 ) -> Result<Option<ShortestPaths>> {
     let mut distance: HashMap<i64, usize> = from.iter().map(|&id| (id, 0)).collect();
     let mut preds: Predecessors = HashMap::new();
+    // Endpoint selectors can overlap, including through a class's members.
+    // Their shared declarations are already reached at distance zero; starting
+    // at level one would miss them or report a longer, unrelated dependency.
+    let mut reached: Vec<i64> = distance
+        .keys()
+        .copied()
+        .filter(|id| to.contains(id))
+        .collect();
+    if !reached.is_empty() {
+        reached.sort_unstable();
+        return Ok(Some(ShortestPaths {
+            length: 0,
+            preds,
+            reached,
+        }));
+    }
     let mut frontier: Vec<i64> = from.to_vec();
     for level in 1..=max_depth {
         if frontier.is_empty() {
