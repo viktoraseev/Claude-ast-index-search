@@ -14,6 +14,7 @@ import sys
 
 from common import ToolError, adapter_digest, discover_mcp_url, canonical_json, connect, file_sha256, now_ms, source_snapshot
 from completion import StaleEvidence, verify as verify_completed_evidence
+from verification_archives import verify_registered
 
 
 SCHEMA = """
@@ -29,6 +30,18 @@ class CommandFailed(ToolError):
     def __init__(self, stage: str, returncode: int):
         self.stage, self.returncode = stage, returncode
         super().__init__(f"{stage} failed ({returncode}); see round logs, payloads were not printed")
+
+
+def queue_committed_regressions(state, row, summary, verification, head):
+    """Keep the existing commit and atomically queue repairs before its push."""
+    if row['phase'] != 'push' or row['commit_head'] != head:
+        raise ToolError('committed regression checkpoint changed')
+    pending = {**summary, 'verification': verification}
+    with state:
+        state.execute("UPDATE rounds SET phase='done',summary_json=?,error=NULL WHERE id=?",
+                      (canonical_json(pending), row['id']))
+        state.execute('INSERT INTO rounds(phase,base_head,summary_json,created_at) VALUES (?,?,?,?)',
+                      ('agent', head, canonical_json(pending), now_ms()))
 
 
 def git(repository: Path, *arguments: str) -> str:
@@ -152,6 +165,12 @@ not repairs to the other language. Do not broaden this task to all languages.
 {priority}
 Target is read-only: {root}. Evidence SQLite: {summary['evidence']}.
 Latest verification: {canonical_json(summary.get('verification', {}))}.
+When verification contains registered oracle archives, read each source_evidence
+and its recorded failed case IDs as the current problem batch as well as the
+main evidence. Replay each archive with its recorded target root. These are
+captured request-bound MCP regressions, not permission to weaken expected
+metadata/items/branches or waive a failed Java case. Keep the archive manifest
+and evidence unchanged; fix production behaviour or a proved adapter defect.
 Round logs: {summary.get('round_logs', 'not available')}.
 Oracle connection: {canonical_json(summary.get('oracle', {}))}.
 Read the checks table using a streaming cursor: up to the first 100 verdict=fail
@@ -388,6 +407,12 @@ def run(arguments: argparse.Namespace) -> int:
                         verify_equivalence(state, summary, directory)
                         try:
                             logged(["cargo", "build", "--release", "--workspace"], repository, directory, "fixed-build")
+                            additional = verify_registered(output, root, repository / 'target/release/ast-index',
+                                                           directory / 'registered-verification', replay)
+                            if additional and additional['verified'] is not True:
+                                summary['verification'] = additional
+                                set_phase(state, round_id, 'agent', summary_json=canonical_json(summary))
+                                continue
                             # Fixture tests invoke the production release CLI;
                             # never test new adapters against a stale executable.
                             logged([sys.executable, "-m", "unittest", "discover", "-s", "tools/java-index-comparator", "-p", "test_*.py"], repository, directory, "tool-tests")
@@ -422,6 +447,12 @@ def run(arguments: argparse.Namespace) -> int:
                     elif phase == "push":
                         if git(repository, "rev-parse", "HEAD") != row["commit_head"]:
                             raise ToolError("HEAD changed before push")
+                        additional = verify_registered(output, root, repository / 'target/release/ast-index',
+                                                       directory / 'registered-prepush', replay)
+                        if additional and additional['verified'] is not True:
+                            queue_committed_regressions(state, row, json.loads(row['summary_json']),
+                                                        additional, row['commit_head'])
+                            continue
                         logged(["cargo", "test", "--release", "--workspace"], repository, directory, "committed-tests")
                         logged(["git", "push", "origin", branch], repository, directory, "push")
                         set_phase(state, round_id, "done")

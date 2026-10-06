@@ -7,6 +7,72 @@ use std::process::{Command, Output};
 use serde_json::Value;
 
 #[test]
+fn record_constructor_overload_keeps_declared_variable_argument_types() {
+    let source = r#"import java.math.BigDecimal;
+record Code(String value) {}
+record Amount(BigDecimal value) {}
+enum Mode { FIRST }
+record Item(Code code, Amount amount, Mode mode) {
+ Item(Code code, BigDecimal amount, Mode mode) { this(code, new Amount(amount), mode); }
+}
+class Probe {
+ void parameter(Mode mode) { new Item(new Code("x"), new BigDecimal("1"), mode); }
+ void local() { Mode mode = Mode.FIRST; new Item(new Code("x"), new BigDecimal("1"), mode); }
+ Mode mode;
+ void field() { new Item(new Code("x"), new BigDecimal("1"), this.mode); }
+ Amount amount;
+ void canonical(Code code, Mode mode) { new Item(code, amount, mode); }
+ void top(Mode mode) { parameter(mode); local(); field(); }
+}
+"#;
+    check_direct_callers(
+        source,
+        "Item",
+        &[("parameter", 9), ("local", 10), ("field", 12)],
+    );
+
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    fs::write(project.path().join("Probe.java"), source).unwrap();
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    let output = run(
+        project.path(),
+        cache.path(),
+        &["--format", "json", "call-tree", "Item", "--depth", "2"],
+    );
+    let tree: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(tree["count"], 6);
+    let branches: Vec<_> = tree["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            (
+                item["depth"].as_u64().unwrap(),
+                item["name"].as_str().unwrap(),
+                item["line"].as_u64().unwrap(),
+                item["status"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        branches,
+        vec![
+            (1, "parameter", 9, "shown"),
+            (2, "top", 15, "shown"),
+            (1, "local", 10, "shown"),
+            (2, "top", 15, "shown"),
+            (1, "field", 12, "shown"),
+            (2, "top", 15, "shown"),
+        ]
+    );
+}
+
+#[test]
 fn collector_callbacks_use_stream_entries_before_key_value_projection() {
     check_direct_callers(
         r#"import java.util.*;

@@ -1256,10 +1256,10 @@ fn creation_argument_types(
                 .to_owned(),
             ),
             "null_literal" => Some("null".to_owned()),
-            _ => match expression_receiver(argument, owner, source, scopes, 0) {
-                JavaReceiver::Type(ty) => Some(ty),
-                _ => None,
-            },
+            // Receiver inference retains declaration-site wrappers for named
+            // values. Use invocation types so known constructor arguments do
+            // not become unknown merely because their lexical scope is kept.
+            _ => invocation_argument_type(argument, owner, source, scopes, 0),
         })
         .collect()
 }
@@ -1404,7 +1404,7 @@ fn variable_invocation_type(
     None
 }
 
-/// Preserve invocation types without changing receiver or constructor inference.
+/// Preserve argument types independently of receiver inference.
 fn invocation_argument_type(
     node: Node<'_>,
     owner: Node<'_>,
