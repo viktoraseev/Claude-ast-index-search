@@ -1884,10 +1884,8 @@ pub fn cmd_add_root_with_format(root: &Path, path: &str, force: bool, format: &s
     };
 
     // Overlap validation
-    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let canonical_new = std::path::Path::new(&abs_path)
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(&abs_path));
+    let canonical_root = db::safe_canonicalize(root);
+    let canonical_new = db::safe_canonicalize(Path::new(&abs_path));
 
     if !force {
         if format == "json"

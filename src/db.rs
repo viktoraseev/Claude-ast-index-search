@@ -5865,39 +5865,48 @@ pub fn stage_restore_snapshot(
 
 /// Check if database exists and is initialized
 pub fn db_exists(project_root: &Path) -> bool {
-    if let Ok((db_path, _lease, _normalized)) = resolve_db_path_and_lease(project_root) {
-        let publication = match try_acquire_shared_publication(&db_path, &_lease) {
-            Ok(publication) => publication,
-            // The bool compatibility API cannot return a retryable error.
-            // Treat contention as "possibly present" so production callers
-            // proceed to `open_db_leased` and surface `IndexPublicationBusy`
-            // instead of printing a false "Index not found" result.
-            Err(error) if is_publication_busy(&error) => return true,
-            Err(_) => return false,
-        };
-        if ensure_no_interrupted_publication(&db_path).is_err() {
-            drop(publication);
-            return true;
-        }
-        if !std::fs::symlink_metadata(&db_path)
-            .map(|metadata| metadata.file_type().is_file())
-            .unwrap_or(false)
+    check_db_exists(project_root).unwrap_or(false)
+}
+
+/// Check index availability without treating cache I/O failures as absence.
+pub fn check_db_exists(project_root: &Path) -> Result<bool> {
+    let (db_path, lease, _normalized) = resolve_db_path_and_lease(project_root)?;
+    let publication = match try_acquire_shared_publication(&db_path, &lease) {
+        Ok(publication) => publication,
+        // Preserve the bool API's contention contract: let the real open
+        // report IndexPublicationBusy, rather than a false missing index.
+        Err(error) if is_publication_busy(&error) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if ensure_no_interrupted_publication(&db_path).is_err() {
+        drop(publication);
+        return Ok(true);
+    }
+    match std::fs::symlink_metadata(&db_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("failed to inspect index availability"),
+    }
+    // Availability probes must never create a database during a race with
+    // removal. An unrecognizable file keeps the existing missing-index hint.
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    match conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'",
+        [],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(rusqlite::Error::SqliteFailure(error, _))
+            if matches!(
+                error.code,
+                ErrorCode::NotADatabase | ErrorCode::DatabaseCorrupt
+            ) =>
         {
-            return false;
+            Ok(false)
         }
-        // Also check if tables exist
-        if let Ok(conn) = Connection::open(&db_path) {
-            conn.query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='files'",
-                [],
-                |_| Ok(()),
-            )
-            .is_ok()
-        } else {
-            false
-        }
-    } else {
-        false
+        Err(error) => Err(error).context("failed to read index availability"),
     }
 }
 
