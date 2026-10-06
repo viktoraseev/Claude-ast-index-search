@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use super::rank::{self, PoolSummary, Preset, RankContext, RankSummary, RankedFile, RankedSymbol};
 use super::{
-    print_truncation_notice, relative_path, search_files_page, Page, Pagination, PathResolver,
+    print_truncation_notice, relative_path, Page, Pagination, PathResolver,
     PAGINATED_JSON_SCHEMA_VERSION,
 };
 use crate::db::{self, SearchScope};
@@ -210,12 +210,19 @@ pub fn cmd_search(
         .as_ref()
         .and_then(|words| words.prefilter(&terms));
     let resolver = PathResolver::try_from_conn(root, &conn)?;
-    let content_page = super::search_files_page_prefiltered(
+    let content_page = super::search_files_page_in_selected(
         root,
+        &resolver.grep_roots(),
         &pattern,
         &super::grep::ALL_SOURCE_EXTENSIONS,
         limit,
         prefilter.as_ref(),
+        &|path| {
+            resolver
+                .scoped_relative_path(path)
+                .is_some_and(|relative| scope.matches_path(&relative))
+        },
+        &|_, _| true,
         |path, line_num, line| {
             let scoped_path = resolver.scoped_relative_path(path)?;
             if !scope.matches_path(&scoped_path) {
@@ -1309,11 +1316,21 @@ pub fn cmd_usages(
         regex::escape(symbol)
     ))?;
 
-    let page = search_files_page(
+    let page = super::search_files_page_in_selected(
         root,
+        &super::project_search_roots(root)?,
         &pattern,
         &["kt", "java"],
         limit,
+        None,
+        &|path| {
+            let relative = match &resolver {
+                Some(resolver) => resolver.scoped_relative_path(path),
+                None => Some(relative_path(root, path)),
+            };
+            relative.is_some_and(|relative| scope.matches_path(&relative))
+        },
+        &|_, _| true,
         |path, line_num, line| {
             // Skip definitions
             if def_pattern.is_match(line) {

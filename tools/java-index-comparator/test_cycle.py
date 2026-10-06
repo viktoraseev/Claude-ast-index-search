@@ -63,6 +63,18 @@ class CycleTests(unittest.TestCase):
                             "every existing case ID"):
             self.assertTrue(requirement in prompt, "missing concrete coverage-closure requirement")
 
+    def test_mixed_framework_contracts_do_not_expand_java_scope(self):
+        for counts in ({"pass": 100}, {"fail": 1}):
+            with self.subTest(counts=counts):
+                prompt = cycle.agent_prompt({"evidence": "evidence.sqlite", "counts": counts},
+                                            Path("project"))
+                for requirement in ("Do not repair XML parsers",
+                                    "split Java-applicable criteria from non-Java-only criteria",
+                                    "must not block Java completion",
+                                    "Preserve earlier fixes, regression assertions and case IDs",
+                                    "never turn an untested Java criterion into a pass"):
+                    self.assertIn(requirement, prompt)
+
     def test_recorded_problems_and_failed_verification_take_priority(self):
         cases = [{"counts": {kind: 1}} for kind in ("fail", "unsupported", "error")]
         cases.append({"counts": {"pass": 100}, "verification": {"verified": False}})

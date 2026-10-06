@@ -139,6 +139,12 @@ require executed evidence for its acceptance checklist and preserve every existi
 automated differential repair, not permission to redefine the goal.
 Scope is JAVA ONLY, including shared ast-index functionality on Java sources.
 Do not repair Kotlin, Swift, Perl, shell or other non-Java parsers or contracts.
+Do not repair XML parsers merely because the target is a Java/Android project.
+For mixed framework parents, split Java-applicable criteria from non-Java-only criteria.
+Java resource ownership/reference behaviour stays in scope; XML-only syntax,
+namespace/entity parsing and other-language resolution must not block Java completion.
+Record those exclusions explicitly, not as passing or silently dropped coverage.
+Preserve earlier fixes, regression assertions and case IDs; never turn an untested Java criterion into a pass.
 Non-Java-only features are explicitly out-of-scope, NOT passing or inapplicable.
 Ignore non-Java pending rows in older evidence; keep every Java case and shared
 Java-applicable contract. Mixed-language output needs Java scope normalization,

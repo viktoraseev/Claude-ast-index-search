@@ -374,13 +374,18 @@ pub fn cmd_callers(
     let mut java_calls = None;
     let mut java_error = None;
     let caller_regex = Regex::new(&build_caller_pattern(function_name))?;
-    let page = super::search_files_page_in_kept(
+    let page = super::search_files_page_in_selected(
         root,
         &roots,
         &pattern,
         &ALL_SOURCE_EXTENSIONS,
         limit,
         prefilter.as_ref(),
+        &|path| {
+            resolver
+                .scoped_relative_path(path)
+                .is_some_and(|relative| scope.matches_path(&relative))
+        },
         &|path, line| {
             path.extension().is_some_and(|ext| ext == "java") || !def_pattern.is_match(line)
         },

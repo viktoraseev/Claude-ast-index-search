@@ -33,7 +33,7 @@ pub use test_paths::{is_test_path, is_test_symbol};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -624,6 +624,33 @@ pub fn search_files_in_kept<F>(
     extensions: &[&str],
     prefilter: Option<&WordPrefilter<'_>>,
     keep: &(dyn Fn(&Path, &str) -> bool + Sync),
+    handler: F,
+) -> Result<()>
+where
+    F: FnMut(&Path, usize, &str),
+{
+    search_files_in_selected(
+        root,
+        roots,
+        pattern,
+        extensions,
+        prefilter,
+        &|_| true,
+        keep,
+        handler,
+    )
+}
+
+/// Apply source ownership/path selectors before opening a candidate file.
+#[allow(clippy::too_many_arguments)]
+fn search_files_in_selected<F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    prefilter: Option<&WordPrefilter<'_>>,
+    keep_path: &(dyn Fn(&Path) -> bool + Sync),
+    keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut handler: F,
 ) -> Result<()>
 where
@@ -674,8 +701,11 @@ where
     // Use HashSet for O(1) extension lookup instead of O(n) linear search
     let extensions: Arc<HashSet<String>> =
         Arc::new(extensions.iter().map(|s| s.to_string()).collect());
+    let java_scope = extensions.contains("java");
 
+    let failure = ScanFailure::default();
     std::thread::scope(|scope| -> Result<()> {
+        let failure = &failure;
         let worker = scope.spawn(move || {
             walker.run(|| {
                 let tx = tx.clone();
@@ -690,16 +720,23 @@ where
                     .build();
 
                 Box::new(move |entry| {
+                    if failure.has_error() {
+                        return ignore::WalkState::Quit;
+                    }
                     if let Ok(entry) = entry {
+                        if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                            return ignore::WalkState::Continue;
+                        }
                         let path = entry.path();
                         if let Some(ext) = path.extension() {
                             // Fast O(1) HashSet lookup
                             if extensions.contains(ext.to_str().unwrap_or(""))
+                                && keep_path(path)
                                 && prefilter.map_or(true, |filter| filter.may_contain(path))
                             {
                                 let path_arc: Arc<Path> = Arc::from(path);
 
-                                search_source_file(
+                                let result = search_source_file(
                                     &mut searcher,
                                     &matcher,
                                     path,
@@ -721,7 +758,16 @@ where
                                         Ok(true)
                                     }),
                                 );
+                                if let Err(error) = result {
+                                    failure.record(error);
+                                    return ignore::WalkState::Quit;
+                                }
                             }
+                        }
+                    } else if let Err(error) = entry {
+                        if java_scope {
+                            failure.record(error.into());
+                            return ignore::WalkState::Quit;
                         }
                     }
                     ignore::WalkState::Continue
@@ -735,7 +781,7 @@ where
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
-        Ok(())
+        failure.finish()
     })?;
 
     Ok(())
@@ -820,6 +866,35 @@ pub fn search_files_page_in_kept<T, F>(
     limit: usize,
     prefilter: Option<&WordPrefilter<'_>>,
     keep: &(dyn Fn(&Path, &str) -> bool + Sync),
+    filter_map: F,
+) -> Result<Page<T>>
+where
+    F: FnMut(&Path, usize, &str) -> Option<T>,
+{
+    search_files_page_in_selected(
+        root,
+        roots,
+        pattern,
+        extensions,
+        limit,
+        prefilter,
+        &|_| true,
+        keep,
+        filter_map,
+    )
+}
+
+/// Exact-total pages with path selectors applied before source I/O.
+#[allow(clippy::too_many_arguments)]
+fn search_files_page_in_selected<T, F>(
+    root: &Path,
+    roots: &[PathBuf],
+    pattern: &str,
+    extensions: &[&str],
+    limit: usize,
+    prefilter: Option<&WordPrefilter<'_>>,
+    keep_path: &(dyn Fn(&Path) -> bool + Sync),
+    keep: &(dyn Fn(&Path, &str) -> bool + Sync),
     mut filter_map: F,
 ) -> Result<Page<T>>
 where
@@ -830,12 +905,13 @@ where
     // Retain only the smallest source positions, using O(limit) memory.
     let mut items = BTreeMap::new();
     let mut total = 0usize;
-    search_files_in_kept(
+    search_files_in_selected(
         root,
         roots,
         pattern,
         extensions,
         prefilter,
+        keep_path,
         keep,
         |path, line_num, line| {
             if let Some(item) = filter_map(path, line_num, line) {
@@ -856,21 +932,60 @@ where
 
 /// Runs `searcher` over `path` unless it is minified. A file type minifiers
 /// emit is read once, and the same bytes are both judged and searched.
-fn search_source_file<S: Sink>(
+fn search_source_file<S: Sink<Error = std::io::Error>>(
     searcher: &mut Searcher,
     matcher: &RegexMatcher,
     path: &Path,
     sink: S,
-) {
-    if crate::minified::judged_by_content(path) {
+) -> Result<()> {
+    let result = if crate::minified::judged_by_content(path) {
         let Ok(bytes) = std::fs::read(path) else {
-            return;
+            return Ok(());
         };
         if !crate::minified::skip(path, Some(&bytes)) {
-            let _ = searcher.search_slice(matcher, &bytes, sink);
+            searcher.search_slice(matcher, &bytes, sink)
+        } else {
+            Ok(())
         }
     } else if !crate::minified::skip_by_name(path) {
-        let _ = searcher.search_path(matcher, path, sink);
+        searcher.search_path(matcher, path, sink)
+    } else {
+        Ok(())
+    };
+    // Java scan failure cannot establish an empty/partial Java result. Keep
+    // other languages' existing best-effort contracts outside this repair.
+    if path.extension().is_some_and(|ext| ext == "java") {
+        result.with_context(|| format!("Cannot search Java source {}", path.display()))
+    } else {
+        Ok(())
+    }
+}
+
+/// Retain one failure across parallel walkers without buffering diagnostics.
+#[derive(Default)]
+struct ScanFailure {
+    failed: AtomicBool,
+    first: Mutex<Option<anyhow::Error>>,
+}
+
+impl ScanFailure {
+    fn has_error(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, error: anyhow::Error) {
+        let mut first = self.first.lock().unwrap();
+        if first.is_none() {
+            *first = Some(error);
+            self.failed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn finish(&self) -> Result<()> {
+        match self.first.lock().unwrap().take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -886,6 +1001,9 @@ where
     F: FnMut(&Path, usize, &str),
 {
     let matcher = RegexMatcher::new(pattern).context("Invalid regex pattern")?;
+    if limit == 0 {
+        return Ok(());
+    }
     let Some(walker) = project_walker(root)? else {
         return Ok(());
     };
@@ -894,10 +1012,12 @@ where
 
     let extensions: Arc<HashSet<String>> =
         Arc::new(extensions.iter().map(|s| s.to_string()).collect());
+    let java_scope = extensions.contains("java");
 
     // Shared counter for early termination
     let found_count = Arc::new(AtomicUsize::new(0));
     let should_stop = Arc::new(AtomicBool::new(false));
+    let failure = ScanFailure::default();
 
     walker.run(|| {
         let tx = tx.clone();
@@ -905,6 +1025,7 @@ where
         let extensions = Arc::clone(&extensions);
         let found_count = Arc::clone(&found_count);
         let should_stop = Arc::clone(&should_stop);
+        let failure = &failure;
 
         // SAFETY: memory-mapped files are safe when files aren't modified during search
         let mut searcher = SearcherBuilder::new()
@@ -914,11 +1035,14 @@ where
 
         Box::new(move |entry| {
             // Check early termination
-            if should_stop.load(Ordering::Relaxed) {
+            if should_stop.load(Ordering::Relaxed) || failure.has_error() {
                 return ignore::WalkState::Quit;
             }
 
             if let Ok(entry) = entry {
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    return ignore::WalkState::Continue;
+                }
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     if extensions.contains(ext.to_str().unwrap_or("")) {
@@ -926,7 +1050,7 @@ where
                         let found_count = Arc::clone(&found_count);
                         let should_stop = Arc::clone(&should_stop);
 
-                        search_source_file(
+                        let result = search_source_file(
                             &mut searcher,
                             &matcher,
                             path,
@@ -950,7 +1074,16 @@ where
                                 Ok(true)
                             }),
                         );
+                        if let Err(error) = result {
+                            failure.record(error);
+                            return ignore::WalkState::Quit;
+                        }
                     }
+                }
+            } else if let Err(error) = entry {
+                if java_scope {
+                    failure.record(error.into());
+                    return ignore::WalkState::Quit;
                 }
             }
             ignore::WalkState::Continue
@@ -968,7 +1101,7 @@ where
         count += 1;
     }
 
-    Ok(())
+    failure.finish()
 }
 
 /// Every file under `root` with one of `extensions`, in path order, under the
@@ -981,12 +1114,21 @@ pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<Path
         return Ok(Vec::new());
     };
     let extensions: HashSet<&str> = extensions.iter().copied().collect();
+    let java_scope = extensions.contains("java");
     let (tx, rx) = channel::unbounded::<PathBuf>();
+    let failure = ScanFailure::default();
     walker.run(|| {
         let tx = tx.clone();
         let extensions = &extensions;
+        let failure = &failure;
         Box::new(move |entry| {
+            if failure.has_error() {
+                return ignore::WalkState::Quit;
+            }
             if let Ok(entry) = entry {
+                if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                    return ignore::WalkState::Continue;
+                }
                 let wanted = entry
                     .path()
                     .extension()
@@ -994,12 +1136,18 @@ pub fn project_source_files(root: &Path, extensions: &[&str]) -> Result<Vec<Path
                 if wanted {
                     let _ = tx.send(entry.into_path());
                 }
+            } else if let Err(error) = entry {
+                if java_scope {
+                    failure.record(error.into());
+                    return ignore::WalkState::Quit;
+                }
             }
             ignore::WalkState::Continue
         })
     });
     drop(tx);
     let mut files: Vec<PathBuf> = rx.into_iter().collect();
+    failure.finish()?;
     files.sort_unstable();
     Ok(files)
 }
@@ -1104,7 +1252,7 @@ where
     let satisfied: Vec<AtomicBool> = patterns.iter().map(|_| AtomicBool::new(false)).collect();
     let stop = AtomicBool::new(false);
     let next = AtomicUsize::new(0);
-    let (tx, rx) = channel::bounded::<(usize, Vec<PatternHit>)>(1024);
+    let (tx, rx) = channel::bounded::<(usize, Result<Vec<PatternHit>>)>(1024);
 
     std::thread::scope(|scope| -> Result<()> {
         let mut workers = Vec::new();
@@ -1125,7 +1273,7 @@ where
                     };
                     let mut hits = Vec::new();
                     if prefilter.is_some_and(|filter| !filter.may_contain(path)) {
-                        if tx.send((index, hits)).is_err() {
+                        if tx.send((index, Ok(hits))).is_err() {
                             break;
                         }
                         continue;
@@ -1139,7 +1287,7 @@ where
                     // first non-UTF-8 line it matched; this marks the patterns
                     // that did.
                     let mut abandoned = vec![false; exact.len()];
-                    search_source_file(
+                    let result = search_source_file(
                         &mut searcher,
                         matcher,
                         path,
@@ -1161,6 +1309,12 @@ where
                                     continue;
                                 }
                                 let Some(text) = text else {
+                                    if path.extension().is_some_and(|ext| ext == "java") {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "matching Java source line is not UTF-8",
+                                        ));
+                                    }
                                     abandoned[index] = true;
                                     continue;
                                 };
@@ -1178,7 +1332,7 @@ where
                             Ok(open && !stop.load(Ordering::Relaxed))
                         }),
                     );
-                    if tx.send((index, hits)).is_err() {
+                    if tx.send((index, result.map(|()| hits))).is_err() {
                         break;
                     }
                 }
@@ -1190,9 +1344,18 @@ where
         let mut open = patterns.len();
         let mut pending = HashMap::new();
         let mut frontier = 0usize;
+        let mut failure = None;
         'files: for (index, hits) in &rx {
             pending.insert(index, hits);
             while let Some(hits) = pending.remove(&frontier) {
+                let hits = match hits {
+                    Ok(hits) => hits,
+                    Err(error) => {
+                        failure = Some(error);
+                        stop.store(true, Ordering::Relaxed);
+                        break 'files;
+                    }
+                };
                 let path = &files[frontier];
                 frontier += 1;
                 for hit in hits {
@@ -1218,7 +1381,10 @@ where
                 .join()
                 .map_err(|_| anyhow::anyhow!("parallel file search worker panicked"))?;
         }
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     })
 }
 
