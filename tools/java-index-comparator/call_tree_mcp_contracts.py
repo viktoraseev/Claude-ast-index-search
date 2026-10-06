@@ -62,6 +62,12 @@ def expectations(fixture, check):
     subject = check['subject']
     root_owners = owners(fixture, subject)
     expected = []
+    branches = []
+
+    def record(row, parent=()):
+        expected.append(row)
+        branches.append((row[0], parent, *row[1:]))
+
     dependencies = {subject}
     for caller in sorted(root_owners):
         path, line, name = caller
@@ -81,15 +87,15 @@ def expectations(fixture, check):
         if exact and terminals:
             raise ScopeUnsupported('same-line callable and initializer owner identities collide')
         if not exact and len(terminals) == 1:
-            expected.append((1, *caller, 'shown'))
+            record((1, *caller, 'shown'))
             continue
         if len(exact) != 1:
             raise ScopeUnsupported('position-bound MCP truth is required for ambiguous/noncallable child')
         if name == subject:
             # The initial name query has already expanded this root target.
-            expected.append((1, *caller, 'expanded_above'))
+            record((1, *caller, 'expanded_above'))
             continue
-        expected.append((1, *caller, 'shown'))
+        record((1, *caller, 'shown'))
         if len(anchors) == 1 and tuple(anchors[0]) == caller:
             dependencies.add(name)
             child_owners = owners(fixture, name)
@@ -99,12 +105,12 @@ def expectations(fixture, check):
             except callers.UnsupportedHierarchy as error:
                 raise ScopeUnsupported(str(error)) from error
         for child in sorted(child_owners):
-            expected.append((2, *child, 'recursive' if child == caller else 'shown'))
+            record((2, *child, 'recursive' if child == caller else 'shown'), caller)
             if len(expected) > MAX_ITEMS:
                 raise ScopeUnsupported('two-level expected tree exceeds bounded item budget')
     if len(expected) > MAX_ITEMS:
         raise ScopeUnsupported('two-level expected tree exceeds bounded item budget')
-    return sorted(expected), sorted(dependencies)
+    return sorted(expected), sorted(dependencies), sorted(branches)
 
 
 def native_tree(fixture, check):
@@ -132,7 +138,7 @@ def native_tree(fixture, check):
 
 
 def exercise(fixture, check):
-    expected, dependencies = expectations(fixture, check)
+    expected, dependencies, expected_branches = expectations(fixture, check)
     if not getattr(fixture, '_call_hierarchy_graph_ready', False):
         fixture.cli('graph', 'build')
         fixture._call_hierarchy_graph_ready = True
@@ -146,6 +152,8 @@ def exercise(fixture, check):
     if doc['count'] != len(doc['items']):
         raise ScopeUnsupported('native two-level call tree page is incomplete')
     actual = []
+    actual_branches = []
+    parent = None
     java_branch = False
     for row in doc['items']:
         if (not isinstance(row, dict) or type(row.get('depth')) is not int
@@ -154,17 +162,24 @@ def exercise(fixture, check):
             raise ToolError('malformed native two-level call tree row')
         location = identity([row.get(key) for key in ('path', 'line', 'name')], fixture.root.resolve())
         if row['depth'] == 1:
+            parent = location
             java_branch = location[0].endswith('.java')
+        elif parent is None:
+            raise ToolError('native second-level row has no first-level owner')
         if not location[0].endswith('.java'):
             continue
         if not java_branch:
             continue
         actual.append((row['depth'], *location, row['status']))
+        actual_branches.append((row['depth'], () if row['depth'] == 1 else parent,
+                                *location, row['status']))
     actual.sort()
     # Counters preserve repeated owners reached through different branches.
-    want, got = Counter(expected), Counter(actual)
-    return {'source': REASON, 'dependencies': dependencies, 'items': expected}, \
-           {'items': actual}, want, got
+    actual_branches.sort()
+    want, got = Counter(expected_branches), Counter(actual_branches)
+    return {'source': REASON, 'dependencies': dependencies, 'items': expected,
+            'branches': expected_branches}, \
+           {'items': actual, 'branches': actual_branches}, want, got
 
 
 def copy_dependencies(source, target, subject):

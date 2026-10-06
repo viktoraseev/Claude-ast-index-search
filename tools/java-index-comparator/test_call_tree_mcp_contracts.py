@@ -99,6 +99,7 @@ class CallTreeMcpTests(unittest.TestCase):
         self.assertEqual(len(json.loads(result['actual_json'])['items']), 4)
 
     def test_second_level_recursion_is_bound_to_the_actual_owner_identity(self):
+        # Recursion is independent of this node's parent branch.
         (self.root / 'Probe.java').write_text(self.source.replace('branch() { seed(); }',
                                                                 'branch() { seed(); branch(); }'))
         self.fixture.cli('rebuild', '--force', '--max-files', '0')
@@ -111,6 +112,7 @@ class CallTreeMcpTests(unittest.TestCase):
         self.assertIn([2, 'Probe.java', 3, 'branch', 'recursive'], json.loads(result['expected_json'])['items'])
 
     def test_missing_or_ambiguous_child_truth_remains_unsupported(self):
+        # A missing scope must remain explicit rather than empty truth.
         self.state.execute("UPDATE checks SET status='pending' WHERE feature=? AND subject='branch'", (callers.FEATURE,))
         self.assertEqual(self.evaluate()['verdict'], 'unsupported')
         self.state.execute("UPDATE checks SET status='complete' WHERE feature=? AND subject='branch'", (callers.FEATURE,))
@@ -279,6 +281,45 @@ class Peer {
         second.executescript(SCHEMA)
         trees.copy_dependencies(copy, second, 'seed')
         self.assertEqual(second.execute('SELECT count(*) FROM graph_mcp_sources').fetchone()[0], 3)
+
+    def test_swapped_grandchildren_cannot_move_to_another_parent_branch(self):
+        (self.root / 'Probe.java').write_text(self.source.replace(
+            'top() { branch(); other(); }',
+            'top() { branch(); }\n static void peer() { other(); }'))
+        self.fixture.cli('rebuild', '--force', '--max-files', '0')
+        callers.plan_methods(self.state, self.root, [{'path': 'Probe.java'}], self.fixture.structure)
+        self.state.execute("UPDATE checks SET expected_json=? WHERE feature=? AND subject='other'",
+            (json.dumps({'source': 'live MCP test double',
+                         'items': [['Probe.java', 6, 'peer']]}), callers.FEATURE))
+        self.assertEqual(self.evaluate()['verdict'], 'pass')
+        original = trees.native_tree
+        def swap(fixture, check):
+            doc = original(fixture, check)
+            children = [index for index, row in enumerate(doc['items']) if row['depth'] == 2]
+            self.assertEqual(len(children), 2)
+            first, second = children
+            doc['items'][first], doc['items'][second] = doc['items'][second], doc['items'][first]
+            return doc
+        with patch.object(trees, 'native_tree', side_effect=swap):
+            result = self.evaluate()
+        self.assertEqual(result['verdict'], 'fail')
+        diff = json.loads(result['diff_json'])
+        self.assertEqual(len(diff['missing']), 2)
+        self.assertEqual(len(diff['unexpected']), 2)
+
+    def test_orphan_second_level_row_is_malformed_not_filtered_away(self):
+        original = trees.native_tree
+        def orphan(fixture, check):
+            doc = original(fixture, check)
+            self.assertEqual(doc['items'][0]['depth'], 1)
+            self.assertEqual(doc['items'][1]['depth'], 2)
+            doc['items'].pop(0)
+            doc['count'] -= 1
+            return doc
+        with patch.object(trees, 'native_tree', side_effect=orphan):
+            result = self.evaluate()
+        self.assertEqual(result['verdict'], 'error')
+        self.assertIn('no first-level owner', result['error'])
 
     def test_actual_replay_keeps_child_truth_without_extra_checks_or_oracle_queries(self):
         self.evaluate()

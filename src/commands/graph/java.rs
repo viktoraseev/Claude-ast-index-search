@@ -30,6 +30,8 @@ pub(super) struct TypeDeclaration {
 pub(super) enum InvocationArgument {
     Type(String),
     Field(JavaReceiver),
+    Value(JavaReceiver),
+    Lambda(usize),
 }
 
 type InvocationArguments = Vec<Option<InvocationArgument>>;
@@ -119,7 +121,8 @@ pub(super) enum JavaReceiver {
     },
     MethodProjection {
         input: Box<JavaReceiver>,
-        qualifier: String,
+        receiver: Box<JavaReceiver>,
+        qualifier: Option<String>,
         name: String,
         line: i64,
     },
@@ -128,6 +131,11 @@ pub(super) enum JavaReceiver {
         collector: Box<JavaReceiver>,
         key: Box<JavaReceiver>,
         value: Box<JavaReceiver>,
+    },
+    StreamFactory {
+        qualifier: Box<JavaReceiver>,
+        elements: Vec<JavaReceiver>,
+        invocation: Box<JavaReceiver>,
     },
     Callback {
         receiver: Option<Box<JavaReceiver>>,
@@ -848,8 +856,13 @@ fn parameter_type(parameter: Node<'_>) -> Option<Node<'_>> {
     })
 }
 
-/// Check explicit target types without guessing an overloaded invocation's SAM.
-fn method_reference_context(node: Node<'_>, source: &str) -> Option<JavaReceiver> {
+/// Check explicit SAM targets and guarded JDK callback input projections.
+fn method_reference_context(
+    node: Node<'_>,
+    owner: Node<'_>,
+    source: &str,
+    scopes: &VariableScopes,
+) -> Option<JavaReceiver> {
     let mut expression = node;
     loop {
         let parent = expression.parent()?;
@@ -874,6 +887,60 @@ fn method_reference_context(node: Node<'_>, source: &str) -> Option<JavaReceiver
             }
             "argument_list" => {
                 let constant = parent.parent()?;
+                if constant.kind() == "method_invocation" {
+                    let method = text(constant.child_by_field_name("name")?, source);
+                    let object = constant.child_by_field_name("object")?;
+                    let mut cursor = parent.walk();
+                    let arguments: Vec<_> = parent
+                        .named_children(&mut cursor)
+                        .filter(|child| !child.is_extra())
+                        .collect();
+                    let future = matches!(
+                        method,
+                        "thenApply"
+                            | "thenCompose"
+                            | "thenAccept"
+                            | "thenApplyAsync"
+                            | "thenComposeAsync"
+                            | "thenAcceptAsync"
+                    );
+                    let arity = arguments.len() == 1
+                        || future && method.ends_with("Async") && arguments.len() == 2;
+                    if !arity
+                        || arguments.first()?.id() != expression.id()
+                        || !(future
+                            || matches!(method, "map" | "flatMap" | "forEach" | "ifPresent"))
+                    {
+                        return None;
+                    }
+                    let function = if matches!(
+                        method,
+                        "forEach" | "ifPresent" | "thenAccept" | "thenAcceptAsync"
+                    ) {
+                        "Consumer"
+                    } else {
+                        "Function"
+                    };
+                    return Some(JavaReceiver::Parameterized {
+                        path: format!("java::util::function::{function}"),
+                        arguments: vec![
+                            Some(JavaReceiver::Element {
+                                receiver: Box::new(expression_receiver(
+                                    object, owner, source, scopes, 0,
+                                )),
+                                operation: if future {
+                                    "future-element"
+                                } else if method == "forEach" {
+                                    "forEach"
+                                } else {
+                                    "stream-element"
+                                }
+                                .to_owned(),
+                            }),
+                            None,
+                        ],
+                    });
+                }
                 if constant.kind() != "enum_constant" {
                     return None;
                 }
@@ -1064,7 +1131,7 @@ fn invocation_type(node: Node<'_>, source: &str) -> Option<String> {
         ));
     }
     if node.kind() == "wildcard" {
-        return None;
+        return (text(node, source).trim() == "?").then(|| "?".to_owned());
     }
     type_name(node, source)
 }
@@ -1799,6 +1866,38 @@ fn expression_receiver(
             else {
                 return JavaReceiver::Unknown;
             };
+            if text(name, source) == "of" {
+                if let (Some(object), Some(values)) = (
+                    node.child_by_field_name("object"),
+                    node.child_by_field_name("arguments"),
+                ) {
+                    let qualifier = expression_receiver(object, owner, source, scopes, depth + 1);
+                    if matches!(&qualifier, JavaReceiver::Type(path)
+                        if path == "Stream" || path == "java::util::stream::Stream")
+                    {
+                        let mut cursor = values.walk();
+                        let elements: Vec<_> = values
+                            .named_children(&mut cursor)
+                            .filter(|value| !value.is_extra())
+                            .map(|value| {
+                                expression_receiver(value, owner, source, scopes, depth + 1)
+                            })
+                            .collect();
+                        let invocation = JavaReceiver::Invocation {
+                            receiver: Some(Box::new(qualifier.clone())),
+                            name: "of".to_owned(),
+                            line: name.start_position().row as i64 + 1,
+                            arguments,
+                            first_argument: elements.first().cloned().map(Box::new),
+                        };
+                        return JavaReceiver::StreamFactory {
+                            qualifier: Box::new(qualifier),
+                            elements,
+                            invocation: Box::new(invocation),
+                        };
+                    }
+                }
+            }
             if text(name, source) == "collect" && arguments == 1 {
                 if let (Some(stream), Some(values)) = (
                     node.child_by_field_name("object"),
@@ -1930,13 +2029,17 @@ fn collector_projection(
     if node.kind() == "method_reference" {
         if let Some(name) = node.named_child(node.named_child_count().saturating_sub(1) as u32) {
             if name.kind() == "identifier" {
-                if let Some(qualifier) = node
-                    .named_child(0)
-                    .and_then(|qualifier| type_name(qualifier, source))
-                {
+                if let Some(qualifier) = node.named_child(0) {
                     return JavaReceiver::MethodProjection {
                         input: Box::new(element()),
-                        qualifier,
+                        receiver: Box::new(expression_receiver(
+                            qualifier,
+                            owner,
+                            source,
+                            scopes,
+                            depth + 1,
+                        )),
+                        qualifier: method_reference_type(qualifier, source, scopes, 0),
                         name: text(name, source).to_owned(),
                         line: name.start_position().row as i64 + 1,
                     };
@@ -3056,7 +3159,7 @@ impl JavaSource {
                         argument_count(node)
                     },
                     reference_context: reference
-                        .then(|| method_reference_context(node, source))
+                        .then(|| method_reference_context(node, owner, source, &scopes))
                         .flatten(),
                     reference_type: reference
                         .then(|| method_reference_type(object, source, &scopes, 0))
@@ -3087,13 +3190,31 @@ impl JavaSource {
                     .named_children(&mut cursor)
                     .filter(|argument| !argument.is_extra())
                     .map(|argument| {
+                        if argument.kind() == "lambda_expression" {
+                            let parameters = argument.child_by_field_name("parameters")?;
+                            let arity = if parameters.kind() == "identifier" {
+                                1
+                            } else {
+                                let mut cursor = parameters.walk();
+                                parameters
+                                    .named_children(&mut cursor)
+                                    .filter(|child| !child.is_extra())
+                                    .count()
+                            };
+                            return Some(InvocationArgument::Lambda(arity));
+                        }
                         invocation_argument_type(argument, owner, source, &scopes, 0)
                             .map(InvocationArgument::Type)
                             .or_else(|| {
                                 let receiver =
                                     expression_receiver(argument, owner, source, &scopes, 0);
-                                matches!(receiver, JavaReceiver::Field { .. })
-                                    .then_some(InvocationArgument::Field(receiver))
+                                if matches!(receiver, JavaReceiver::Field { .. }) {
+                                    Some(InvocationArgument::Field(receiver))
+                                } else if !matches!(receiver, JavaReceiver::Unknown) {
+                                    Some(InvocationArgument::Value(receiver))
+                                } else {
+                                    None
+                                }
                             })
                     })
                     .collect()

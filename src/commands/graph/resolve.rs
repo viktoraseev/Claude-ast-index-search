@@ -1891,6 +1891,15 @@ impl Builder {
         if depth >= 32 {
             return None;
         }
+        if input != "null"
+            && input != "?"
+            && self
+                .java_invocation_identity(input_owner, input, 0)
+                .zip(self.java_invocation_identity(parameter_owner, parameter, 0))
+                .is_some_and(|(input, parameter)| input == parameter)
+        {
+            return Some(true);
+        }
         if input == "null" {
             return Some(!Self::java_primitive(parameter));
         }
@@ -1942,6 +1951,29 @@ impl Builder {
             {
                 return Some(true);
             }
+            let input_container = self.java_known_container(input_owner, &input_raw);
+            let parameter_container = self.java_known_container(parameter_owner, &parameter_raw);
+            if input_container.is_some()
+                && self
+                    .java_lang_type(parameter_owner, &parameter_raw)
+                    .is_some()
+            {
+                return Some(false);
+            }
+            if matches!(
+                (input_container.as_deref(), parameter_container.as_deref()),
+                (
+                    Some("List" | "Set" | "Collection"),
+                    Some("Collection" | "Iterable")
+                )
+            ) {
+                let Some(parameters) = Self::java_invariant_arguments(parameter) else {
+                    return Some(true);
+                };
+                if parameters.iter().all(|parameter| *parameter == "?") {
+                    return Some(true);
+                }
+            }
             // A parameterized subclass needs type-argument substitution. Only
             // identical declaring types establish invariant arguments here.
             let inputs = self.resolve_java_type(
@@ -1964,6 +1996,59 @@ impl Builder {
             }
             let ([input_class], [parameter_class]) = (inputs.as_slice(), parameters.as_slice())
             else {
+                // A parentless project class cannot implement a library container.
+                if let [input_class] = inputs.as_slice() {
+                    let symbol = &self.syms[*input_class as usize];
+                    if symbol.kind == "class"
+                        && self.files[symbol.file as usize]
+                            .java
+                            .as_ref()
+                            .and_then(|java| java.parent_types(&symbol.name, symbol.line))
+                            .is_some_and(|parents| parents.is_empty())
+                        && self
+                            .java_known_container(parameter_owner, &parameter_raw)
+                            .is_some()
+                    {
+                        return Some(false);
+                    }
+                }
+                if inputs.is_empty()
+                    && parameters.len() == 1
+                    && self.java_known_container(input_owner, &input_raw).is_some()
+                {
+                    return Some(false);
+                }
+                if self
+                    .java_invocation_identity(input_owner, &input_raw, 0)
+                    .zip(self.java_invocation_identity(parameter_owner, &parameter_raw, 0))
+                    .is_some_and(|(input, parameter)| input == parameter)
+                {
+                    let Some(parameters) = Self::java_invariant_arguments(parameter) else {
+                        return Some(true);
+                    };
+                    let inputs = Self::java_invariant_arguments(input)?;
+                    if inputs.len() != parameters.len() {
+                        return None;
+                    }
+                    let mut certain = true;
+                    for (input, parameter) in inputs.into_iter().zip(parameters) {
+                        if parameter == "?" {
+                            continue;
+                        }
+                        let identity = self
+                            .java_invocation_identity(input_owner, input, depth + 1)
+                            .zip(self.java_invocation_identity(
+                                parameter_owner,
+                                parameter,
+                                depth + 1,
+                            ));
+                        match identity {
+                            Some((input, parameter)) if input == parameter => {}
+                            _ => certain = false,
+                        }
+                    }
+                    return certain.then_some(true);
+                }
                 return None;
             };
             if input_class != parameter_class {
@@ -1979,6 +2064,9 @@ impl Builder {
             }
             let mut certain = true;
             for (input, parameter) in inputs.into_iter().zip(parameters) {
+                if parameter == "?" {
+                    continue;
+                }
                 // Invariance requires identity, rather than argument widening.
                 match (
                     self.java_invocation_conversion(
@@ -2131,6 +2219,120 @@ impl Builder {
         Some(result)
     }
 
+    /// Canonical identity proves equality without inventing library ancestry.
+    fn java_invocation_identity(&self, context: u32, ty: &str, depth: usize) -> Option<String> {
+        if depth >= 32 || ty == "?" || ty == "null" {
+            return None;
+        }
+        if let Some(element) = ty.strip_suffix("[]") {
+            return Some(format!(
+                "{}[]",
+                self.java_invocation_identity(context, element, depth + 1)?
+            ));
+        }
+        if let Some(arguments) = Self::java_invariant_arguments(ty) {
+            let raw = ty.split('<').next()?;
+            let arguments: Option<Vec<_>> = arguments
+                .into_iter()
+                .map(|argument| self.java_invocation_identity(context, argument, depth + 1))
+                .collect();
+            return Some(format!(
+                "{}<{}>",
+                self.java_invocation_identity(context, raw, depth + 1)?,
+                arguments?.join(",")
+            ));
+        }
+        if Self::java_primitive(ty) {
+            return Some(ty.to_owned());
+        }
+        let classes = self.resolve_java_type(context, self.namespace_of(context), ty, None);
+        if let [class] = classes.as_slice() {
+            return Some(self.syms[*class as usize].qual.clone());
+        }
+        if !classes.is_empty() {
+            return None;
+        }
+        if let Some(path) = self.java_lang_type(context, ty) {
+            return Some(path);
+        }
+        let java = self.files[self.syms[context as usize].file as usize]
+            .java
+            .as_ref()?;
+        let (head, suffix) = ty
+            .split_once("::")
+            .map_or((ty, ""), |(head, suffix)| (head, suffix));
+        let imports: Vec<_> = java
+            .imports
+            .iter()
+            .filter(|path| path.rsplit("::").next() == Some(head))
+            .collect();
+        if let [path] = imports.as_slice() {
+            return Some(if suffix.is_empty() {
+                (*path).clone()
+            } else {
+                format!("{path}::{suffix}")
+            });
+        }
+        if !imports.is_empty() {
+            return None;
+        }
+        if ty.contains("::") && head.chars().next().is_some_and(char::is_lowercase) {
+            return Some(ty.to_owned());
+        }
+        // A wildcard cannot establish identity: an unindexed same-package
+        // declaration takes precedence even when there is only one wildcard.
+        None
+    }
+
+    fn java_receiver_invocation_type(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+    ) -> Option<(u32, String)> {
+        let (owner, value) = self.java_declared_receiver(source, receiver, 0)?;
+        // Keep erased Object, primitive and array expression results outside
+        // this nominal receiver contract; their previous uncertainty is retained.
+        if matches!(&value, JavaReceiver::Array(_))
+            || matches!(&value, JavaReceiver::Type(path) if Self::java_primitive(path)
+                || self.java_lang_type(owner, path).as_deref() == Some("java::lang::Object"))
+        {
+            return None;
+        }
+        fn spelling(
+            resolver: &Builder,
+            owner: u32,
+            value: &JavaReceiver,
+            depth: usize,
+        ) -> Option<String> {
+            if depth >= 16 {
+                return None;
+            }
+            match value {
+                JavaReceiver::Type(path) => Some(path.clone()),
+                JavaReceiver::Parameterized { path, arguments } => {
+                    let arguments: Option<Vec<_>> = arguments
+                        .iter()
+                        .map(|value| {
+                            let (context, value) = resolver.java_declared_receiver(
+                                owner,
+                                value.as_ref()?,
+                                depth + 1,
+                            )?;
+                            let ty = spelling(resolver, context, &value, depth + 1)?;
+                            resolver
+                                .java_invocation_identity(context, &ty, 0)
+                                .or_else(|| (context == owner).then_some(ty))
+                        })
+                        .collect();
+                    Some(format!("{path}<{}>", arguments?.join(",")))
+                }
+                JavaReceiver::Array(Some(element)) => Some(format!("{element}[]")),
+                _ => None,
+            }
+        }
+        Some((owner, spelling(self, owner, &value, 0)?))
+    }
+
     /// Resolve explicit field metadata in its declaring source namespace.
     fn java_invocation_argument(
         &self,
@@ -2152,6 +2354,10 @@ impl Builder {
                     .map(|ty| (*target, ty.to_owned()))
             }
             InvocationArgument::Field(_) => None,
+            InvocationArgument::Value(receiver) => {
+                self.java_receiver_invocation_type(source, receiver)
+            }
+            InvocationArgument::Lambda(_) => None,
         }
     }
 
@@ -2190,10 +2396,113 @@ impl Builder {
         )
     }
 
+    fn java_known_container(&self, owner: u32, path: &str) -> Option<String> {
+        self.java_collection_kind(
+            owner,
+            &JavaReceiver::Parameterized {
+                path: path.to_owned(),
+                arguments: Vec::new(),
+            },
+            0,
+        )
+    }
+
+    /// Substitute class parameters only through that exact declaring receiver.
+    fn java_formal_template(
+        &self,
+        source: u32,
+        target: u32,
+        name: &str,
+        line: i64,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Option<String> {
+        if depth >= 16 {
+            return None;
+        }
+        match receiver {
+            JavaReceiver::Type(path) => self.java_invocation_identity(target, path, 0),
+            JavaReceiver::Parameterized { path, arguments } => {
+                let arguments: Option<Vec<_>> = arguments
+                    .iter()
+                    .map(|argument| {
+                        self.java_formal_template(
+                            source,
+                            target,
+                            name,
+                            line,
+                            argument.as_ref()?,
+                            depth + 1,
+                        )
+                    })
+                    .collect();
+                Some(format!(
+                    "{}<{}>",
+                    self.java_invocation_identity(target, path, 0)?,
+                    arguments?.join(",")
+                ))
+            }
+            JavaReceiver::Parameter(parameter) => {
+                let symbol = &self.syms[target as usize];
+                let java = self.files[symbol.file as usize].java.as_ref()?;
+                // A method parameter can shadow a class parameter with the same name.
+                if java
+                    .parameter_index(&symbol.name, symbol.line, parameter)
+                    .is_some()
+                {
+                    return None;
+                }
+                let class = self.class_scope(target)?;
+                let class_symbol = &self.syms[class as usize];
+                let index =
+                    java.parameter_index(&class_symbol.name, class_symbol.line, parameter)?;
+                let owner = &self.syms[source as usize];
+                let source_java = self.files[owner.file as usize].java.as_ref()?;
+                let call = source_java
+                    .expression_call(&owner.name, owner.line, line, name)?
+                    .as_ref()?;
+                if self.java_receiver_classes(source, &call.receiver, 0) != [class] {
+                    return None;
+                }
+                let (owner, value) =
+                    self.java_argument_receiver(source, &call.receiver, index, 0)?;
+                let (owner, ty) = self.java_receiver_invocation_type(owner, &value)?;
+                self.java_invocation_identity(owner, &ty, 0)
+            }
+            _ => None,
+        }
+    }
+
+    fn java_contextual_formals(
+        &self,
+        source: u32,
+        target: u32,
+        name: &str,
+        line: i64,
+        count: usize,
+        phase: u8,
+    ) -> Option<Vec<Option<String>>> {
+        let mut parameters = self.java_invocation_formals(target, count, phase)?;
+        let symbol = &self.syms[target as usize];
+        let java = self.files[symbol.file as usize].java.as_ref()?;
+        for (index, parameter) in parameters.iter_mut().enumerate() {
+            if parameter.is_none() {
+                *parameter = java
+                    .reference_parameter(&symbol.name, symbol.line, index)
+                    .and_then(|template| {
+                        self.java_formal_template(source, target, name, line, template, 0)
+                    });
+            }
+        }
+        Some(parameters)
+    }
+
     fn java_invocation_applicability(
         &self,
         source: u32,
         target: u32,
+        name: &str,
+        line: i64,
         arguments: &[Option<InvocationArgument>],
         phase: u8,
     ) -> Option<bool> {
@@ -2202,11 +2511,67 @@ impl Builder {
             .java
             .as_ref()?
             .invocation_signature_at(&symbol.name, symbol.line, symbol.java_callable_ordinal)?;
-        let Some(parameters) = self.java_invocation_formals(target, arguments.len(), phase) else {
+        let Some(parameters) =
+            self.java_contextual_formals(source, target, name, line, arguments.len(), phase)
+        else {
             return Some(false);
         };
         let mut certain = true;
-        for (input, parameter) in arguments.iter().zip(parameters.iter()) {
+        for (index, (input, parameter)) in arguments.iter().zip(parameters.iter()).enumerate() {
+            if let Some(InvocationArgument::Lambda(arity)) = input {
+                let java = self.files[symbol.file as usize].java.as_ref()?;
+                if let Some(template) = java.reference_parameter(&symbol.name, symbol.line, index) {
+                    if let Some(inputs) = self.java_functional_arity(target, template) {
+                        if inputs != *arity {
+                            return Some(false);
+                        }
+                        continue;
+                    }
+                    if let JavaReceiver::Parameter(parameter) = template {
+                        if let Some(class) = self.class_scope(target) {
+                            let class = &self.syms[class as usize];
+                            if java
+                                .type_bound(&class.name, class.line, parameter)
+                                .is_some_and(|bound| {
+                                    self.resolve_java_type(
+                                        target,
+                                        self.namespace_of(target),
+                                        bound,
+                                        None,
+                                    )
+                                    .iter()
+                                    .any(|class| self.syms[*class as usize].kind == "class")
+                                })
+                            {
+                                return Some(false);
+                            }
+                        }
+                    }
+                }
+                let Some(parameter) = parameter.as_deref() else {
+                    certain = false;
+                    continue;
+                };
+                let raw = parameter.split('<').next().unwrap_or(parameter);
+                let receiver = JavaReceiver::Type(raw.to_owned());
+                if let Some(inputs) = self.java_functional_arity(target, &receiver) {
+                    if inputs != *arity {
+                        return Some(false);
+                    }
+                    continue;
+                }
+                let classes = self.resolve_java_type(target, self.namespace_of(target), raw, None);
+                if classes
+                    .iter()
+                    .any(|class| self.syms[*class as usize].kind == "class")
+                    || self.java_known_container(target, raw).is_some()
+                    || self.java_lang_type(target, raw).is_some()
+                {
+                    return Some(false);
+                }
+                certain = false;
+                continue;
+            }
             let conversion =
                 input
                     .as_ref()
@@ -2241,7 +2606,8 @@ impl Builder {
             return true;
         };
         (0..3).any(|phase| {
-            self.java_invocation_applicability(source, target, arguments, phase) != Some(false)
+            self.java_invocation_applicability(source, target, name, line, arguments, phase)
+                != Some(false)
         })
     }
 
@@ -2267,7 +2633,8 @@ impl Builder {
         };
         let Some(phase) = (0..3).find(|&phase| {
             targets.iter().any(|&target| {
-                self.java_invocation_applicability(source, target, arguments, phase) != Some(false)
+                self.java_invocation_applicability(source, target, name, line, arguments, phase)
+                    != Some(false)
             })
         }) else {
             return;
@@ -2275,22 +2642,60 @@ impl Builder {
         // Without a proven applicable candidate, an earlier unknown phase
         // cannot justify discarding a later, known applicable declaration.
         if !targets.iter().any(|&target| {
-            self.java_invocation_applicability(source, target, arguments, phase) == Some(true)
+            self.java_invocation_applicability(source, target, name, line, arguments, phase)
+                == Some(true)
         }) {
             return;
         }
         targets.retain(|&target| {
-            self.java_invocation_applicability(source, target, arguments, phase) != Some(false)
+            self.java_invocation_applicability(source, target, name, line, arguments, phase)
+                != Some(false)
         });
+        // An identity conversion for every argument is at least as specific
+        // as any applicable reference supertype, even when its ancestry is absent.
+        let exact: Vec<_> = targets
+            .iter()
+            .copied()
+            .filter(|&target| {
+                let Some(parameters) = self.java_contextual_formals(
+                    source,
+                    target,
+                    name,
+                    line,
+                    arguments.len(),
+                    phase,
+                ) else {
+                    return false;
+                };
+                parameters.len() == arguments.len()
+                    && arguments.iter().zip(parameters).all(|(input, parameter)| {
+                        input
+                            .as_ref()
+                            .zip(parameter.as_deref())
+                            .and_then(|(input, parameter)| {
+                                let (owner, input) =
+                                    self.java_invocation_argument(source, input)?;
+                                self.java_invocation_identity(owner, &input, 0)
+                                    .zip(self.java_invocation_identity(target, parameter, 0))
+                            })
+                            .is_some_and(|(input, parameter)| input == parameter)
+                    })
+            })
+            .collect();
+        if !exact.is_empty() {
+            *targets = exact;
+        }
         let more_specific = |left: u32, right: u32| {
-            if self.java_invocation_applicability(source, left, arguments, phase) != Some(true)
-                || self.java_invocation_applicability(source, right, arguments, phase) != Some(true)
+            if self.java_invocation_applicability(source, left, name, line, arguments, phase)
+                != Some(true)
+                || self.java_invocation_applicability(source, right, name, line, arguments, phase)
+                    != Some(true)
             {
                 return false;
             }
             let (Some(left_parameters), Some(right_parameters)) = (
-                self.java_invocation_formals(left, arguments.len(), phase),
-                self.java_invocation_formals(right, arguments.len(), phase),
+                self.java_contextual_formals(source, left, name, line, arguments.len(), phase),
+                self.java_contextual_formals(source, right, name, line, arguments.len(), phase),
             ) else {
                 return false;
             };
@@ -2970,6 +3375,7 @@ impl Builder {
             | JavaReceiver::Callback { .. }
             | JavaReceiver::CapturedField { .. }
             | JavaReceiver::CollectedMap { .. }
+            | JavaReceiver::StreamFactory { .. }
             | JavaReceiver::MethodProjection { .. } => Vec::new(),
             JavaReceiver::Array(_) => Vec::new(),
             JavaReceiver::Field { receiver, name } => {
@@ -3532,12 +3938,62 @@ impl Builder {
         depth: usize,
     ) -> Option<(u32, JavaReceiver)> {
         match value {
+            JavaReceiver::StreamFactory {
+                qualifier,
+                elements,
+                invocation,
+            } => {
+                if !self.java_is_factory(source, qualifier, "java::util::stream::Stream") {
+                    return self.java_value_receiver(source, invocation, depth + 1);
+                }
+                if elements.is_empty() {
+                    return None;
+                }
+                let mut common = None;
+                for element in elements {
+                    let (owner, mut value) =
+                        self.java_declared_receiver(source, element, depth + 1)?;
+                    if elements.len() == 1 {
+                        if let JavaReceiver::Array(Some(element)) = value {
+                            value = JavaReceiver::Type(element);
+                        }
+                    }
+                    let (owner, ty) = self.java_receiver_invocation_type(owner, &value)?;
+                    let ty = self.java_invocation_identity(owner, &ty, 0)?;
+                    if common.as_ref().is_some_and(|previous| *previous != ty) {
+                        return None;
+                    }
+                    common = Some(ty);
+                }
+                Some((
+                    source,
+                    JavaReceiver::Parameterized {
+                        path: "java::util::stream::Stream".to_owned(),
+                        arguments: vec![common.map(JavaReceiver::Type)],
+                    },
+                ))
+            }
             JavaReceiver::MethodProjection {
                 input,
+                receiver,
                 qualifier,
                 name,
                 line,
             } => {
+                if qualifier.is_none() {
+                    // A value-qualified reference consumes its argument, not
+                    // an unbound receiver. Keep the bound source expression so
+                    // its method's declared future/container result survives.
+                    let invocation = JavaReceiver::Invocation {
+                        receiver: Some(receiver.clone()),
+                        name: name.clone(),
+                        line: *line,
+                        arguments: 1,
+                        first_argument: Some(input.clone()),
+                    };
+                    return self.java_value_receiver(source, &invocation, depth + 1);
+                }
+                let qualifier = qualifier.as_deref()?;
                 let classes =
                     self.resolve_java_type(source, self.namespace_of(source), qualifier, None);
                 let static_targets: Vec<_> = self
@@ -3553,7 +4009,7 @@ impl Builder {
                     .collect();
                 let receiver = if let [_] = static_targets.as_slice() {
                     JavaReceiver::Invocation {
-                        receiver: Some(Box::new(JavaReceiver::Type(qualifier.clone()))),
+                        receiver: Some(Box::new(JavaReceiver::Type(qualifier.to_owned()))),
                         name: name.clone(),
                         line: *line,
                         arguments: 1,
@@ -4447,7 +4903,32 @@ impl Builder {
                 self.java_narrow_invocation_targets(source, name, line, &mut targets);
             }
             if let Some(context) = &call.reference_context {
-                if let Some(inputs) = self.java_functional_arity(source, context) {
+                // An inferred JDK callback context is valid only for the verified
+                // JDK receiver; user-defined methods do not inherit that SAM.
+                let inferred_valid = match Self::java_functional_input(context, 0) {
+                    Some(JavaReceiver::Element {
+                        receiver,
+                        operation,
+                    }) => {
+                        let kind = self.java_collection_kind(source, receiver, 0);
+                        match operation.as_str() {
+                            "forEach" => matches!(
+                                kind.as_deref(),
+                                Some("List" | "Collection" | "Set" | "Iterable" | "Stream")
+                            ),
+                            "stream-element" => {
+                                matches!(kind.as_deref(), Some("Stream" | "Optional"))
+                            }
+                            "future-element" => kind.as_deref() == Some("CompletableFuture"),
+                            _ => false,
+                        }
+                    }
+                    _ => true,
+                };
+                if let Some(inputs) = inferred_valid
+                    .then(|| self.java_functional_arity(source, context))
+                    .flatten()
+                {
                     targets.retain(|&target| {
                         let symbol = &self.syms[target as usize];
                         let Some(java) = &self.files[symbol.file as usize].java else {
@@ -4481,6 +4962,42 @@ impl Builder {
                                 })
                             })
                     });
+                    let exact: Vec<_> = targets
+                        .iter()
+                        .copied()
+                        .filter(|&target| {
+                            let symbol = &self.syms[target as usize];
+                            let Some(java) = &self.files[symbol.file as usize].java else {
+                                return false;
+                            };
+                            // Unbound instance references also consume a receiver;
+                            // leave that separate conversion to existing binding.
+                            if reference_is_type
+                                && !java.is_static_method(&symbol.name, symbol.line)
+                            {
+                                return false;
+                            }
+                            let Some(parameters) = self.java_invocation_formals(target, inputs, 0)
+                            else {
+                                return false;
+                            };
+                            parameters.iter().enumerate().all(|(index, parameter)| {
+                                Self::java_functional_input(context, index)
+                                    .zip(parameter.as_deref())
+                                    .and_then(|(input, parameter)| {
+                                        let (owner, input) =
+                                            self.java_receiver_invocation_type(source, input)?;
+                                        self.java_invocation_identity(owner, &input, 0).zip(
+                                            self.java_invocation_identity(target, parameter, 0),
+                                        )
+                                    })
+                                    .is_some_and(|(input, parameter)| input == parameter)
+                            })
+                        })
+                        .collect();
+                    if !exact.is_empty() {
+                        targets = exact;
+                    }
                 }
             }
             targets.sort_unstable();
@@ -4518,6 +5035,21 @@ impl Builder {
         target: u32,
         parameter: &JavaReceiver,
     ) -> bool {
+        if let (Some((input_owner, input)), Some((parameter_owner, parameter))) = (
+            self.java_receiver_invocation_type(source, input),
+            self.java_receiver_invocation_type(target, parameter),
+        ) {
+            if let Some(compatible) = self.java_invocation_conversion(
+                input_owner,
+                &input,
+                parameter_owner,
+                &parameter,
+                true,
+                0,
+            ) {
+                return compatible;
+            }
+        }
         let input_classes = self.java_receiver_classes(source, input, 0);
         let [input_class] = input_classes.as_slice() else {
             return true;
