@@ -91,6 +91,7 @@ import module_scope_contracts
 import module_root_contracts
 import module_alias_contracts
 import java_module_binding_contracts
+import java_inherited_import_contracts
 import selector_error_contracts
 import operation_error_contracts
 import scan_error_contracts
@@ -584,6 +585,7 @@ class Fixture:
         self._module_root_results = None
         self._module_alias_results = None
         self._java_module_binding_results = None
+        self._java_inherited_import_results = None
         self._selector_error_results = None
         self._operation_error_results = None
         self._scan_error_results = None
@@ -2131,6 +2133,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def java_inherited_import_check(self, check: sqlite3.Row):
+        if self._java_inherited_import_results is None:
+            self._java_inherited_import_results = java_inherited_import_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._java_inherited_import_results)
+        return {'source': java_inherited_import_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def module_scope_check(self, check: sqlite3.Row):
         if self._module_scope_results is None:
             self._module_scope_results = module_scope_contracts.exercise(self.binary, self.database.parent)
@@ -2324,6 +2334,8 @@ class Fixture:
                 handler = self.module_root_check
             if check['feature'] in java_module_binding_contracts.FEATURES:
                 handler = self.java_module_binding_check
+            if check['feature'] in java_inherited_import_contracts.FEATURES:
+                handler = self.java_inherited_import_check
             if check['feature'] in module_alias_contracts.FEATURES:
                 handler = self.module_alias_check
             if check['feature'] in module_scope_contracts.FEATURES:
@@ -2458,6 +2470,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(module_scope_contracts.FEATURES)
     features.update(module_root_contracts.FEATURES)
     features.update(java_module_binding_contracts.FEATURES)
+    features.update(java_inherited_import_contracts.FEATURES)
     features.update(module_alias_contracts.FEATURES)
     features.update(selector_error_contracts.FEATURES)
     features.update(operation_error_contracts.FEATURES)
@@ -2649,6 +2662,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     graph_ambiguity_contracts.plan_contracts(state, root)
     module_alias_contracts.plan_aliases(state, root)
     java_module_binding_contracts.plan_binding(state, root)
+    java_inherited_import_contracts.plan_imports(state, root)
     selector_error_contracts.plan_errors(state, root)
     operation_error_contracts.plan_errors(state, root)
     scan_error_contracts.plan_errors(state, root)

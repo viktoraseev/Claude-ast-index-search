@@ -271,12 +271,19 @@ pub(crate) struct DependencySyntax {
     pub expression_types: std::collections::BTreeSet<String>,
 }
 
-/// Direct importable members retain declaration modifiers, including implicit
-/// interface members. Inherited and protected-subclass lookup is separate.
+/// Import metadata retains hiding barriers even for inaccessible members.
 pub(crate) struct DependencyImportDeclaration {
     pub accessible: bool,
+    pub member_accessible: bool,
+    pub package_member: bool,
     pub static_member: bool,
     pub static_names: std::collections::HashSet<(String, bool)>,
+    pub declared_names: std::collections::HashSet<(String, bool)>,
+    pub package_names: std::collections::HashSet<(String, bool)>,
+    pub parents: Vec<String>,
+    pub package: String,
+    pub imports: Vec<(String, bool)>,
+    pub interface: bool,
 }
 
 pub(crate) fn dependency_import_declaration(
@@ -284,6 +291,7 @@ pub(crate) fn dependency_import_declaration(
     qualified: &str,
     accessing_package: &str,
 ) -> Result<Option<DependencyImportDeclaration>> {
+    let imports = import_declarations(content)?;
     fn is_type(node: Node<'_>) -> bool {
         matches!(
             node.kind(),
@@ -315,6 +323,12 @@ pub(crate) fn dependency_import_declaration(
     fn accessible(node: Node<'_>, content: &str, same_package: bool) -> bool {
         !modifier(node, content, "private")
             && (modifier(node, content, "public") || interface_member(node) || same_package)
+    }
+    fn package_member(node: Node<'_>, content: &str) -> bool {
+        !interface_member(node)
+            && !["public", "private", "protected"]
+                .iter()
+                .any(|keyword| modifier(node, content, keyword))
     }
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let mut package = String::new();
@@ -384,6 +398,8 @@ pub(crate) fn dependency_import_declaration(
                         | "record_declaration"
                 ));
         let mut static_names = std::collections::HashSet::new();
+        let mut declared_names = std::collections::HashSet::new();
+        let mut package_names = std::collections::HashSet::new();
         if let Some(body) = node.child_by_field_name("body") {
             super::walk_tree_preorder(&body, |member| {
                 if member.id() == body.id() || member.kind() == "enum_body_declarations" {
@@ -391,22 +407,31 @@ pub(crate) fn dependency_import_declaration(
                 }
                 if member.kind() == "enum_constant" {
                     if let Some(name) = member.child_by_field_name("name") {
-                        static_names.insert((node_text(content, &name).to_owned(), false));
+                        let key = (node_text(content, &name).to_owned(), false);
+                        declared_names.insert(key.clone());
+                        static_names.insert(key);
                     }
                     return super::WalkControl::SkipChildren;
                 }
                 if !matches!(
                     member.kind(),
                     "field_declaration" | "constant_declaration" | "method_declaration"
-                ) || !accessible(member, content, package == accessing_package)
-                    || !(modifier(member, content, "static")
-                        || interface_member(member) && member.kind() != "method_declaration")
-                {
+                ) {
                     return super::WalkControl::SkipChildren;
                 }
+                let allowed = accessible(member, content, package == accessing_package)
+                    && (modifier(member, content, "static")
+                        || interface_member(member) && member.kind() != "method_declaration");
                 if member.kind() == "method_declaration" {
                     if let Some(name) = member.child_by_field_name("name") {
-                        static_names.insert((node_text(content, &name).to_owned(), true));
+                        let key = (node_text(content, &name).to_owned(), true);
+                        declared_names.insert(key.clone());
+                        if package_member(member, content) {
+                            package_names.insert(key.clone());
+                        }
+                        if allowed {
+                            static_names.insert(key);
+                        }
                     }
                 } else {
                     let mut cursor = member.walk();
@@ -415,17 +440,59 @@ pub(crate) fn dependency_import_declaration(
                         .filter(|n| n.kind() == "variable_declarator")
                     {
                         if let Some(name) = variable.child_by_field_name("name") {
-                            static_names.insert((node_text(content, &name).to_owned(), false));
+                            let key = (node_text(content, &name).to_owned(), false);
+                            declared_names.insert(key.clone());
+                            if package_member(member, content) {
+                                package_names.insert(key.clone());
+                            }
+                            if allowed {
+                                static_names.insert(key);
+                            }
                         }
                     }
                 }
                 super::WalkControl::SkipChildren
             });
         }
+        let mut parents = Vec::new();
+        let mut cursor = node.walk();
+        for branch in node.named_children(&mut cursor).filter(|child| {
+            matches!(
+                child.kind(),
+                "superclass" | "super_interfaces" | "extends_interfaces"
+            )
+        }) {
+            super::walk_tree_preorder(&branch, |ty| {
+                if matches!(
+                    ty.kind(),
+                    "type_identifier" | "scoped_type_identifier" | "generic_type"
+                ) {
+                    let ty = if ty.kind() == "generic_type" {
+                        ty.named_child(0).unwrap_or(ty)
+                    } else {
+                        ty
+                    };
+                    parents.push(node_text(content, &ty).to_owned());
+                    return super::WalkControl::SkipChildren;
+                }
+                super::WalkControl::Continue
+            });
+        }
         result = Some(DependencyImportDeclaration {
             accessible: allowed,
+            member_accessible: accessible(node, content, package == accessing_package),
+            package_member: package_member(node, content),
             static_member,
             static_names,
+            declared_names,
+            package_names,
+            parents,
+            package: package.clone(),
+            imports: imports.clone(),
+            interface: matches!(
+                node.kind(),
+                "interface_declaration" | "annotation_type_declaration"
+            ),
         });
         super::WalkControl::SkipChildren
     });

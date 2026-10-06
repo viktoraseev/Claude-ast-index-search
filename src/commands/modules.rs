@@ -2227,12 +2227,201 @@ fn java_dependency_declaration(
             qualified,
             accessing_package,
         )? {
-            if declaration.accessible {
-                return Ok(Some(declaration));
-            }
+            return Ok(Some(declaration));
         }
     }
     Ok(None)
+}
+
+struct JavaDependencyType {
+    identity: String,
+    declaration: crate::parsers::treesitter::java::DependencyImportDeclaration,
+}
+
+/// Check inherited aliases without borrowing another root's classpath metadata.
+struct JavaDependencyLookup<'a> {
+    conn: &'a Connection,
+    root: &'a Path,
+    resolver: &'a super::PathResolver,
+    package: &'a str,
+}
+
+impl JavaDependencyLookup<'_> {
+    fn direct(&self, name: &str) -> Result<Option<JavaDependencyType>> {
+        Ok(
+            java_dependency_declaration(self.conn, self.root, self.resolver, name, self.package)?
+                .map(|declaration| JavaDependencyType {
+                    identity: name.to_owned(),
+                    declaration,
+                }),
+        )
+    }
+
+    fn parents(&self, owner: &JavaDependencyType) -> Result<Vec<JavaDependencyType>> {
+        let mut result = Vec::new();
+        for name in &owner.declaration.parents {
+            let first = name.split('.').next().unwrap_or(name);
+            let suffix = &name[first.len()..];
+            let explicit = owner.declaration.imports.iter().find(|(import, _)| {
+                !import.ends_with(".*") && import.rsplit('.').next() == Some(first)
+            });
+            let mut candidates = Vec::new();
+            if let Some((import, _)) = explicit {
+                candidates.push(format!("{import}{suffix}"));
+            } else {
+                // Lexical enclosing types and the package precede on-demand imports.
+                let mut prefix = owner.identity.as_str();
+                while let Some((outer, _)) = prefix.rsplit_once('.') {
+                    if outer == owner.declaration.package {
+                        break;
+                    }
+                    candidates.push(format!("{outer}.{name}"));
+                    prefix = outer;
+                }
+                candidates.push(if owner.declaration.package.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}.{name}", owner.declaration.package)
+                });
+                candidates.push(name.clone());
+            }
+            let mut found = None;
+            for candidate in candidates {
+                if let Some(parent) = self.direct(&candidate)? {
+                    found = Some(parent);
+                    break;
+                }
+            }
+            if found.is_none() && explicit.is_none() {
+                let mut matches = std::collections::BTreeMap::new();
+                for (import, _) in &owner.declaration.imports {
+                    if let Some(prefix) = import.strip_suffix(".*") {
+                        if let Some(parent) = self.direct(&format!("{prefix}.{name}"))? {
+                            matches.insert(parent.identity.clone(), parent);
+                        }
+                    }
+                }
+                if matches.len() == 1 {
+                    found = matches.into_values().next();
+                }
+            }
+            if let Some(parent) = found {
+                result.push(parent);
+            }
+        }
+        Ok(result)
+    }
+
+    fn inherited_type(
+        &self,
+        owner: &JavaDependencyType,
+        member: &str,
+        visiting: &mut HashSet<String>,
+    ) -> Result<Vec<JavaDependencyType>> {
+        if visiting.len() >= 128 || !visiting.insert(owner.identity.clone()) {
+            return Ok(Vec::new());
+        }
+        let mut matches = std::collections::BTreeMap::new();
+        if let Some(mut direct) = self.direct(&format!("{}.{member}", owner.identity))? {
+            // A direct inaccessible declaration still hides all parent candidates.
+            direct.declaration.accessible = direct.declaration.member_accessible;
+            matches.insert(direct.identity.clone(), direct);
+        } else {
+            for parent in self.parents(owner)? {
+                for found in self.inherited_type(&parent, member, visiting)? {
+                    if found.declaration.accessible
+                        && (!found.declaration.package_member
+                            || found.declaration.package == owner.declaration.package)
+                    {
+                        matches.insert(found.identity.clone(), found);
+                    }
+                }
+            }
+        }
+        visiting.remove(&owner.identity);
+        Ok(matches.into_values().collect())
+    }
+
+    fn type_name(&self, name: &str, aliases: bool) -> Result<Option<JavaDependencyType>> {
+        self.type_name_inner(name, aliases, 0)
+    }
+
+    fn type_name_inner(
+        &self,
+        name: &str,
+        aliases: bool,
+        depth: usize,
+    ) -> Result<Option<JavaDependencyType>> {
+        if depth >= 128 {
+            return Ok(None);
+        }
+        if let Some(found) = self.direct(name)? {
+            return Ok(found.declaration.accessible.then_some(found));
+        }
+        if !aliases {
+            return Ok(None);
+        }
+        let Some((prefix, member)) = name.rsplit_once('.') else {
+            return Ok(None);
+        };
+        let Some(owner) = self.type_name_inner(prefix, true, depth + 1)? else {
+            return Ok(None);
+        };
+        let mut matches = self.inherited_type(&owner, member, &mut HashSet::new())?;
+        // Distinct declarations remain ambiguous, including inaccessible barriers.
+        if matches.len() != 1 {
+            return Ok(None);
+        }
+        let found = matches.pop().unwrap();
+        Ok(found.declaration.accessible.then_some(found))
+    }
+
+    fn member_origins(
+        &self,
+        owner: &JavaDependencyType,
+        member: &(String, bool),
+        inherited: bool,
+        visiting: &mut HashSet<String>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let mut matches = std::collections::BTreeSet::new();
+        if visiting.len() >= 128 || !visiting.insert(owner.identity.clone()) {
+            return Ok(matches);
+        }
+        if owner.declaration.declared_names.contains(member) {
+            if owner.declaration.static_names.contains(member)
+                && !(inherited && member.1 && owner.declaration.interface)
+            {
+                matches.insert(owner.identity.clone());
+            }
+        } else {
+            for parent in self.parents(owner)? {
+                for identity in self.member_origins(&parent, member, true, visiting)? {
+                    if let Some(found) = self.direct(&identity)? {
+                        if found.declaration.package_names.contains(member)
+                            && found.declaration.package != owner.declaration.package
+                        {
+                            continue;
+                        }
+                    }
+                    matches.insert(identity);
+                }
+            }
+        }
+        visiting.remove(&owner.identity);
+        Ok(matches)
+    }
+
+    fn static_member(&self, owner: &str, member: &(String, bool)) -> Result<Option<String>> {
+        let Some(owner) = self.type_name(owner, true)? else {
+            return Ok(None);
+        };
+        let mut matches = self.member_origins(&owner, member, false, &mut HashSet::new())?;
+        Ok(if matches.len() == 1 {
+            matches.pop_first()
+        } else {
+            None
+        })
+    }
 }
 
 /// Check dependency identities using Java syntax and other languages' indexed refs.
@@ -2311,86 +2500,58 @@ fn count_symbols_used_in_module(
             crate::indexer::max_file_size_bytes(),
         )?;
         let syntax = crate::parsers::treesitter::java::dependency_syntax(&content)?;
-        let declaration =
-            |name: &str| java_dependency_declaration(conn, root, &resolver, name, &syntax.package);
+        let lookup = JavaDependencyLookup {
+            conn,
+            root,
+            resolver: &resolver,
+            package: &syntax.package,
+        };
+        let declaration = |name: &str| lookup.type_name(name, true);
         let mut identities = std::collections::BTreeSet::new();
         let mut explicit = HashMap::new();
         let mut explicit_static = HashSet::new();
         let mut invalid_static_types = HashSet::new();
         let mut wildcards = vec![("java.lang".to_string(), false)];
         for (import, is_static) in &syntax.imports {
-            if import.ends_with(".*") {
-                wildcards.push((import.trim_end_matches(".*").to_owned(), *is_static));
+            if let Some(owner) = import.strip_suffix(".*") {
+                wildcards.push((owner.to_owned(), *is_static));
                 continue;
             }
-            let mut owner = import.as_str();
-            // A static import names either a nested type or a member of the
-            // longest indexed type prefix. Importing a member needs its owner
-            // even when the body contains no class-name reference.
-            while !exists.query_row(params![owner], |row| row.get::<_, bool>(0))? {
-                if !is_static {
-                    break;
-                }
-                let Some((prefix, _)) = owner.rsplit_once('.') else {
-                    break;
-                };
-                owner = prefix;
-            }
-            if let Some(found) = declaration(owner)? {
-                let member = import
-                    .strip_prefix(owner)
-                    .and_then(|suffix| suffix.strip_prefix('.'));
-                let valid = if *is_static {
-                    member.map_or(found.static_member, |name| {
-                        found
-                            .static_names
-                            .iter()
-                            .any(|(candidate, _)| candidate == name)
-                    })
+            let simple = import.rsplit('.').next().unwrap_or(import).to_owned();
+            // Ordinary single type imports require a canonical name. Static
+            // single imports may name an inherited member of a visible owner.
+            if let Some(found) = lookup.type_name(import, *is_static)? {
+                if !is_static || found.declaration.static_member {
+                    identities.insert(found.identity);
                 } else {
-                    true
-                };
-                if valid {
-                    identities.insert(owner.to_owned());
+                    invalid_static_types.insert(simple.clone());
                 }
-                if !import.ends_with(".*") && owner == import {
-                    if !valid {
-                        invalid_static_types
-                            .insert(import.rsplit('.').next().unwrap_or(import).to_owned());
-                    }
-                    explicit.insert(
-                        import.rsplit('.').next().unwrap_or(import).to_owned(),
-                        import.clone(),
-                    );
-                } else if *is_static {
-                    if let Some(member) = member {
-                        // Even an external or inaccessible single import must
-                        // block fallback to an unrelated on-demand member.
-                        let mut found_member = false;
-                        for (name, method) in &found.static_names {
-                            if name == member {
-                                explicit_static.insert((name.clone(), *method));
-                                found_member = true;
-                            }
-                        }
-                        if !found_member {
-                            explicit_static.insert((member.to_owned(), false));
-                            explicit_static.insert((member.to_owned(), true));
-                        }
-                    }
+                explicit.insert(simple, import.clone());
+                continue;
+            }
+            if !is_static {
+                explicit.insert(simple.clone(), import.clone());
+                invalid_static_types.insert(simple);
+                continue;
+            }
+            let Some((owner, member)) = import.rsplit_once('.') else {
+                continue;
+            };
+            let mut found = false;
+            for method in [false, true] {
+                let key = (member.to_owned(), method);
+                if let Some(identity) = lookup.static_member(owner, &key)? {
+                    identities.insert(identity);
+                    explicit_static.insert(key);
+                    found = true;
                 }
-            } else if !is_static {
-                // An external explicit import still blocks matching a project
-                // type with the same simple name through a wildcard import.
-                explicit.insert(
-                    import.rsplit('.').next().unwrap_or(import).to_owned(),
-                    import.clone(),
-                );
-            } else if let Some((_, member)) = import.rsplit_once('.') {
-                // External single imports still take precedence; no platform
-                // symbol inference is needed to reject a wildcard fallback.
+            }
+            if !found {
+                // An inaccessible/external single import blocks unrelated
+                // wildcard fallback in both member namespaces.
                 explicit_static.insert((member.to_owned(), false));
                 explicit_static.insert((member.to_owned(), true));
+                invalid_static_types.insert(simple);
             }
         }
         for name in &syntax.types {
@@ -2404,10 +2565,7 @@ fn count_symbols_used_in_module(
                 let mut value_import = explicit_static.contains(&member);
                 if !value_import {
                     for (owner, is_static) in &wildcards {
-                        if *is_static
-                            && declaration(owner)?
-                                .is_some_and(|found| found.static_names.contains(&member))
-                        {
+                        if *is_static && lookup.static_member(owner, &member)?.is_some() {
                             value_import = true;
                             break;
                         }
@@ -2424,8 +2582,8 @@ fn count_symbols_used_in_module(
                     continue;
                 }
                 let candidate = format!("{import}{suffix}");
-                if declaration(&candidate)?.is_some() {
-                    identities.insert(candidate);
+                if let Some(found) = declaration(&candidate)? {
+                    identities.insert(found.identity);
                 }
                 continue;
             }
@@ -2435,22 +2593,30 @@ fn count_symbols_used_in_module(
                 format!("{}.{name}", syntax.package)
             };
             if exists.query_row(params![&local], |row| row.get::<_, bool>(0))? {
-                if declaration(&local)?.is_some() {
-                    identities.insert(local);
+                if let Some(found) = declaration(&local)? {
+                    identities.insert(found.identity);
                 }
                 continue;
             }
-            if name.contains('.') && exists.query_row(params![name], |row| row.get::<_, bool>(0))? {
-                if declaration(name)?.is_some() {
-                    identities.insert(name.clone());
+            if name.contains('.') {
+                if let Some(found) = declaration(&local)? {
+                    identities.insert(found.identity);
+                    continue;
                 }
-                continue;
+            }
+            if name.contains('.') {
+                if let Some(found) = declaration(name)? {
+                    identities.insert(found.identity);
+                    continue;
+                }
             }
             let mut matches = std::collections::BTreeSet::new();
             for (package, is_static) in &wildcards {
                 let candidate = format!("{package}.{name}");
-                if declaration(&candidate)?.is_some_and(|found| !is_static || found.static_member) {
-                    matches.insert(candidate);
+                if let Some(found) = lookup.type_name(&candidate, *is_static)? {
+                    if !is_static || found.declaration.static_member {
+                        matches.insert(found.identity);
+                    }
                 }
             }
             // Ambiguous on-demand imports are not evidence of either owner.
@@ -2464,10 +2630,10 @@ fn count_symbols_used_in_module(
             }
             let mut matches = std::collections::BTreeSet::new();
             for (owner, is_static) in &wildcards {
-                if *is_static
-                    && declaration(owner)?.is_some_and(|found| found.static_names.contains(member))
-                {
-                    matches.insert(owner.clone());
+                if *is_static {
+                    if let Some(identity) = lookup.static_member(owner, member)? {
+                        matches.insert(identity);
+                    }
                 }
             }
             if matches.len() == 1 {
