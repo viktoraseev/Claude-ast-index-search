@@ -249,6 +249,12 @@ class CompletionTests(unittest.TestCase):
         with self.assertRaises(ToolError):
             self.check()
 
+    def test_legacy_foreign_pending_and_error_rows_remain_durable_without_counting(self):
+        before = self.check()['checks']
+        self.mutate("INSERT INTO checks(id,feature,subject,status,verdict) VALUES ('foreign-pending','xml-usages:syntax','legacy','pending',NULL)")
+        self.mutate("INSERT INTO checks(id,feature,subject,status,verdict) VALUES ('foreign-error','composables','legacy','complete','error')")
+        self.assertEqual(self.check()['checks'], before)
+
 
 if __name__ == '__main__':
     unittest.main()

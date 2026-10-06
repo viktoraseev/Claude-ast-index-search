@@ -7,17 +7,18 @@ from common import ToolError, connect, stable_id
 import mobile_contracts
 from root_contracts import Runner
 from java_type_binding_contracts import edges, identity
+import java_receiver_site_contracts
 
 SCOPES = 'graph:java-local-class-shadows'
 MEMBERS = 'graph:java-local-class-members'
 EXPLORE = 'explore:java-local-class-shadows'
 RECEIVERS = 'graph:java-local-class-receiver-sites'
 RECEIVER_EXPLORE = 'explore:java-local-class-receiver-sites'
-FEATURES = {SCOPES, MEMBERS, EXPLORE, RECEIVERS, RECEIVER_EXPLORE}
+FEATURES = {SCOPES, MEMBERS, EXPLORE, RECEIVERS, RECEIVER_EXPLORE} | java_receiver_site_contracts.FEATURES
 REASON = ('independent source/state: disposable javac-validated Java local classes, '
           'member/package/import shadows, declaration/block/sibling boundaries, nested '
           'types and static qualifiers, graph pages/reverse/path and exploration; '
-          'distinct-line direct nominal receiver declaration sites across later local shadows; '
+          'distinct-line direct/chained nominal and generic receiver declaration sites across later local shadows; '
           'not MCP equivalence or compiler-wide receiver dispatch')
 SOURCES = {
     'Leaf.java': '''package fixture;
@@ -204,6 +205,13 @@ def plan_classes(state, root):
                           ('; separate Java fixture checks direct nominal receiver declaration sites across '
                            'later local shadows, including captures and method references; chained/generic '
                            'receivers, same-line type sites and compiler-wide dispatch remain unresolved', parent))
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending'",
+                          ('; separate executed javac/source contract covers nominal field/return chains, '
+                           'List/Optional/nested Map/List and explicit generic Box projections, captures, '
+                           'method references and missing-member guards at receiver declaration sites; '
+                           'same-line local declaration collisions, generic inference beyond explicit type '
+                           'arguments, overload/accessibility dispatch and attached-root receiver semantics '
+                           'remain pending; not MCP equivalence', parent))
 
 
 def exercise(binary, base):
@@ -356,4 +364,7 @@ def exercise(binary, base):
                           *(['--include-ambiguous'] if ambiguous else []))
         record(MEMBERS, f'missing-member:{ambiguous}',
                [(local_targets('Probe.java', 'emptyShadow', ('Leaf',))[0], 'scoped')], edges(doc))
+    site_expected, site_actual = java_receiver_site_contracts.exercise(binary, base)
+    expected.update(site_expected)
+    actual.update(site_actual)
     return expected, actual

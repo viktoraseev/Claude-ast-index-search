@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 
-from audit import Fixture, InvocationOracle, SCHEMA
+from audit import Fixture, InvocationOracle, SCHEMA, check_scope_filter
 from build_index import build_ast_index, capture_binary, freeze_binary
 from common import StreamableHttpMcpClient, ToolError, adapter_digest, canonical_json, connect, file_sha256, source_snapshot, stable_id
 import mobile_contracts
@@ -60,10 +60,11 @@ class ArchiveOracle:
 
 def problem_batch(source, limit: int):
     """Stream the bounded failure batch and every recorded contract error."""
+    scope, parameters = check_scope_filter(source)
     yield from source.execute(
-        "SELECT * FROM checks WHERE verdict='fail' ORDER BY rowid LIMIT ?", (limit,))
+        f"SELECT * FROM checks WHERE verdict='fail' AND {scope} ORDER BY rowid LIMIT ?", (*parameters, limit))
     yield from source.execute(
-        "SELECT * FROM checks WHERE verdict IN ('unsupported','error') ORDER BY rowid")
+        f"SELECT * FROM checks WHERE verdict IN ('unsupported','error') AND {scope} ORDER BY rowid", parameters)
 
 
 def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 100, *, mcp_url: str | None = None, oracle_evidence: Path | None = None) -> dict:

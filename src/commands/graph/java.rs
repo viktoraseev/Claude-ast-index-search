@@ -95,6 +95,16 @@ pub(super) struct JavaSource {
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) enum JavaReceiver {
+    Declared {
+        receiver: Box<JavaReceiver>,
+        site: ReceiverTypeSite,
+    },
+    /// A graph-local identity after declaration-site syntax binding. Retaining
+    /// the index avoids rebinding local types through their nonunique names.
+    BoundType {
+        class: u32,
+        arguments: Option<Vec<Option<JavaReceiver>>>,
+    },
     Type(String),
     Parameter(String),
     Parameterized {
@@ -167,7 +177,7 @@ pub(super) struct ExpressionCall {
     pub reference_type: Option<String>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct ReceiverTypeSite {
     pub path: String,
     pub line: i64,
@@ -565,13 +575,13 @@ fn blocks_enclosing_fields(node: Node<'_>, source: &str) -> bool {
     blocked
 }
 
-fn variable_inferred<'a>(
+fn variable_binding<'a>(
     call: Node<'_>,
     name: &str,
     fields_only: bool,
     scopes: &'a VariableScopes,
     source: &str,
-) -> Option<&'a JavaReceiver> {
+) -> Option<&'a VariableBinding> {
     let mut ancestor = Some(call);
     let mut fields_blocked = false;
     while let Some(node) = ancestor {
@@ -585,7 +595,7 @@ fn variable_inferred<'a>(
                 })
                 .max_by_key(|binding| binding.position)
             {
-                return binding.inferred.as_ref();
+                return Some(binding);
             }
         }
         if blocks_enclosing_fields(node, source) {
@@ -594,6 +604,40 @@ fn variable_inferred<'a>(
         ancestor = node.parent();
     }
     None
+}
+
+fn variable_receiver(
+    call: Node<'_>,
+    name: &str,
+    fields_only: bool,
+    scopes: &VariableScopes,
+    source: &str,
+) -> Option<JavaReceiver> {
+    let binding = variable_binding(call, name, fields_only, scopes, source)?;
+    let receiver = binding.inferred.clone().or_else(|| {
+        binding.site.as_ref()?;
+        binding.declared.clone().map(JavaReceiver::Type)
+    })?;
+    Some(if let Some(site) = &binding.site {
+        JavaReceiver::Declared {
+            receiver: Box::new(receiver),
+            site: site.clone(),
+        }
+    } else {
+        receiver
+    })
+}
+
+fn variable_inferred<'a>(
+    call: Node<'_>,
+    name: &str,
+    fields_only: bool,
+    scopes: &'a VariableScopes,
+    source: &str,
+) -> Option<&'a JavaReceiver> {
+    variable_binding(call, name, fields_only, scopes, source)?
+        .inferred
+        .as_ref()
 }
 
 fn variable_type<'a>(
@@ -603,43 +647,28 @@ fn variable_type<'a>(
     scopes: &'a VariableScopes,
     source: &str,
 ) -> Option<Option<&'a str>> {
-    let mut ancestor = Some(call);
-    let mut fields_blocked = false;
-    while let Some(node) = ancestor {
-        if let Some(bindings) = scopes.get(&node.id()).and_then(|scope| scope.get(name)) {
-            if let Some(binding) = bindings
-                .iter()
-                .filter(|binding| {
-                    (!fields_only || binding.field)
-                        && (!fields_blocked || !binding.field)
-                        && (binding.field || binding.position < call.start_byte())
-                })
-                .max_by_key(|binding| binding.position)
-            {
-                return Some(binding.declared.as_deref());
-            }
-        }
-        // Static and inherited scopes cannot capture an enclosing field safely.
-        if blocks_enclosing_fields(node, source) {
-            fields_blocked = true;
-        }
-        ancestor = node.parent();
-    }
-    None
+    Some(
+        variable_binding(call, name, fields_only, scopes, source)?
+            .declared
+            .as_deref(),
+    )
 }
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
 
-/// Keep a nominal variable type in its declaring lexical scope. Generic and
-/// array receiver projection remains separate evidence.
+/// Keep nominal and generic variable types in their declaring lexical scope.
+/// Array projection remains separate evidence.
 fn receiver_type_site(
     ty: Node<'_>,
     source: &str,
     declarations: &HashMap<usize, InvocationOwner>,
 ) -> Option<ReceiverTypeSite> {
-    if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+    if !matches!(
+        ty.kind(),
+        "type_identifier" | "scoped_type_identifier" | "generic_type"
+    ) {
         return None;
     }
     if ty.parent().is_some_and(|declaration| {
@@ -1915,6 +1944,14 @@ fn expression_receiver(
                 }
                 ancestor = scope.parent();
             }
+            if let Some(capture) = captured_field(node, text(node, source), scopes, source) {
+                return capture;
+            }
+            if let Some(receiver) =
+                variable_receiver(node, text(node, source), false, scopes, source)
+            {
+                return receiver;
+            }
             if let Some(parameters) = owner.child_by_field_name("parameters") {
                 let mut cursor = parameters.walk();
                 for parameter in parameters.named_children(&mut cursor) {
@@ -1947,14 +1984,6 @@ fn expression_receiver(
                     }
                 }
             }
-            if let Some(capture) = captured_field(node, text(node, source), scopes, source) {
-                return capture;
-            }
-            if let Some(inferred) =
-                variable_inferred(node, text(node, source), false, scopes, source)
-            {
-                return inferred.clone();
-            }
             match variable_type(node, text(node, source), false, scopes, source) {
                 Some(binding) => typed(binding.map(str::to_owned)),
                 None => typed(Some(text(node, source).to_owned())),
@@ -1969,9 +1998,9 @@ fn expression_receiver(
                 .is_some_and(|base| base.kind() == "this") =>
         {
             if let Some(receiver) = node.child_by_field_name("field").and_then(|field| {
-                variable_inferred(node, text(field, source), true, scopes, source)
+                variable_receiver(node, text(field, source), true, scopes, source)
             }) {
-                return receiver.clone();
+                return receiver;
             }
             let binding = node
                 .child_by_field_name("field")

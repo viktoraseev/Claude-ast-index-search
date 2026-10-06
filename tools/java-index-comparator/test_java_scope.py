@@ -3,13 +3,69 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from audit import JAVA_EXCLUDED_FEATURES, SCHEMA, plan
+from audit import JAVA_EXCLUDED_FEATURES, SCHEMA, plan, next_check
+from replay import problem_batch
 from common import connect
 import annotation_contracts
 import android_contracts
+import android_syntax_contracts
+import java_resource_contracts
 
 
 class JavaScopeTests(unittest.TestCase):
+    def test_java_scope_excludes_xml_only_criteria_preserving_legacy_ids_and_java_ownership(self):
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts/tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=artifacts) as temporary:
+            directory = Path(temporary)
+            root = directory / 'project'
+            root.mkdir()
+            (root / 'Sentinel.java').write_text('class Sentinel {}\n')
+            (root / 'AndroidManifest.xml').write_text('<manifest/>\n')
+            state = connect(directory / 'evidence.sqlite')
+            self.addCleanup(state.close)
+            state.executescript(SCHEMA)
+            help_text = '  class  Classes\n  symbol  Symbols\n  file  Files'
+            plan(state, [{'path': 'Sentinel.java'}], help_text, root=root)
+            prior = {tuple(row) for row in state.execute('SELECT id,feature,subject FROM checks')}
+            plan(state, [{'path': 'Sentinel.java'}], help_text, root=root, java_only=True)
+            self.assertTrue(prior.issubset({tuple(row) for row in state.execute('SELECT id,feature,subject FROM checks')}))
+            self.assertEqual(state.execute('SELECT count(*) FROM file_inventory').fetchone()[0], 2)
+            for feature in android_syntax_contracts.FEATURES:
+                self.assertEqual(state.execute('SELECT status FROM coverage WHERE feature=?', (feature,)).fetchone()[0], 'out-of-scope')
+            for feature in java_resource_contracts.FEATURES:
+                self.assertEqual(state.execute('SELECT status FROM coverage WHERE feature=?', (feature,)).fetchone()[0], 'implemented')
+            parent = state.execute("SELECT * FROM coverage WHERE feature='android:syntax-resolution'").fetchone()
+            self.assertEqual(parent['status'], 'pending')
+            self.assertIn('XML-only', parent['reason'])
+            self.assertIn('out-of-scope', parent['reason'])
+            self.assertEqual(state.execute("SELECT count(*) FROM checks WHERE verdict='pass'").fetchone()[0], 0)
+
+    def test_legacy_foreign_pending_and_errors_do_not_schedule_or_hide_java_failures(self):
+        artifacts = Path(__file__).resolve().parents[2] / '.artifacts/tests'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=artifacts) as temporary:
+            state = connect(Path(temporary) / 'evidence.sqlite')
+            self.addCleanup(state.close)
+            state.executescript(SCHEMA)
+            with state:
+                state.execute("INSERT INTO metadata VALUES ('audit_scope','java')")
+                state.executemany('INSERT INTO checks(id,feature,subject,status,verdict) VALUES (?,?,?,?,?)', [
+                    ('foreign-pending', 'xml-usages:syntax', 'old', 'pending', None),
+                    ('foreign-fail', 'resource-usages:xml-syntax', 'old', 'complete', 'fail'),
+                    ('foreign-error', 'composables', 'old', 'complete', 'error'),
+                    ('java-fail', 'graph', 'Java', 'complete', 'fail'),
+                    ('java-error', 'resource-usages', 'Java', 'complete', 'error'),
+                    ('outline', 'outline', 'A.java', 'pending', None)])
+                state.execute("INSERT INTO coverage VALUES ('xml-usages:syntax','pending','legacy')")
+            self.assertEqual([row['id'] for row in problem_batch(state, 1)], ['java-fail', 'java-error'])
+            self.assertIsNone(next_check(state))
+            with state:
+                state.execute("UPDATE checks SET verdict='pass' WHERE id IN ('java-fail','java-error')")
+            self.assertEqual(next_check(state)['id'], 'outline')
+            self.assertEqual(state.execute('SELECT count(*) FROM checks').fetchone()[0], 6)
+            self.assertEqual(state.execute("SELECT status,verdict FROM checks WHERE id='foreign-pending'").fetchone()['status'], 'pending')
+
     def test_java_audit_keeps_framework_contracts_pending_for_non_java_markers(self):
         artifacts = Path(__file__).resolve().parents[2] / '.artifacts' / 'tests'
         artifacts.mkdir(parents=True, exist_ok=True)

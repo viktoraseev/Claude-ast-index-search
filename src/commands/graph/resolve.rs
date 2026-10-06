@@ -13,7 +13,7 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::java::{InvocationArgument, JavaReceiver, JavaSource, TypeAccess};
+use super::java::{InvocationArgument, JavaReceiver, JavaSource, ReceiverTypeSite, TypeAccess};
 use super::metrics::compute_metrics;
 use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
@@ -2309,6 +2309,10 @@ impl Builder {
             }
             match value {
                 JavaReceiver::Type(path) => Some(path.clone()),
+                JavaReceiver::BoundType {
+                    class,
+                    arguments: None,
+                } => Some(resolver.syms[*class as usize].qual.clone()),
                 JavaReceiver::Parameterized { path, arguments } => {
                     let arguments: Option<Vec<_>> = arguments
                         .iter()
@@ -3415,6 +3419,8 @@ impl Builder {
             return self.java_receiver_classes(owner, &value, depth + 1);
         }
         match receiver {
+            JavaReceiver::BoundType { class, .. } => vec![*class],
+            JavaReceiver::Declared { .. } => Vec::new(),
             JavaReceiver::Unknown
             | JavaReceiver::Identity
             | JavaReceiver::Parameter(_)
@@ -3957,6 +3963,180 @@ impl Builder {
             .unwrap_or_default()
     }
 
+    fn java_receiver_site_owner(&self, source: u32, site: &ReceiverTypeSite) -> Option<u32> {
+        let file = self.syms[source as usize].file;
+        let mut owners = self
+            .by_short
+            .get(&site.owner)?
+            .iter()
+            .copied()
+            .filter(|&candidate| {
+                let symbol = &self.syms[candidate as usize];
+                symbol.file == file
+                    && symbol.line == site.owner_line
+                    && match site.owner_ordinal {
+                        Some(ordinal) => {
+                            symbol.kind == "function" && symbol.java_callable_ordinal == ordinal
+                        }
+                        None => is_container_kind(&symbol.kind),
+                    }
+            });
+        let owner = owners.next()?;
+        owners.next().is_none().then_some(owner)
+    }
+
+    /// Bind every nominal component before projecting a chained result. Generic
+    /// arguments belong to the variable's declaration, even inside captures.
+    fn java_bind_receiver_site(
+        &self,
+        owner: u32,
+        receiver: &JavaReceiver,
+        site: &ReceiverTypeSite,
+        depth: usize,
+    ) -> JavaReceiver {
+        if depth >= 32 {
+            return JavaReceiver::Unknown;
+        }
+        let (path, arguments) = match receiver {
+            JavaReceiver::Type(path) => (path, None),
+            JavaReceiver::Parameterized { path, arguments } => (path, Some(arguments)),
+            _ => return receiver.clone(),
+        };
+        let classes =
+            self.resolve_java_type_at(owner, self.namespace_of(owner), path, None, Some(site.line));
+        let arguments = arguments.map(|arguments| {
+            arguments
+                .iter()
+                .map(|argument| {
+                    argument.as_ref().map(|argument| {
+                        self.java_bind_receiver_site(owner, argument, site, depth + 1)
+                    })
+                })
+                .collect()
+        });
+        if let [class] = classes.as_slice() {
+            // Nonlocal canonical names can retain existing generic machinery;
+            // local names require their resolved identity throughout projection.
+            let symbol = &self.syms[*class as usize];
+            let local = self.files[symbol.file as usize]
+                .java
+                .as_ref()
+                .and_then(|java| java.type_declaration(&symbol.qual, symbol.line))
+                .is_some_and(|declaration| declaration.local_scope.is_some());
+            return if local {
+                JavaReceiver::BoundType {
+                    class: *class,
+                    arguments,
+                }
+            } else if let Some(arguments) = arguments {
+                JavaReceiver::Parameterized {
+                    path: symbol.qual.clone(),
+                    arguments,
+                }
+            } else {
+                JavaReceiver::Type(symbol.qual.clone())
+            };
+        }
+        if !classes.is_empty() {
+            return JavaReceiver::Unknown;
+        }
+        if let Some(arguments) = arguments {
+            // External containers have no native declaration. Resolve the import
+            // spelling now so a later local type cannot change JDK projection.
+            let Some(java) = self.files[self.syms[owner as usize].file as usize]
+                .java
+                .as_ref()
+            else {
+                return JavaReceiver::Unknown;
+            };
+            let qualified = if path.contains("::") {
+                Some(path.clone())
+            } else if let Some(import) = java
+                .imports
+                .iter()
+                .find(|import| import.rsplit("::").next() == Some(path))
+            {
+                Some(import.clone())
+            } else {
+                // Retain the existing conservative guard for unindexed imports:
+                // an unknown wildcard could also provide this container name.
+                if java
+                    .imports
+                    .iter()
+                    .filter_map(|import| import.strip_suffix("::*"))
+                    .any(|package| {
+                        !matches!(
+                            package,
+                            "java::util"
+                                | "java::util::concurrent"
+                                | "java::util::concurrent::atomic"
+                                | "java::util::function"
+                                | "java::util::stream"
+                                | "java::lang"
+                        )
+                    })
+                {
+                    return JavaReceiver::Unknown;
+                }
+                let mut candidates: Vec<_> = java
+                    .imports
+                    .iter()
+                    .filter_map(|import| import.strip_suffix("::*"))
+                    .chain(std::iter::once("java::lang"))
+                    .map(|package| format!("{package}::{path}"))
+                    .filter(|qualified| {
+                        self.java_collection_kind(
+                            owner,
+                            &JavaReceiver::Parameterized {
+                                path: qualified.clone(),
+                                arguments: Vec::new(),
+                            },
+                            depth + 1,
+                        )
+                        .is_some()
+                    })
+                    .collect();
+                candidates.sort();
+                candidates.dedup();
+                (candidates.len() == 1).then(|| candidates.remove(0))
+            };
+            return qualified
+                .map(|path| JavaReceiver::Parameterized { path, arguments })
+                .unwrap_or(JavaReceiver::Unknown);
+        }
+        // An absent library declaration still has an explicit import identity.
+        // Do not re-enter lexical lookup here: a later local type can share the
+        // spelling, and a wildcard alone cannot prove an external identity.
+        let Some(java) = self.files[self.syms[owner as usize].file as usize]
+            .java
+            .as_ref()
+        else {
+            return JavaReceiver::Unknown;
+        };
+        let (head, suffix) = path.split_once("::").unwrap_or((path, ""));
+        let imports: Vec<_> = java
+            .imports
+            .iter()
+            .filter(|import| import.rsplit("::").next() == Some(head))
+            .collect();
+        let external = if let [import] = imports.as_slice() {
+            Some(if suffix.is_empty() {
+                (*import).clone()
+            } else {
+                format!("{import}::{suffix}")
+            })
+        } else if !imports.is_empty() {
+            None
+        } else if path.contains("::") && head.chars().next().is_some_and(char::is_lowercase) {
+            Some(path.clone())
+        } else {
+            self.java_lang_type(owner, path)
+        };
+        external
+            .map(JavaReceiver::Type)
+            .unwrap_or(JavaReceiver::Unknown)
+    }
+
     /// Retain nested generic arguments and their declaring namespace across
     /// member results. Erasing an outer container loses callback element types.
     fn java_value_receiver(
@@ -3984,6 +4164,13 @@ impl Builder {
         depth: usize,
     ) -> Option<(u32, JavaReceiver)> {
         match value {
+            JavaReceiver::Declared { receiver, site } => {
+                let owner = self.java_receiver_site_owner(source, site)?;
+                Some((
+                    owner,
+                    self.java_bind_receiver_site(owner, receiver, site, depth + 1),
+                ))
+            }
             JavaReceiver::StreamFactory {
                 qualifier,
                 elements,
@@ -4723,6 +4910,7 @@ impl Builder {
                 | JavaReceiver::Array(_)
                 | JavaReceiver::This
                 | JavaReceiver::Super
+                | JavaReceiver::BoundType { .. }
         ) {
             Some((source, receiver.clone()))
         } else {
@@ -4771,8 +4959,13 @@ impl Builder {
         depth: usize,
     ) -> Option<(u32, JavaReceiver)> {
         let (owner, value) = self.java_declared_receiver(source, receiver, depth + 1)?;
-        let JavaReceiver::Parameterized { arguments, .. } = value else {
-            return None;
+        let arguments = match value {
+            JavaReceiver::Parameterized { arguments, .. }
+            | JavaReceiver::BoundType {
+                arguments: Some(arguments),
+                ..
+            } => arguments,
+            _ => return None,
         };
         Some((owner, arguments.get(index)?.clone()?))
     }
@@ -4895,31 +5088,12 @@ impl Builder {
                 // Captures retain the declaring callable/type, rather than the
                 // nested callable where the receiver is used. Source-order
                 // ordinals distinguish overloads sharing a declaration line.
-                let owners: Vec<_> = self
-                    .by_short
-                    .get(&site.owner)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                    .filter(|&candidate| {
-                        let symbol = &self.syms[candidate as usize];
-                        symbol.file == file
-                            && symbol.line == site.owner_line
-                            && match site.owner_ordinal {
-                                Some(ordinal) => {
-                                    symbol.kind == "function"
-                                        && symbol.java_callable_ordinal == ordinal
-                                }
-                                None => is_container_kind(&symbol.kind),
-                            }
-                    })
-                    .collect();
-                let [owner] = owners.as_slice() else {
+                let Some(owner) = self.java_receiver_site_owner(source, site) else {
                     return Vec::new();
                 };
                 self.resolve_java_type_at(
-                    *owner,
-                    self.namespace_of(*owner),
+                    owner,
+                    self.namespace_of(owner),
                     &site.path,
                     None,
                     Some(site.line),

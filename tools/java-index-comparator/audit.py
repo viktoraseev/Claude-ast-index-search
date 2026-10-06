@@ -136,22 +136,32 @@ class SearchCollectionCap(Unsupported):
     pass
 
 
+def check_scope_filter(state: sqlite3.Connection):
+    """Keep legacy foreign rows durable without scheduling/counting Java work."""
+    scope = state.execute("SELECT value FROM metadata WHERE key='audit_scope'").fetchone()
+    if scope is None or scope[0] != 'java':
+        return '1', ()
+    excluded = tuple(sorted(JAVA_EXCLUDED_FEATURES))
+    return 'feature NOT IN (' + ','.join('?' for _ in excluded) + ')', excluded
+
+
 def next_check(state: sqlite3.Connection):
     """Defer outline until all other applicable contracts actually pass.
 
     The expression/partial indexes keep this O(log N), rather than repeatedly
     scanning all deferred files or all completed checks on large projects.
     """
-    check = state.execute("""SELECT * FROM checks WHERE status='pending'
-        ORDER BY (feature='outline' OR feature GLOB 'outline:*'),feature,subject LIMIT 1""").fetchone()
+    scope, parameters = check_scope_filter(state)
+    check = state.execute(f"""SELECT * FROM checks WHERE status='pending' AND {scope}
+        ORDER BY (feature='outline' OR feature GLOB 'outline:*'),feature,subject LIMIT 1""", parameters).fetchone()
     if check is None:
         return None
     if check['feature'] == 'outline' or check['feature'].startswith('outline:'):
-        if state.execute("SELECT 1 FROM coverage WHERE status='pending' LIMIT 1").fetchone():
+        if state.execute(f"SELECT 1 FROM coverage WHERE status='pending' AND {scope} LIMIT 1", parameters).fetchone():
             return None
-        if state.execute("""SELECT 1 FROM checks
+        if state.execute(f"""SELECT 1 FROM checks
             WHERE NOT (feature='outline' OR feature GLOB 'outline:*')
-              AND (status!='complete' OR verdict IS NOT 'pass') LIMIT 1""").fetchone():
+              AND (status!='complete' OR verdict IS NOT 'pass') AND {scope} LIMIT 1""", parameters).fetchone():
             return None
     return check
 
@@ -2334,6 +2344,7 @@ class Fixture:
 
 
 JAVA_EXCLUDED_FEATURES = (set(mobile_contracts.EXTENSIONS) | set(perl_contracts.EXTENSIONS)
+                          | android_syntax_contracts.FEATURES
                           | {'composables', 'previews', 'swiftui', 'async-funcs',
                              'storyboard-usages', 'asset-usages', 'deeplinks:non-java',
                              'suppress:non-java', 'inject:non-java'})
@@ -2527,7 +2538,17 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     profile_contracts.plan_profiles(state, root)
     route_contracts.plan_routes(state, root)
     android_contracts.plan_android(state, root)
-    android_syntax_contracts.plan_syntax(state, root)
+    if java_only:
+        with state:
+            state.execute("UPDATE coverage SET reason=? WHERE feature='android:syntax-resolution' AND status='pending'",
+                          ('Java compiler visibility/shadowing, merged dependency R classes, '
+                           'computed/manifest namespaces, attached-root resource resolution and '
+                           'additional Java-referenced resource definition types remain unresolved; '
+                           'executed lexical/import/literal-namespace fixtures do not establish '
+                           'target Java resource equivalence; XML-only syntax and namespace/entity '
+                           'parsing are explicitly out-of-scope, not passing',))
+    else:
+        android_syntax_contracts.plan_syntax(state, root)
     java_resource_contracts.plan_java_resources(state, root)
     vcs_contracts.plan_vcs(state, root)
     rank_contracts.plan_rank(state, root)
@@ -2650,24 +2671,26 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         call_tree_mcp_contracts.plan(state)
         limit = arguments.case_limit
         processed = 0
-        problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
+        check_scope, scope_parameters = check_scope_filter(state)
+        problem_query = f"SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported') AND {check_scope}"
+        problems = state.execute(problem_query, scope_parameters).fetchone()[0]
         while problems < arguments.problem_limit and (limit is None or processed < limit):
             check = next_check(state)
             if check is None:
                 break
             fixture.evaluate(check)
             processed += 1
-            problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
+            problems = state.execute(problem_query, scope_parameters).fetchone()[0]
             if state.execute("SELECT verdict FROM checks WHERE id=?", (check["id"],)).fetchone()[0] == "error":
                 break
         # Source changes invalidate evidence rather than manufacturing defects.
         if source_snapshot(root)[0] != snapshot or mobile_contracts.inventory_snapshot(root) != inventory_hash or file_sha256(binary) != binary_hash:
             raise ToolError("target sources or binary changed while scanning; evidence is invalid")
         counts = {row[0]: row[1] for row in state.execute(
-            "SELECT verdict,count(*) FROM checks WHERE status='complete' GROUP BY verdict"
+            f"SELECT verdict,count(*) FROM checks WHERE status='complete' AND {check_scope} GROUP BY verdict", scope_parameters
         )}
-        remaining = state.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0]
-        pending_features = state.execute("SELECT count(*) FROM coverage WHERE status='pending'").fetchone()[0]
+        remaining = state.execute(f"SELECT count(*) FROM checks WHERE status!='complete' AND {check_scope}", scope_parameters).fetchone()[0]
+        pending_features = state.execute(f"SELECT count(*) FROM coverage WHERE status='pending' AND {check_scope}", scope_parameters).fetchone()[0]
         summary = {
             "java_files": len(source_files), "processed_this_run": processed,
             "counts": counts, "remaining_checks": remaining,
@@ -2683,7 +2706,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
             "evidence": str(directory / "evidence.sqlite"),
         }
         if arguments.case_limit is not None and arguments.case_limit <= 10:
-            rows = state.execute("SELECT id,feature,subject,verdict,error FROM checks WHERE status='complete' ORDER BY feature,subject LIMIT ?", (arguments.case_limit,)).fetchall()
+            rows = state.execute(f"SELECT id,feature,subject,verdict,error FROM checks WHERE status='complete' AND {check_scope} ORDER BY feature,subject LIMIT ?", (*scope_parameters, arguments.case_limit)).fetchall()
             summary["first_checks"] = [{"feature": row["feature"], "verdict": row["verdict"]} for row in rows]
         return summary
     finally:

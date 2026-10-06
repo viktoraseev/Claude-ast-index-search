@@ -15,7 +15,7 @@ class StaleEvidence(ToolError):
 
 
 def verify(evidence: Path, root: Path, binary: Path) -> dict:
-    from audit import JAVA_EXCLUDED_FEATURES, required_features
+    from audit import JAVA_EXCLUDED_FEATURES, required_features, check_scope_filter
 
     root, binary, evidence = root.resolve(), binary.resolve(), evidence.resolve()
     snapshot, files = source_snapshot(root)
@@ -33,8 +33,9 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
             raise ToolError('final evidence is not a nonempty Java audit')
         if metadata.get('java_files') != str(len(files)):
             raise ToolError('final Java source population differs from evidence')
-        total = state.execute('SELECT count(*) FROM checks').fetchone()[0]
-        unresolved = state.execute("SELECT count(*) FROM checks WHERE status!='complete' OR verdict IS NOT 'pass'").fetchone()[0]
+        scope, parameters = check_scope_filter(state)
+        total = state.execute(f'SELECT count(*) FROM checks WHERE {scope}', parameters).fetchone()[0]
+        unresolved = state.execute(f"SELECT count(*) FROM checks WHERE (status!='complete' OR verdict IS NOT 'pass') AND {scope}", parameters).fetchone()[0]
         if not total or unresolved:
             raise ToolError('final evidence has empty or unresolved checks')
         coverage = {row['feature']: row['status'] for row in state.execute('SELECT feature,status FROM coverage')}
@@ -72,7 +73,7 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
             AND NOT EXISTS (SELECT 1 FROM checks k WHERE k.feature=c.feature) LIMIT 1""").fetchone():
             raise ToolError('implemented coverage contract has no executed check')
         if state.execute("""SELECT 1 FROM checks k JOIN coverage c USING(feature)
-            WHERE c.status='out-of-scope' LIMIT 1""").fetchone():
+            WHERE c.status='out-of-scope' AND k.verdict='pass' LIMIT 1""").fetchone():
             raise ToolError('foreign checks cannot count toward a final Java audit')
         if state.execute("""SELECT 1 FROM checks k LEFT JOIN coverage c USING(feature)
             WHERE c.feature IS NULL LIMIT 1""").fetchone():
