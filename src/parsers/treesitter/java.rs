@@ -285,6 +285,145 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     }
 
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    // A declaration's spelling is not a file-wide shadow. Keep byte ranges
+    // per name so adjacent blocks/methods, including sites on one line, retain
+    // their own Java type and expression namespaces.
+    type Shadows = std::collections::HashMap<String, Vec<std::ops::Range<usize>>>;
+    fn ancestor<'a>(node: tree_sitter::Node<'a>, kinds: &[&str]) -> Option<tree_sitter::Node<'a>> {
+        let mut parent = node.parent();
+        while let Some(scope) = parent {
+            if kinds.contains(&scope.kind()) {
+                return Some(scope);
+            }
+            parent = scope.parent();
+        }
+        None
+    }
+    let mut type_shadows = Shadows::new();
+    let mut value_shadows = Shadows::new();
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        let type_declaration = matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        );
+        let binding = if type_declaration {
+            ancestor(
+                node,
+                &[
+                    "program",
+                    "class_body",
+                    "interface_body",
+                    "enum_body",
+                    "block",
+                    "switch_block",
+                ],
+            )
+            .map(|scope| {
+                (
+                    true,
+                    node.child_by_field_name("name"),
+                    if matches!(scope.kind(), "block" | "switch_block") {
+                        node.start_byte()..scope.end_byte()
+                    } else {
+                        scope.byte_range()
+                    },
+                )
+            })
+        } else if node.kind() == "type_parameter" {
+            node.parent()
+                .and_then(|parameters| parameters.parent())
+                .map(|owner| (true, node.named_child(0), owner.byte_range()))
+        } else if node.kind() == "variable_declarator" {
+            ancestor(
+                node,
+                &[
+                    "class_body",
+                    "interface_body",
+                    "enum_body",
+                    "block",
+                    "for_statement",
+                ],
+            )
+            .map(|scope| {
+                (
+                    false,
+                    node.child_by_field_name("name"),
+                    if matches!(scope.kind(), "block" | "for_statement") {
+                        node.start_byte()..scope.end_byte()
+                    } else {
+                        scope.byte_range()
+                    },
+                )
+            })
+        } else if matches!(
+            node.kind(),
+            "formal_parameter" | "spread_parameter" | "catch_formal_parameter"
+        ) {
+            ancestor(
+                node,
+                &[
+                    "method_declaration",
+                    "constructor_declaration",
+                    "lambda_expression",
+                    "catch_clause",
+                    "record_declaration",
+                ],
+            )
+            .map(|scope| {
+                let name = node.child_by_field_name("name").or_else(|| {
+                    let mut cursor = node.walk();
+                    let mut children = node.named_children(&mut cursor);
+                    children
+                        .find(|child| child.kind() == "variable_declarator")
+                        .and_then(|child| child.child_by_field_name("name"))
+                });
+                (false, name, scope.byte_range())
+            })
+        } else if node.kind() == "identifier"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "inferred_parameters"
+                    || (parent.kind() == "lambda_expression"
+                        && parent
+                            .child_by_field_name("parameters")
+                            .is_some_and(|p| p.id() == node.id()))
+            })
+        {
+            ancestor(node, &["lambda_expression"])
+                .map(|scope| (false, Some(node), scope.byte_range()))
+        } else if node.kind() == "enhanced_for_statement" {
+            node.child_by_field_name("body")
+                .map(|scope| (false, node.child_by_field_name("name"), scope.byte_range()))
+        } else {
+            None
+        };
+        if let Some((is_type, Some(name), range)) = binding {
+            let shadows = if is_type {
+                &mut type_shadows
+            } else {
+                &mut value_shadows
+            };
+            shadows
+                .entry(node_text(content, &name).to_owned())
+                .or_default()
+                .push(range);
+        }
+        super::WalkControl::Continue
+    });
+    let shadowed = |name: &str, node: tree_sitter::Node<'_>, expression: bool| {
+        let first = name.split('.').next().unwrap_or(name);
+        let visible = |shadows: &Shadows| {
+            shadows.get(first).is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|range| range.contains(&node.start_byte()))
+            })
+        };
+        visible(&type_shadows) || (expression && visible(&value_shadows))
+    };
     let mut result = DependencySyntax::default();
     super::walk_tree_preorder(&tree.root_node(), |node| {
         match node.kind() {
@@ -314,13 +453,19 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                                 && p.named_child(0).is_some_and(|name| name.id() == node.id()))
                     });
                     if !declaration {
-                        result.types.insert(spelling(node, content));
+                        let name = spelling(node, content);
+                        if !shadowed(&name, node, false) {
+                            result.types.insert(name);
+                        }
                     }
                 }
             }
             "annotation" | "marker_annotation" => {
                 if let Some(name) = node.child_by_field_name("name") {
-                    result.types.insert(spelling(name, content));
+                    let spelling = spelling(name, content);
+                    if !shadowed(&spelling, name, false) {
+                        result.types.insert(spelling);
+                    }
                 }
             }
             "method_invocation" | "field_access" => {
@@ -329,7 +474,10 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         object.kind(),
                         "identifier" | "scoped_identifier" | "field_access"
                     ) {
-                        result.types.insert(spelling(object, content));
+                        let name = spelling(object, content);
+                        if !shadowed(&name, object, true) {
+                            result.types.insert(name);
+                        }
                     }
                 }
             }

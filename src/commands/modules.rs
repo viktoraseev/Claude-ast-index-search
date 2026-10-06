@@ -2284,9 +2284,6 @@ fn count_symbols_used_in_module(
                 .map_or((name.as_str(), ""), |(first, _)| {
                     (first, &name[first.len()..])
                 });
-            if syntax.declarations.contains(first) {
-                continue;
-            }
             if let Some(import) = explicit.get(first) {
                 identities.insert(format!("{import}{suffix}"));
                 continue;

@@ -58,6 +58,7 @@ import graph_contracts
 import java_receiver_contracts
 import java_exception_scope_contracts
 import java_local_interface_contracts
+import graph_mcp_contracts
 import java_pattern_scope_contracts
 import java_type_binding_contracts
 import java_type_access_contracts
@@ -118,7 +119,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA + graph_mcp_contracts.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -666,6 +667,12 @@ class Fixture:
         try:
             return call_hierarchy_contracts.exercise(self, check)
         except call_hierarchy_contracts.UnsupportedHierarchy as error:
+            raise Unsupported(str(error)) from error
+
+    def graph_mcp_check(self, check: sqlite3.Row):
+        try:
+            return graph_mcp_contracts.exercise(self, check)
+        except graph_mcp_contracts.ScopeUnsupported as error:
             raise Unsupported(str(error)) from error
 
     def paginated(self, check_id: str, tool: str, arguments: dict[str, Any], field: str) -> list[dict[str, Any]]:
@@ -2185,6 +2192,8 @@ class Fixture:
                 handler = self.module_format_check
             if check['feature'] in call_hierarchy_contracts.FEATURES:
                 handler = self.call_hierarchy_check
+            if check['feature'] in graph_mcp_contracts.FEATURES:
+                handler = self.graph_mcp_check
             if check['feature'] in file_view_contracts.FEATURES:
                 handler = self.file_view_check
             if check['feature'] in file_scope_contracts.FEATURES:
@@ -2307,6 +2316,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(graph_directory_contracts.FEATURES)
     features.update(graph_ambiguity_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
+    features.update(graph_mcp_contracts.FEATURES)
     return features
 
 
@@ -2545,6 +2555,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         help_text = run_command([str(binary), "--help"], root, fixture.environment)
         plan(state, source_files, help_text, candidates, root, java_only=True)
         call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure)
+        graph_mcp_contracts.plan(state)
         limit = arguments.case_limit
         processed = 0
         problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]

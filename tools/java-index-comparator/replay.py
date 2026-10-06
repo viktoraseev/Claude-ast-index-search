@@ -11,6 +11,7 @@ from common import StreamableHttpMcpClient, ToolError, adapter_digest, canonical
 import mobile_contracts
 import text_snapshot
 import call_hierarchy_contracts
+import graph_mcp_contracts
 
 
 class StoredOracle:
@@ -143,10 +144,20 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     fixture.batch_text = batch_text
                     if fixture._text_snapshot is not None:
                         fixture._text_snapshot.client = oracle
-                if check['feature'] in call_hierarchy_contracts.FEATURES and not hierarchy_ready:
+                if check['feature'] in call_hierarchy_contracts.FEATURES | graph_mcp_contracts.FEATURES and not hierarchy_ready:
                     call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure,
                                                           schedule_checks=False)
                     hierarchy_ready = True
+                if check['feature'] in graph_mcp_contracts.FEATURES:
+                    dependency = source.execute('SELECT id,status,verdict,expected_json FROM checks WHERE feature=? AND subject=?',
+                                                (call_hierarchy_contracts.FEATURE, check['subject'])).fetchone()
+                    if dependency is None and source.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_mcp_sources'").fetchone():
+                        dependency = source.execute('SELECT id,status,verdict,expected_json FROM graph_mcp_sources WHERE subject=?',
+                                                    (check['subject'],)).fetchone()
+                    if dependency is not None:
+                        with state:
+                            state.execute('INSERT OR REPLACE INTO graph_mcp_sources VALUES (?,?,?,?,?)',
+                                          (check['subject'], *tuple(dependency)))
                 fixture.evaluate(check)
                 try:
                     oracle.assert_consumed()
@@ -162,7 +173,7 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     refreshed_fixture = Fixture(root, binary, database, state, refreshed_oracle, schedule_followups=False)
                     # The replay pins its source/index/binary for the whole batch.
                     # Changing only the oracle must not rebuild the same graph.
-                    if check['feature'] in call_hierarchy_contracts.FEATURES \
+                    if check['feature'] in call_hierarchy_contracts.FEATURES | graph_mcp_contracts.FEATURES \
                             and getattr(fixture, '_call_hierarchy_graph_ready', False):
                         refreshed_fixture._call_hierarchy_graph_ready = True
                     refreshed_fixture.evaluate(check)

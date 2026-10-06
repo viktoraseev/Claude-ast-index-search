@@ -89,6 +89,27 @@ class JavaDependencyContracts(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, 'inside repository'):
             contracts.exercise(self.binary, self.directory.parent.parent.parent)
 
+    def test_shadow_contract_requires_complete_inventory_and_cannot_skip(self):
+        self.assertIn(contracts.SHADOWS, required_features())
+        before = [tuple(row) for row in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')]
+        contracts.plan_dependencies(self.state, self.root)
+        self.assertEqual(before, [tuple(row) for row in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')])
+        coverage = self.state.execute('SELECT * FROM coverage WHERE feature=?', (contracts.SHADOWS,)).fetchone()
+        self.assertEqual(coverage['status'], 'implemented')
+        self.assertTrue(coverage['reason'].startswith('independent source/state:'))
+        for observed in ({}, {'scope': 'inapplicable'}, {'scope': []}):
+            self.fixture._java_dependency_results = None
+            with patch.object(contracts, 'exercise', return_value=(
+                    {contracts.SHADOWS: {'scope': ['alpha']}}, {contracts.SHADOWS: observed})):
+                self.assertEqual(self.evaluate(contracts.SHADOWS)['verdict'], 'fail')
+        inventory = mobile_contracts.inventory
+        def incomplete(state, root):
+            inventory(state, root)
+            state.execute("DELETE FROM file_inventory WHERE extension='.txt'")
+        with patch.object(mobile_contracts, 'inventory', side_effect=incomplete):
+            with self.assertRaisesRegex(ToolError, 'full inventory incomplete'):
+                contracts.exercise(self.binary, self.directory)
+
 
 if __name__ == '__main__':
     unittest.main()
