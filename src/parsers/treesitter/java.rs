@@ -269,12 +269,18 @@ pub(crate) struct DependencySyntax {
     pub declarations: std::collections::HashSet<String>,
     pub static_names: std::collections::BTreeSet<(String, bool)>,
     pub expression_types: std::collections::BTreeSet<String>,
+    pub type_uses: std::collections::BTreeSet<(String, bool, Vec<String>)>,
+    pub member_uses: std::collections::BTreeSet<(String, bool, Vec<String>)>,
+    pub qualified_members: std::collections::BTreeSet<(String, String, bool, Vec<String>)>,
 }
 
 /// Import metadata retains hiding barriers even for inaccessible members.
 pub(crate) struct DependencyImportDeclaration {
     pub accessible: bool,
     pub member_accessible: bool,
+    pub protected_member: bool,
+    pub access_barriers: Vec<(String, bool)>,
+    pub protected_names: std::collections::HashSet<(String, bool)>,
     pub package_member: bool,
     pub static_member: bool,
     pub static_names: std::collections::HashSet<(String, bool)>,
@@ -356,12 +362,17 @@ pub(crate) fn dependency_import_declaration(
         let mut names = Vec::new();
         let mut current = Some(node);
         let mut allowed = true;
+        let mut barriers = Vec::new();
         while let Some(ancestor) = current {
             if is_type(ancestor) {
                 if let Some(name) = ancestor.child_by_field_name("name") {
                     names.push(node_text(content, &name));
                 }
-                allowed &= accessible(ancestor, content, package == accessing_package);
+                let accessible = accessible(ancestor, content, package == accessing_package);
+                allowed &= accessible;
+                if !accessible {
+                    barriers.push((ancestor, modifier(ancestor, content, "protected")));
+                }
             } else if !matches!(
                 ancestor.kind(),
                 "program"
@@ -397,6 +408,7 @@ pub(crate) fn dependency_import_declaration(
                         | "enum_declaration"
                         | "record_declaration"
                 ));
+        let mut protected_names = std::collections::HashSet::new();
         let mut static_names = std::collections::HashSet::new();
         let mut declared_names = std::collections::HashSet::new();
         let mut package_names = std::collections::HashSet::new();
@@ -429,6 +441,11 @@ pub(crate) fn dependency_import_declaration(
                         if package_member(member, content) {
                             package_names.insert(key.clone());
                         }
+                        if modifier(member, content, "protected")
+                            && modifier(member, content, "static")
+                        {
+                            protected_names.insert(key.clone());
+                        }
                         if allowed {
                             static_names.insert(key);
                         }
@@ -444,6 +461,11 @@ pub(crate) fn dependency_import_declaration(
                             declared_names.insert(key.clone());
                             if package_member(member, content) {
                                 package_names.insert(key.clone());
+                            }
+                            if modifier(member, content, "protected")
+                                && modifier(member, content, "static")
+                            {
+                                protected_names.insert(key.clone());
                             }
                             if allowed {
                                 static_names.insert(key);
@@ -481,6 +503,30 @@ pub(crate) fn dependency_import_declaration(
         result = Some(DependencyImportDeclaration {
             accessible: allowed,
             member_accessible: accessible(node, content, package == accessing_package),
+            protected_member: modifier(node, content, "protected"),
+            access_barriers: barriers
+                .into_iter()
+                .map(|(barrier, protected)| {
+                    let mut enclosing = Vec::new();
+                    let mut parent = barrier.parent();
+                    while let Some(ancestor) = parent {
+                        if is_type(ancestor) {
+                            if let Some(name) = ancestor.child_by_field_name("name") {
+                                enclosing.push(node_text(content, &name));
+                            }
+                        }
+                        parent = ancestor.parent();
+                    }
+                    enclosing.reverse();
+                    let owner = if package.is_empty() {
+                        enclosing.join(".")
+                    } else {
+                        format!("{package}.{}", enclosing.join("."))
+                    };
+                    (owner, protected)
+                })
+                .collect(),
+            protected_names,
             package_member: package_member(node, content),
             static_member,
             static_names,
@@ -822,6 +868,48 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
         };
         visible(&type_shadows) || (expression && visible(&value_shadows))
     };
+    fn contexts(node: Node<'_>, content: &str, package: &str) -> Vec<String> {
+        let position = node.start_byte();
+        let mut names = Vec::new();
+        let mut visible = Vec::new();
+        let mut parent = node.parent();
+        while let Some(owner) = parent {
+            if matches!(
+                owner.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) {
+                if let Some(name) = owner.child_by_field_name("name") {
+                    names.push(node_text(content, &name));
+                    visible.push(
+                        owner
+                            .child_by_field_name("body")
+                            .is_some_and(|body| body.byte_range().contains(&position)),
+                    );
+                }
+            }
+            parent = owner.parent();
+        }
+        (0..names.len())
+            .filter(|i| visible[*i])
+            .map(|i| {
+                let suffix = names[i..]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if package.is_empty() {
+                    suffix
+                } else {
+                    format!("{package}.{suffix}")
+                }
+            })
+            .collect()
+    }
     let mut result = DependencySyntax::default();
     let mut actual_types = std::collections::BTreeSet::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
@@ -855,6 +943,11 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         let name = spelling(node, content);
                         if !shadowed(&name, node, false) {
                             actual_types.insert(name.clone());
+                            result.type_uses.insert((
+                                name.clone(),
+                                false,
+                                contexts(node, content, &result.package),
+                            ));
                             result.types.insert(name);
                         }
                     }
@@ -865,6 +958,11 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                     let spelling = spelling(name, content);
                     if !shadowed(&spelling, name, false) {
                         actual_types.insert(spelling.clone());
+                        result.type_uses.insert((
+                            spelling.clone(),
+                            false,
+                            contexts(node, content, &result.package),
+                        ));
                         result.types.insert(spelling);
                     }
                 }
@@ -881,6 +979,11 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                                 .any(|range| range.contains(&name.start_byte()))
                         }) {
                             result.static_names.insert((text.to_owned(), true));
+                            result.member_uses.insert((
+                                text.to_owned(),
+                                true,
+                                contexts(node, content, &result.package),
+                            ));
                         }
                     }
                 }
@@ -892,6 +995,29 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         let name = spelling(object, content);
                         if !shadowed(&name, object, true) {
                             result.expression_types.insert(name.clone());
+                            let owners = contexts(node, content, &result.package);
+                            if let Some(member) =
+                                node.child_by_field_name(if node.kind() == "field_access" {
+                                    "field"
+                                } else {
+                                    "name"
+                                })
+                            {
+                                result.qualified_members.insert((
+                                    name.clone(),
+                                    node_text(content, &member).to_owned(),
+                                    node.kind() == "method_invocation",
+                                    owners.clone(),
+                                ));
+                            }
+                            result
+                                .type_uses
+                                .insert((name.clone(), true, owners.clone()));
+                            result.member_uses.insert((
+                                name.split('.').next().unwrap_or(&name).to_owned(),
+                                false,
+                                owners,
+                            ));
                             result.static_names.insert((
                                 name.split('.').next().unwrap_or(&name).to_owned(),
                                 false,
@@ -928,6 +1054,11 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         let name = node_text(content, &node);
                         if !shadowed(name, node, true) {
                             result.static_names.insert((name.to_owned(), false));
+                            result.member_uses.insert((
+                                name.to_owned(),
+                                false,
+                                contexts(node, content, &result.package),
+                            ));
                         }
                     }
                 }
@@ -2161,6 +2292,62 @@ public @interface Mark { class Nested {} }
             names.get(&("class".into(), 2, "Nested".into())),
             Some(&"fixture.Mark.Nested".into())
         );
+    }
+
+    #[test]
+    fn dependency_uses_keep_subclass_body_contexts_separate_from_headers_and_siblings() {
+        let source = r#"package fixture;
+import static base.Parent.Guarded;
+class Child extends base.Parent {
+    Guarded field;
+    class Inner { Guarded field; int value=SECRET+secret(); }
+    void local() { class Local { Guarded field; } }
+}
+class Peer { Guarded field; int value=SECRET+secret(); }
+"#;
+        let syntax = dependency_syntax(source).unwrap();
+        assert!(syntax
+            .type_uses
+            .contains(&("base.Parent".into(), false, vec![])));
+        for owners in [
+            vec!["fixture.Child"],
+            vec!["fixture.Child.Inner", "fixture.Child"],
+            vec!["fixture.Child.Local", "fixture.Child"],
+            vec!["fixture.Peer"],
+        ] {
+            assert!(syntax.type_uses.contains(&(
+                "Guarded".into(),
+                false,
+                owners.into_iter().map(str::to_owned).collect()
+            )));
+        }
+        assert!(syntax
+            .member_uses
+            .contains(&("secret".into(), true, vec!["fixture.Peer".into()])));
+        assert!(!syntax
+            .type_uses
+            .iter()
+            .any(|(name, _, _)| name == "base.Parent.Guarded"));
+        let declaration = dependency_import_declaration(
+            "package base; public class Parent { protected static class Guarded {} protected static int SECRET; }",
+            "base.Parent.Guarded", "fixture").unwrap().unwrap();
+        assert!(!declaration.accessible);
+        assert!(declaration.protected_member);
+        assert_eq!(
+            declaration.access_barriers,
+            vec![("base.Parent".into(), true)]
+        );
+        let declaration = dependency_import_declaration(
+            "package base; public class Parent { protected static int SECRET; }",
+            "base.Parent",
+            "fixture",
+        )
+        .unwrap()
+        .unwrap();
+        assert!(declaration
+            .protected_names
+            .contains(&("SECRET".into(), false)));
+        assert!(!declaration.static_names.contains(&("SECRET".into(), false)));
     }
 
     #[test]

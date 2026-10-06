@@ -12,7 +12,8 @@ from root_contracts import Runner
 FEATURES = {'unused-deps:java-inherited-imports'}
 REASON = ('independent source/state and javac: inherited Java member type/static imports, '
           'canonical import guards, hiding/diamonds, accessibility and attached classpath '
-          'declaring ownership in default/strict JSON/text; not MCP equivalence')
+          'declaring ownership, occurrence-scoped protected subclass types/static members and '
+          'enclosing-subclass/sibling/import guards in default/strict JSON/text; not MCP equivalence')
 
 
 def plan_imports(state, root):
@@ -32,6 +33,16 @@ def plan_imports(state, root):
                            'classpath provenance; protected subclass lexical access, external/platform '
                            'lookup, overload/receiver dispatch and classpath-order ambiguity remain '
                            'pending; not MCP equivalence', parent))
+
+        for parent in ('unused-deps:semantic-resolution', 'global:scope-command-matrix'):
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,'occurrence-scoped protected subclass fixture')=0",
+                          ('; separate executed occurrence-scoped protected subclass fixture covers '
+                           'lexical/canonical/alias member types, inherited static fields/methods, '
+                           'enclosing subclass access including local-class captures, sibling isolation, hiding and import guards '
+                           'with attached declaring ownership and JSON/text/refresh controls; '
+                           'value receiver dispatch, instance members, local subclass superclass hiding, external/platform lookup '
+                           'and classpath-order ambiguity remain pending; not MCP equivalence', parent))
 
 
 def exercise(binary, base):
@@ -56,10 +67,10 @@ def exercise(binary, base):
     sources = {
         'base/Parent.java': '''package shared; public class Parent {
             public static class Nested { public static class Deep {} }
-            public class Instance {} protected static class Guarded {}
+            public class Instance {} protected static class Guarded { public static class Deep {} }
             private static class Hidden {} static class PackageOnly {}
             public static int VALUE=1; public static int read(){return 1;}
-            protected static int SECRET=1; public int instance(){return 1;}
+            protected static int SECRET=1; protected static int secret(){return 1;} public int instance(){return 1;}
         }''',
         'base/Port.java': '''package shared; public interface Port {
             class Token {} int FLAG=1; static int own(){return 1;}
@@ -81,6 +92,29 @@ def exercise(binary, base):
         'lib/Return.java': 'package shared; public class Return extends other.Bridge {}',
     }
     cases = [
+        ('protected-lexical-type', 'class Use extends shared.Child { Guarded x; }', True, {'base': ['Guarded'], 'lib': ['Child']}),
+        ('protected-qualified-type', 'class Use extends shared.Child { shared.Parent.Guarded x; }', True, {'base': ['Guarded'], 'lib': ['Child']}),
+        ('protected-alias-type', 'class Use extends shared.Child { shared.Child.Guarded x; }', True, {'base': ['Guarded'], 'lib': ['Child']}),
+        ('protected-enclosing-type', 'class Use extends shared.Child { static class Inner { Guarded x; } }', True, {'base': ['Guarded'], 'lib': ['Child']}),
+        ('protected-lexical-field', 'class Use extends shared.Child { int x=SECRET; }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('protected-lexical-method', 'class Use extends shared.Child { int x=secret(); }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('protected-enclosing-member', 'class Use extends shared.Child { static class Inner { int x=SECRET+secret(); } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('protected-sibling-type', 'class Use extends shared.Child {} class Peer { shared.Child.Guarded x; }', False, {'lib': ['Child']}),
+        ('protected-sibling-member', 'class Use extends shared.Child {} class Peer { int x=SECRET+secret(); }', False, {'lib': ['Child']}),
+        ('protected-invalid-import', 'import static shared.Parent.Guarded; class Use extends shared.Child { Guarded x; }', False, {'lib': ['Child']}),
+        ('protected-deep-type', 'class Use extends shared.Child { Guarded.Deep x; }', True, {'base': ['Deep'], 'lib': ['Child']}),
+        ('protected-qualified-deep', 'class Use extends shared.Child { shared.Parent.Guarded.Deep x; }', True, {'base': ['Deep'], 'lib': ['Child']}),
+        ('protected-local-enclosing', 'class Use extends shared.Child { void use(){ class Local { Guarded x; int y=SECRET+secret(); } } }', True, {'base': ['Guarded', 'Parent'], 'lib': ['Child']}),
+        ('protected-type-shadow', 'class Use extends shared.Child { private static class Guarded {} Guarded x; }', True, {'lib': ['Child']}),
+        ('protected-value-shadow', 'class Use extends shared.Child { private int SECRET=2; public static int secret(){return 2;} int x=SECRET+secret(); }', True, {'lib': ['Child']}),
+        ('protected-import-wildcard', 'import static shared.Child.*; class Use extends shared.Child { Guarded x; int y=SECRET+secret(); }', True, {'base': ['Guarded', 'Parent'], 'lib': ['Child']}),
+        ('protected-invalid-field-import', 'import static shared.Parent.SECRET; class Use extends shared.Child { int x=SECRET; }', False, {'lib': ['Child']}),
+        ('protected-invalid-method-import', 'import static shared.Parent.secret; class Use extends shared.Child { int x=secret(); }', False, {'lib': ['Child']}),
+        ('protected-qualified-field', 'class Use extends shared.Child { int x=shared.Child.SECRET; }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('protected-qualified-method', 'class Use extends shared.Child { int x=shared.Child.secret(); }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('protected-imported-qualifier', 'import shared.Child; class Use extends Child { int x=Child.SECRET+Child.secret(); }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('protected-sibling-qualified-member', 'class Use extends shared.Child {} class Peer { int x=shared.Child.SECRET+shared.Child.secret(); }', False, {'lib': ['Child']}),
+        ('protected-missing-member', 'class Use extends shared.Child { int x=shared.Child.MISSING+shared.Child.missing(); }', False, {'lib': ['Child']}),
         ('member-types', 'import shared.Child.*; class Use { Nested x; Instance y; Nested.Deep z; }', False, {}),
         ('static-types', 'import static shared.Child.*; class Use { Nested x; Nested.Deep y; }', True, {'base': ['Deep', 'Nested']}),
         ('qualified-alias', 'class Use { shared.Child.Nested x; shared.Child.Nested.Deep y; }', True, {'base': ['Deep', 'Nested']}),
@@ -193,10 +227,27 @@ def exercise(binary, base):
         record('option:' + ','.join(flags), [('attached::base', 'direct', ['Parent']),
                ('attached::lib', 'transitive' if transitive else 'unused', [])],
                [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+    for flags in (['--no-transitive'], ['--no-xml'], ['--no-resources'],
+                  ['--no-transitive', '--no-xml', '--no-resources']):
+        document = runner.json('unused-deps', 'attached::protected-qualified-field', '--verbose', *flags)
+        record('protected-option:' + ','.join(flags),
+               [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Child'])],
+               [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+    document = runner.json('unused-deps', 'attached::protected-lexical-type')
+    record('protected-nonverbose', [('attached::base', 'direct', 1, False),
+                                  ('attached::lib', 'direct', 1, False)],
+           [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
+    _, text = runner.command('unused-deps', 'attached::protected-lexical-type')
+    record('protected-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
     record('local-selection', 'missing_module', runner.json('--local', 'unused-deps', 'attached::member-types').get('empty_reason'))
     record('cwd-selection', 'missing_module', runner.json('unused-deps', 'attached::member-types', cwd=runner.root / 'lib').get('empty_reason'))
     for args in (('rebuild', '--type', 'modules'), ('update',)):
         runner.command(*args)
         record('refresh:' + args[0], ['Exported'], runner.json('unused-deps', 'attached::hidden-owner-type', '--verbose')['items'][0]['examples']['direct'])
+        for label, want in [('protected-lexical-type', ['Guarded']),
+                            ('protected-qualified-field', ['Parent']),
+                            ('protected-deep-type', ['Deep'])]:
+            record('protected-refresh:' + args[0] + ':' + label, want,
+                   runner.json('unused-deps', 'attached::' + label, '--verbose')['items'][0]['examples']['direct'])
     feature = next(iter(FEATURES))
     return {feature: expected}, {feature: actual}
