@@ -291,6 +291,64 @@ def hierarchy_omits_source_owners(fixture, anchor):
     return False
 
 
+def anchor_owners(fixture, check, anchor, *, exact_member=False):
+    """Bind one callable declaration; never union another same-name member."""
+    expected = set()
+    queries = fixture.state.execute(
+        'SELECT coalesce(max(page)+1,0) FROM pages WHERE check_id=?',
+        (check['id'],)).fetchone()[0]
+    request = dict(project_path=str(fixture.root), file=anchor['path'], line=anchor['line'],
+                   column=anchor['column'], direction='callers', depth=1,
+                   scope='project_files', includeGenerated=anchor['kind'] == 'accessor')
+    if anchor['kind'] == 'accessor':
+        try:
+            response, queries = accessor_response(fixture, check, anchor, queries)
+        except UnsupportedHierarchy:
+            expected.update(callable_reference_owners(fixture, check, anchor))
+            if len(expected) > MAX_CALLERS:
+                raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
+            return expected, False
+    else:
+        response = fixture.client.call('ide_call_hierarchy', request)
+        fixture.oracle_store.page(check['id'], queries, 'ide_call_hierarchy', request, response)
+        queries += 1
+    if not isinstance(response, dict) or not isinstance(response.get('calls'), list) \
+            or not isinstance(response.get('element'), dict):
+        raise UnsupportedHierarchy('unrecognized MCP call hierarchy response')
+    if any(response.get(flag) for flag in ('stale', 'truncated', 'hasMore', 'nextCursor', 'incomplete')):
+        raise UnsupportedHierarchy('MCP call hierarchy response is incomplete')
+    selected = response['element']
+    if relative(selected.get('file'), fixture.root) != anchor['path'] or selected.get('line') != anchor['line']:
+        raise UnsupportedHierarchy('MCP selected a different call hierarchy declaration')
+    same_line = fixture.state.execute('SELECT column FROM call_hierarchy_anchors '
+                                     'WHERE path=? AND line=? AND name=? LIMIT 2',
+                                     (anchor['path'], anchor['line'], anchor['name'])).fetchall()
+    if len(same_line) > 1 and selected.get('column') != anchor['column']:
+        raise UnsupportedHierarchy('same-line callable selection requires exact MCP column')
+    if len(response['calls']) > MAX_CALLERS:
+        raise UnsupportedHierarchy('MCP direct callers exceed bounded contract')
+    narrow_override = anchor['kind'] == 'method' and any(
+        entry['kind'] == 'method' and entry['name'] == anchor['name']
+        and entry['line'] == anchor['line'] and entry['column'] == anchor['column']
+        and entry.get('overrides') is True for entry in fixture.structure(anchor['path']))
+    for node in response['calls']:
+        if not isinstance(node, dict) or node.get('children'):
+            raise UnsupportedHierarchy('MCP direct caller node has unknown/deeper shape')
+        identity = owner(fixture, node)
+        if identity is not None and not (narrow_override or exact_member):
+            expected.add(identity)
+        if len(expected) > MAX_CALLERS:
+            raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
+    if anchor['kind'] in {'constructor', 'accessor'} or narrow_override or exact_member \
+            or hierarchy_omits_source_owners(fixture, anchor):
+        expected.update(callable_reference_owners(fixture, check, anchor))
+        if len(expected) > MAX_CALLERS:
+            raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
+        queries = fixture.state.execute('SELECT count(*) FROM pages WHERE check_id=?',
+                                        (check['id'],)).fetchone()[0]
+    return expected, narrow_override
+
+
 def exercise(fixture, check):
     if not getattr(fixture, '_call_hierarchy_graph_ready', False):
         fixture.cli('graph', 'build')
@@ -300,55 +358,14 @@ def exercise(fixture, check):
     for anchor in fixture.state.execute(
         'SELECT * FROM call_hierarchy_anchors WHERE name=? ORDER BY path,line,column,kind',
         (check['subject'],)):
-        request = dict(project_path=str(fixture.root), file=anchor['path'], line=anchor['line'],
-                       column=anchor['column'], direction='callers', depth=1,
-                       scope='project_files', includeGenerated=anchor['kind'] == 'accessor')
-        if anchor['kind'] == 'accessor':
-            try:
-                response, queries = accessor_response(fixture, check, anchor, queries)
-            except UnsupportedHierarchy:
-                expected.update(callable_reference_owners(fixture, check, anchor))
-                if len(expected) > MAX_CALLERS:
-                    raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
-                queries = fixture.state.execute('SELECT count(*) FROM pages WHERE check_id=?',
-                                                (check['id'],)).fetchone()[0]
-                declarations += 1
-                continue
-        else:
-            response = fixture.client.call('ide_call_hierarchy', request)
-            fixture.oracle_store.page(check['id'], queries, 'ide_call_hierarchy', request, response)
-            queries += 1
+        owners, narrow_override = anchor_owners(fixture, check, anchor)
+        expected.update(owners)
+        if len(expected) > MAX_CALLERS:
+            raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
         declarations += 1
-        if not isinstance(response, dict) or not isinstance(response.get('calls'), list) \
-                or not isinstance(response.get('element'), dict):
-            raise UnsupportedHierarchy('unrecognized MCP call hierarchy response')
-        if any(response.get(flag) for flag in ('stale', 'truncated', 'hasMore', 'nextCursor', 'incomplete')):
-            raise UnsupportedHierarchy('MCP call hierarchy response is incomplete')
-        selected = response['element']
-        if relative(selected.get('file'), fixture.root) != anchor['path'] or selected.get('line') != anchor['line']:
-            raise UnsupportedHierarchy('MCP selected a different call hierarchy declaration')
-        if len(response['calls']) > MAX_CALLERS:
-            raise UnsupportedHierarchy('MCP direct callers exceed bounded contract')
-        narrow_override = anchor['kind'] == 'method' and any(
-            entry['kind'] == 'method' and entry['name'] == anchor['name']
-            and entry['line'] == anchor['line'] and entry['column'] == anchor['column']
-            and entry.get('overrides') is True for entry in fixture.structure(anchor['path']))
-        for node in response['calls']:
-            if not isinstance(node, dict) or node.get('children'):
-                raise UnsupportedHierarchy('MCP direct caller node has unknown/deeper shape')
-            identity = owner(fixture, node)
-            if identity is not None and not narrow_override:
-                expected.add(identity)
-            if len(expected) > MAX_CALLERS:
-                raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
-        if anchor['kind'] in {'constructor', 'accessor'} or narrow_override \
-                or hierarchy_omits_source_owners(fixture, anchor):
-            expected.update(callable_reference_owners(fixture, check, anchor))
-            if len(expected) > MAX_CALLERS:
-                raise UnsupportedHierarchy('MCP caller union exceeds bounded contract')
-            queries = fixture.state.execute('SELECT count(*) FROM pages WHERE check_id=?',
-                                            (check['id'],)).fetchone()[0]
-            narrowed_overrides += int(narrow_override)
+        narrowed_overrides += int(narrow_override)
+    queries = fixture.state.execute(
+        'SELECT count(*) FROM pages WHERE check_id=?', (check['id'],)).fetchone()[0]
     if not declarations:
         raise UnsupportedHierarchy('call hierarchy check has no independently scheduled declarations')
     actual = native_callers(fixture, check)

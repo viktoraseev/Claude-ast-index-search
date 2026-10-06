@@ -569,6 +569,7 @@ struct CallerSite {
     path: String,
     line: usize,
     target: CallerTarget,
+    callable: bool,
 }
 
 impl CallerSite {
@@ -578,6 +579,7 @@ impl CallerSite {
             name,
             path,
             line,
+            callable: true,
         }
     }
 }
@@ -742,7 +744,8 @@ impl<'a> TreeWalk<'a, '_> {
                 (self.visit)(depth, site, TreeNode::Recursive);
                 continue;
             }
-            let expandable = depth < self.max_depth && is_callable_name(&site.name);
+            let expandable =
+                depth < self.max_depth && site.callable && is_callable_name(&site.name);
             let expansion = match (&self.root_target, &site.target) {
                 (CallerTarget::Name(name), CallerTarget::JavaSymbol(_)) if name == &site.name => {
                     &self.root_target
@@ -878,6 +881,7 @@ fn find_caller_functions(
                         name: source.name,
                         path: super::display_path(resolver, root, &path),
                         line: source.line as usize,
+                        callable: source.kind == "function",
                     });
                 }
                 sites.sort_by(|a, b| (&a.path, a.line, &a.name).cmp(&(&b.path, b.line, &b.name)));
@@ -933,20 +937,24 @@ fn find_caller_functions(
             continue;
         }
         let content = read_java_syntax_source(path, crate::indexer::max_file_size_bytes())?;
-        let owners =
-            crate::parsers::treesitter::java::invocation_callers(&content, &function_names, limit)?;
+        let owners = crate::parsers::treesitter::java::invocation_caller_sites(
+            &content,
+            &function_names,
+            limit,
+        )?;
         for ((sites, owners), answered) in java_callers.iter_mut().zip(owners).zip(&graph_answered)
         {
             if *answered {
                 continue;
             }
             let remaining = limit.saturating_sub(sites.len());
-            sites.extend(
-                owners
-                    .into_iter()
-                    .take(remaining)
-                    .map(|(name, line)| CallerSite::lexical(name, rel.clone(), line)),
-            );
+            sites.extend(owners.into_iter().take(remaining).map(|owner| CallerSite {
+                target: CallerTarget::Name(owner.name.clone()),
+                name: owner.name,
+                path: rel.clone(),
+                line: owner.line,
+                callable: owner.callable,
+            }));
         }
     }
     let patterns: Vec<(String, String)> = function_names

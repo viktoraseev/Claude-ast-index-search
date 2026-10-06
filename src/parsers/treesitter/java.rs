@@ -1383,11 +1383,36 @@ fn invocation_identifier<'tree>(
 }
 
 /// Attribute actual invocations to syntax owners, retaining distinct overloads.
+#[cfg(test)]
 pub(crate) fn invocation_callers(
     content: &str,
     names: &[String],
     limit: usize,
 ) -> Result<Vec<Vec<(String, usize)>>> {
+    Ok(invocation_caller_sites(content, names, limit)?
+        .into_iter()
+        .map(|owners| {
+            owners
+                .into_iter()
+                .map(|owner| (owner.name, owner.line))
+                .collect()
+        })
+        .collect())
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct InvocationCaller {
+    pub name: String,
+    pub line: usize,
+    pub callable: bool,
+}
+
+/// Initializers own calls but cannot themselves be called as methods.
+pub(crate) fn invocation_caller_sites(
+    content: &str,
+    names: &[String],
+    limit: usize,
+) -> Result<Vec<Vec<InvocationCaller>>> {
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let lookup: HashMap<&str, usize> = names
         .iter()
@@ -1439,7 +1464,16 @@ pub(crate) fn invocation_callers(
                     .is_some_and(|parent| parent.kind() == "field_declaration"))
             {
                 if let Some(name) = owner.child_by_field_name("name") {
-                    let site = (node_text(content, &name).to_string(), node_line(&name));
+                    let site = InvocationCaller {
+                        name: node_text(content, &name).to_string(),
+                        line: node_line(&name),
+                        callable: matches!(
+                            owner.kind(),
+                            "method_declaration"
+                                | "constructor_declaration"
+                                | "compact_constructor_declaration"
+                        ),
+                    };
                     for index in &indices {
                         if callers[*index].len() < limit && !callers[*index].contains(&site) {
                             callers[*index].push(site.clone());

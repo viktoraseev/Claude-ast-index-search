@@ -12,6 +12,7 @@ import mobile_contracts
 import text_snapshot
 import call_hierarchy_contracts
 import graph_mcp_contracts
+import call_tree_mcp_contracts
 
 
 class StoredOracle:
@@ -144,10 +145,12 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                     fixture.batch_text = batch_text
                     if fixture._text_snapshot is not None:
                         fixture._text_snapshot.client = oracle
-                if check['feature'] in call_hierarchy_contracts.FEATURES | graph_mcp_contracts.FEATURES and not hierarchy_ready:
+                if check['feature'] in call_hierarchy_contracts.FEATURES | graph_mcp_contracts.FEATURES | call_tree_mcp_contracts.FEATURES and not hierarchy_ready:
                     call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure,
                                                           schedule_checks=False)
                     hierarchy_ready = True
+                if check['feature'] in call_tree_mcp_contracts.FEATURES:
+                    call_tree_mcp_contracts.copy_dependencies(source, state, check['subject'])
                 if check['feature'] in graph_mcp_contracts.FEATURES:
                     dependency = source.execute('SELECT id,status,verdict,expected_json FROM checks WHERE feature=? AND subject=?',
                                                 (call_hierarchy_contracts.FEATURE, check['subject'])).fetchone()

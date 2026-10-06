@@ -59,6 +59,7 @@ import java_receiver_contracts
 import java_exception_scope_contracts
 import java_local_interface_contracts
 import graph_mcp_contracts
+import call_tree_mcp_contracts
 import java_pattern_scope_contracts
 import java_type_binding_contracts
 import java_type_access_contracts
@@ -672,6 +673,12 @@ class Fixture:
     def graph_mcp_check(self, check: sqlite3.Row):
         try:
             return graph_mcp_contracts.exercise(self, check)
+        except graph_mcp_contracts.ScopeUnsupported as error:
+            raise Unsupported(str(error)) from error
+
+    def call_tree_mcp_check(self, check: sqlite3.Row):
+        try:
+            return call_tree_mcp_contracts.exercise(self, check)
         except graph_mcp_contracts.ScopeUnsupported as error:
             raise Unsupported(str(error)) from error
 
@@ -2194,6 +2201,8 @@ class Fixture:
                 handler = self.call_hierarchy_check
             if check['feature'] in graph_mcp_contracts.FEATURES:
                 handler = self.graph_mcp_check
+            if check['feature'] in call_tree_mcp_contracts.FEATURES:
+                handler = self.call_tree_mcp_check
             if check['feature'] in file_view_contracts.FEATURES:
                 handler = self.file_view_check
             if check['feature'] in file_scope_contracts.FEATURES:
@@ -2317,6 +2326,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(graph_ambiguity_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
     features.update(graph_mcp_contracts.FEATURES)
+    features.update(call_tree_mcp_contracts.FEATURES)
     return features
 
 
@@ -2556,6 +2566,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         plan(state, source_files, help_text, candidates, root, java_only=True)
         call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure)
         graph_mcp_contracts.plan(state)
+        call_tree_mcp_contracts.plan(state)
         limit = arguments.case_limit
         processed = 0
         problems = state.execute("SELECT count(*) FROM checks WHERE verdict IN ('fail','unsupported')").fetchone()[0]
