@@ -2547,7 +2547,17 @@ impl JavaSource {
                             }
                         })
                         .or_insert(container);
-                    let range = declaration.byte_range();
+                    // A field's type precedes its variable declarator. Its
+                    // lexical range must include that type site, especially
+                    // when it refers to the enclosing block-local class.
+                    let range = declaration
+                        .parent()
+                        .filter(|parent| {
+                            declaration.kind() == "variable_declarator"
+                                && parent.kind() == "field_declaration"
+                        })
+                        .unwrap_or(declaration)
+                        .byte_range();
                     result
                         .declaration_ranges
                         .entry((
@@ -3752,6 +3762,20 @@ impl JavaSource {
 #[cfg(test)]
 mod tests {
     use super::JavaSource;
+
+    #[test]
+    fn local_class_field_scope_includes_its_declared_type() {
+        let java = JavaSource::parse(
+            "package fixture;\nclass Probe {\n void method() {\n  class Leaf {\n   Leaf first, second;\n  }\n }\n}\n",
+        )
+        .unwrap();
+        let declaration = java.type_declaration("fixture::Probe::Leaf", 4).unwrap();
+        for field in ["first", "second"] {
+            assert!(java.type_in_scope(declaration, field, 5, Some((5, "Leaf"))));
+            assert!(java.type_in_scope(declaration, field, 5, None));
+        }
+        assert!(!java.type_in_scope(declaration, "Probe", 2, None));
+    }
 
     #[test]
     fn static_imports_and_bare_call_arity_are_separate_from_type_imports() {

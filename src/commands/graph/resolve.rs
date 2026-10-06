@@ -2964,7 +2964,7 @@ impl Builder {
         let mut prefix = qualified;
         let mut tail: Vec<&str> = Vec::new();
         loop {
-            let declared: Vec<_> = self
+            let mut declared: Vec<_> = self
                 .by_qual
                 .get(prefix)
                 .into_iter()
@@ -2998,6 +2998,27 @@ impl Builder {
                 })
                 .collect();
             if !declared.is_empty() {
+                // A visible block-local type hides same-named member types.
+                // Descendants share their local owner's scope, so narrow the
+                // owner before selecting any qualified member below it.
+                let local_scope = |candidate: u32| {
+                    let symbol = &self.syms[candidate as usize];
+                    self.files[symbol.file as usize]
+                        .java
+                        .as_ref()
+                        .and_then(|java| java.type_declaration(&symbol.qual, symbol.line))
+                        .and_then(|declaration| declaration.local_scope.as_ref())
+                };
+                if let Some(length) = reference.and_then(|_| {
+                    declared
+                        .iter()
+                        .filter_map(|&candidate| local_scope(candidate).map(|scope| scope.len()))
+                        .min()
+                }) {
+                    declared.retain(|&candidate| {
+                        local_scope(candidate).is_some_and(|scope| scope.len() == length)
+                    });
+                }
                 let mut classes = declared;
                 classes
                     .retain(|&candidate| self.java_type_accessible(source, candidate, at_import));
@@ -3088,14 +3109,30 @@ impl Builder {
         // lookup into inaccessible classes in the default package.
         let mut namespace = namespace;
         while namespace != java.package {
-            if let Some(classes) = self.java_qualified_types(
+            if let Some(mut classes) = self.java_qualified_types(
                 source,
-                &join_path(namespace, &[declared]),
-                exclude,
+                &join_path(namespace, &[head]),
+                None,
                 false,
                 true,
                 line.map(|line| (line, head)),
             ) {
+                // Resolve the lexical head first. A local Leaf without Nested
+                // must not borrow Nested from the hidden enclosing Leaf.
+                if !tail.is_empty() {
+                    for name in tail.split("::") {
+                        classes = classes
+                            .into_iter()
+                            .flat_map(|owner| self.java_member_types(owner, name))
+                            .filter(|&candidate| {
+                                self.java_member_type_accessible(source, candidate, false)
+                            })
+                            .collect();
+                    }
+                }
+                classes.retain(|&candidate| Some(candidate) != exclude);
+                classes.sort_unstable();
+                classes.dedup();
                 return classes;
             }
             let Some((parent, _)) = namespace.rsplit_once("::") else {
