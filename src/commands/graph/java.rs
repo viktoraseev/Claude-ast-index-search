@@ -180,10 +180,17 @@ pub(super) struct ExpressionCall {
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(super) struct ReceiverTypeSite {
     pub path: String,
-    pub line: i64,
+    /// Exact nominal type site, including all explicit generic arguments.
+    pub position: usize,
     pub owner: String,
     pub owner_line: i64,
     pub owner_ordinal: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum TypeReference<'a> {
+    Occurrences(i64, &'a str),
+    Position(usize),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -698,7 +705,7 @@ fn receiver_type_site(
             let name = owner.child_by_field_name("name")?;
             return Some(ReceiverTypeSite {
                 path,
-                line: ty.start_position().row as i64 + 1,
+                position: ty.start_byte(),
                 owner: text(name, source).to_owned(),
                 owner_line: name.start_position().row as i64 + 1,
                 owner_ordinal: declarations.get(&owner.id()).map(|owner| owner.ordinal),
@@ -3789,18 +3796,24 @@ impl JavaSource {
         declaration: &TypeDeclaration,
         owner: &str,
         owner_line: i64,
-        reference: Option<(i64, &str)>,
+        reference: Option<TypeReference<'_>>,
     ) -> bool {
         let Some(scope) = &declaration.local_scope else {
             return true;
         };
+        if let Some(TypeReference::Position(position)) = reference {
+            return scope.contains(&position);
+        }
         let key = (owner.to_owned(), owner_line);
         let Some(range) = self.declaration_ranges.get(&key).and_then(Option::as_ref) else {
             return false;
         };
-        if let Some(positions) =
-            reference.and_then(|(line, name)| self.type_positions.get(&(line, name.to_owned())))
-        {
+        if let Some(positions) = reference.and_then(|reference| match reference {
+            TypeReference::Occurrences(line, name) => {
+                self.type_positions.get(&(line, name.to_owned()))
+            }
+            TypeReference::Position(_) => None,
+        }) {
             let mut positions = positions
                 .iter()
                 .filter(|position| range.contains(position))
@@ -3943,7 +3956,26 @@ impl JavaSource {
 
 #[cfg(test)]
 mod tests {
-    use super::JavaSource;
+    use super::{JavaSource, TypeReference};
+
+    #[test]
+    fn receiver_type_sites_distinguish_positions_on_a_shared_line() {
+        let source = "package fixture;\nclass Probe { int use() { Leaf before = null; class Leaf {} Leaf after = null; return 0; } }\n";
+        let java = JavaSource::parse(source).unwrap();
+        let declaration = java.type_declaration("fixture::Probe::Leaf", 2).unwrap();
+        let before = source.find("Leaf before").unwrap();
+        let after = source.find("Leaf after").unwrap();
+        assert!(!java.type_in_scope(declaration, "use", 2, Some(TypeReference::Position(before))));
+        assert!(java.type_in_scope(declaration, "use", 2, Some(TypeReference::Position(after))));
+        // A line-only reference cannot establish which of the two sites was
+        // meant. Preserve that conservative contract for stored reference rows.
+        assert!(!java.type_in_scope(
+            declaration,
+            "use",
+            2,
+            Some(TypeReference::Occurrences(2, "Leaf"))
+        ));
+    }
 
     #[test]
     fn local_class_field_scope_includes_its_declared_type() {
@@ -3953,7 +3985,12 @@ mod tests {
         .unwrap();
         let declaration = java.type_declaration("fixture::Probe::Leaf", 4).unwrap();
         for field in ["first", "second"] {
-            assert!(java.type_in_scope(declaration, field, 5, Some((5, "Leaf"))));
+            assert!(java.type_in_scope(
+                declaration,
+                field,
+                5,
+                Some(TypeReference::Occurrences(5, "Leaf"))
+            ));
             assert!(java.type_in_scope(declaration, field, 5, None));
         }
         assert!(!java.type_in_scope(declaration, "Probe", 2, None));

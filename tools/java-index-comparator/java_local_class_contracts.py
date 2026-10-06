@@ -8,17 +8,19 @@ import mobile_contracts
 from root_contracts import Runner
 from java_type_binding_contracts import edges, identity
 import java_receiver_site_contracts
+import java_same_line_site_contracts
 
 SCOPES = 'graph:java-local-class-shadows'
 MEMBERS = 'graph:java-local-class-members'
 EXPLORE = 'explore:java-local-class-shadows'
 RECEIVERS = 'graph:java-local-class-receiver-sites'
 RECEIVER_EXPLORE = 'explore:java-local-class-receiver-sites'
-FEATURES = {SCOPES, MEMBERS, EXPLORE, RECEIVERS, RECEIVER_EXPLORE} | java_receiver_site_contracts.FEATURES
+FEATURES = ({SCOPES, MEMBERS, EXPLORE, RECEIVERS, RECEIVER_EXPLORE}
+            | java_receiver_site_contracts.FEATURES | java_same_line_site_contracts.FEATURES)
 REASON = ('independent source/state: disposable javac-validated Java local classes, '
           'member/package/import shadows, declaration/block/sibling boundaries, nested '
           'types and static qualifiers, graph pages/reverse/path and exploration; '
-          'distinct-line direct/chained nominal and generic receiver declaration sites across later local shadows; '
+          'direct/chained nominal and generic receiver declaration byte sites across later local shadows; '
           'not MCP equivalence or compiler-wide receiver dispatch')
 SOURCES = {
     'Leaf.java': '''package fixture;
@@ -212,6 +214,14 @@ def plan_classes(state, root):
                            'same-line local declaration collisions, generic inference beyond explicit type '
                            'arguments, overload/accessibility dispatch and attached-root receiver semantics '
                            'remain pending; not MCP equivalence', parent))
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending'",
+                          ('; separate executed javac/source contract covers same-line receiver declaration '
+                           'byte sites for parameters, locals, fields, new/casts, explicit generic projections, '
+                           'captures, method references, block/sibling boundaries, graph pages/reverse/path '
+                           'and exploration with missing-member guards; colliding same-named local type '
+                           'declarations on one line still require distinct declaration/member identities; '
+                           'generic inference, overload/accessibility and attached-root dispatch remain pending; '
+                           'not MCP equivalence', parent))
 
 
 def exercise(binary, base):
@@ -367,4 +377,7 @@ def exercise(binary, base):
     site_expected, site_actual = java_receiver_site_contracts.exercise(binary, base)
     expected.update(site_expected)
     actual.update(site_actual)
+    byte_expected, byte_actual = java_same_line_site_contracts.exercise(binary, base)
+    expected.update(byte_expected)
+    actual.update(byte_actual)
     return expected, actual

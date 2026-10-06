@@ -13,7 +13,9 @@ use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 
-use super::java::{InvocationArgument, JavaReceiver, JavaSource, ReceiverTypeSite, TypeAccess};
+use super::java::{
+    InvocationArgument, JavaReceiver, JavaSource, ReceiverTypeSite, TypeAccess, TypeReference,
+};
 use super::metrics::compute_metrics;
 use super::rust::{crate_name, module_location, parse_uses, FileUses, ModuleScope};
 use super::schema::{column_candidates, link_models, underscore, ModelClass, SchemaLinkSummary};
@@ -2971,7 +2973,7 @@ impl Builder {
         exclude: Option<u32>,
         at_import: bool,
         allow_local: bool,
-        reference: Option<(i64, &str)>,
+        reference: Option<TypeReference<'_>>,
     ) -> Option<Vec<u32>> {
         let file = self.syms[source as usize].file;
         let mut prefix = qualified;
@@ -3084,6 +3086,24 @@ impl Builder {
         exclude: Option<u32>,
         line: Option<i64>,
     ) -> Vec<u32> {
+        let head = declared.split("::").next().unwrap_or(declared);
+        self.resolve_java_type_reference(
+            source,
+            namespace,
+            declared,
+            exclude,
+            line.map(|line| TypeReference::Occurrences(line, head)),
+        )
+    }
+
+    fn resolve_java_type_reference(
+        &self,
+        source: u32,
+        namespace: &str,
+        declared: &str,
+        exclude: Option<u32>,
+        reference: Option<TypeReference<'_>>,
+    ) -> Vec<u32> {
         let file = self.syms[source as usize].file;
         let Some(java) = self.files[file as usize].java.as_ref() else {
             return Vec::new();
@@ -3128,7 +3148,7 @@ impl Builder {
                 None,
                 false,
                 true,
-                line.map(|line| (line, head)),
+                reference,
             ) {
                 // Resolve the lexical head first. A local Leaf without Nested
                 // must not borrow Nested from the hidden enclosing Leaf.
@@ -4002,8 +4022,13 @@ impl Builder {
             JavaReceiver::Parameterized { path, arguments } => (path, Some(arguments)),
             _ => return receiver.clone(),
         };
-        let classes =
-            self.resolve_java_type_at(owner, self.namespace_of(owner), path, None, Some(site.line));
+        let classes = self.resolve_java_type_reference(
+            owner,
+            self.namespace_of(owner),
+            path,
+            None,
+            Some(TypeReference::Position(site.position)),
+        );
         let arguments = arguments.map(|arguments| {
             arguments
                 .iter()
@@ -5091,12 +5116,12 @@ impl Builder {
                 let Some(owner) = self.java_receiver_site_owner(source, site) else {
                     return Vec::new();
                 };
-                self.resolve_java_type_at(
+                self.resolve_java_type_reference(
                     owner,
                     self.namespace_of(owner),
                     &site.path,
                     None,
-                    Some(site.line),
+                    Some(TypeReference::Position(site.position)),
                 )
             });
             let type_classes = call.reference_type.as_deref().map(|path| {
