@@ -325,7 +325,10 @@ impl Collector {
         let sha = parse_utf8(&output.stdout.bytes, "git rev-parse output")?
             .trim()
             .to_string();
-        Ok((!sha.is_empty()).then_some(sha))
+        if output.stdout.truncated || !valid_commit_id(&sha) {
+            bail!("git rev-parse returned an invalid commit identity");
+        }
+        Ok(Some(sha))
     }
 
     fn push_pathspec(&self, args: &mut Vec<OsString>) {
@@ -451,7 +454,14 @@ impl Collector {
         }
         match self.git_capped(&args, stdout_limit)? {
             Some(bytes) => {
-                out.extend(parse(&bytes)?);
+                let rows = parse(&bytes)?;
+                if rows.len() != count {
+                    bail!(
+                        "git window returned {} records; expected {count}",
+                        rows.len()
+                    );
+                }
+                out.extend(rows);
                 Ok(())
             }
             None if count <= 1 => bail!(
@@ -488,7 +498,7 @@ impl Collector {
     /// included, with its parents: the graph the order keys are built from.
     fn list_graph(&self, revs: &[OsString]) -> Result<Vec<GraphCommit>> {
         let total = self.count(&os_args(&["rev-list", "--count"]), revs, false)?;
-        self.windowed(
+        let graph = self.windowed(
             &os_args(&["rev-list", "--parents", "--timestamp"]),
             revs,
             false,
@@ -496,7 +506,17 @@ impl Collector {
             GRAPH_WINDOW,
             parse_graph,
             STDOUT_LIMIT,
-        )
+        )?;
+        if graph
+            .iter()
+            .map(|commit| &commit.sha)
+            .collect::<HashSet<_>>()
+            .len()
+            != graph.len()
+        {
+            bail!("git rev-list returned duplicate commits");
+        }
+        Ok(graph)
     }
 
     /// Diffstats of every non-merge commit `revs` selects that changes the
@@ -522,7 +542,7 @@ impl Collector {
                 self.window.max(1)
             );
         }
-        self.windowed(
+        let records = self.windowed(
             &log_args,
             revs,
             true,
@@ -530,7 +550,17 @@ impl Collector {
             self.window,
             parse_git_log,
             LOG_WINDOW_STDOUT_LIMIT,
-        )
+        )?;
+        if records
+            .iter()
+            .map(|commit| &commit.sha)
+            .collect::<HashSet<_>>()
+            .len()
+            != records.len()
+        {
+            bail!("git log returned duplicate commits");
+        }
+        Ok(records)
     }
 
     /// Project paths whose content differs between commits `from` and `to`,
@@ -787,7 +817,13 @@ fn order_keys(
                     outside[parent]
                 };
                 match parent_key {
-                    Some(value) => key = key.max(value + 1),
+                    Some(value) => {
+                        key = key.max(
+                            value
+                                .checked_add(1)
+                                .ok_or_else(|| anyhow!("commit graph order overflowed"))?,
+                        )
+                    }
                     None if strict => return Ok(None),
                     None => {}
                 }
@@ -805,14 +841,18 @@ fn parse_graph(bytes: &[u8]) -> Result<Vec<GraphCommit>> {
     for line in text.lines() {
         let mut fields = line.split_ascii_whitespace();
         let (Some(timestamp), Some(sha)) = (fields.next(), fields.next()) else {
-            continue;
+            bail!("git rev-list returned an incomplete commit record");
         };
+        let parents: Vec<String> = fields.map(str::to_string).collect();
+        if !valid_commit_id(sha) || parents.iter().any(|parent| !valid_commit_id(parent)) {
+            bail!("git rev-list returned an invalid commit identity");
+        }
         commits.push(GraphCommit {
             committed_at: timestamp
                 .parse::<i64>()
-                .with_context(|| format!("bad commit timestamp in '{line}'"))?,
+                .context("git rev-list returned a bad commit timestamp")?,
             sha: sha.to_string(),
-            parents: fields.map(str::to_string).collect(),
+            parents,
         });
     }
     Ok(commits)
@@ -1102,6 +1142,20 @@ fn apply_plan(
     repo_root: &str,
     scope_key: &str,
 ) -> Result<Applied> {
+    // Validate response identities before opening a write transaction. A log
+    // record outside the selected graph used to panic after history was cleared.
+    let selected: HashSet<&str> = plan
+        .new_commits
+        .iter()
+        .map(|commit| commit.sha.as_str())
+        .collect();
+    if plan
+        .records
+        .iter()
+        .any(|record| !selected.contains(record.sha.as_str()))
+    {
+        bail!("git log returned a commit outside the selected history graph");
+    }
     let started = Instant::now();
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1312,7 +1366,11 @@ fn count_lines(path: &Path) -> Option<i64> {
 /// is that commit's numstat. A pure or modifying rename emits three records:
 /// `added\tdeleted\t`, then the old path, then the new one.
 fn parse_git_log(bytes: &[u8]) -> Result<Vec<CommitRecord>> {
+    if !bytes.is_empty() && bytes.last() != Some(&0) {
+        bail!("git log returned an unterminated record");
+    }
     let mut commits: Vec<CommitRecord> = Vec::new();
+    let mut identities = HashSet::new();
     let mut fields = bytes.split(|byte| *byte == 0).peekable();
 
     while let Some(raw) = fields.next() {
@@ -1321,25 +1379,39 @@ fn parse_git_log(bytes: &[u8]) -> Result<Vec<CommitRecord>> {
             continue;
         }
         if let Some(header) = parse_commit_header(field)? {
+            if !identities.insert(header.sha.clone()) {
+                bail!("git log returned duplicate commits");
+            }
             commits.push(header);
             continue;
         }
-        let Some(commit) = commits.last_mut() else {
-            continue;
-        };
+        let commit = commits
+            .last_mut()
+            .ok_or_else(|| anyhow!("git log returned numstat before a commit header"))?;
         // Lossy on purpose: Git paths are arbitrary bytes, and one file with a
         // latin-1 name must not abort the collection for the whole repository.
         let text = String::from_utf8_lossy(field);
         let mut parts = text.splitn(3, '\t');
-        let added = parse_stat(parts.next().unwrap_or(""));
-        let deleted = parse_stat(parts.next().unwrap_or(""));
-        let tail = parts.next().unwrap_or("");
+        let added_column = parts.next().unwrap_or("");
+        let deleted_column = parts
+            .next()
+            .ok_or_else(|| anyhow!("git log returned incomplete numstat columns"))?;
+        let tail = parts
+            .next()
+            .ok_or_else(|| anyhow!("git log returned incomplete numstat columns"))?;
+        if (added_column == "-") != (deleted_column == "-") {
+            bail!("git log returned inconsistent binary numstat columns");
+        }
+        let added = parse_stat(added_column)?;
+        let deleted = parse_stat(deleted_column)?;
         if tail.is_empty() {
             // Rename: the two following records carry old and new path.
-            let from = fields.next().map(trim_record_newlines).unwrap_or_default();
-            let to = fields.next().map(trim_record_newlines).unwrap_or_default();
+            // These are raw paths, not header/numstat separators. Leading
+            // newline and tab characters belong to the file identity.
+            let from = fields.next().unwrap_or_default();
+            let to = fields.next().unwrap_or_default();
             if from.is_empty() || to.is_empty() {
-                continue;
+                bail!("git log returned an incomplete rename");
             }
             commit.files.push(FileChange::Renamed {
                 from: String::from_utf8_lossy(from).into_owned(),
@@ -1367,8 +1439,20 @@ fn trim_record_newlines(field: &[u8]) -> &[u8] {
 }
 
 /// `-` in a numstat column means a binary file: counted as a touch, not churn.
-fn parse_stat(value: &str) -> i64 {
-    value.trim().parse::<i64>().unwrap_or(0)
+fn parse_stat(value: &str) -> Result<i64> {
+    if value == "-" {
+        return Ok(0);
+    }
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("git log returned an invalid numstat count");
+    }
+    value
+        .parse::<i64>()
+        .context("git log numstat count overflowed")
+}
+
+fn valid_commit_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_commit_header(field: &[u8]) -> Result<Option<CommitRecord>> {
@@ -1376,20 +1460,32 @@ fn parse_commit_header(field: &[u8]) -> Result<Option<CommitRecord>> {
         return Ok(None);
     }
     let text = String::from_utf8_lossy(&field[1..]);
-    let mut parts = text.split('\u{1f}');
+    // Subjects can contain the field separator; only the first four delimiters
+    // are structural. Git intentionally permits empty author name/email fields.
+    let mut parts = text.splitn(5, '\u{1f}');
     let sha = parts.next().unwrap_or("");
-    if sha.len() < 7 || !sha.chars().all(|character| character.is_ascii_hexdigit()) {
-        return Ok(None);
+    if !valid_commit_id(sha) {
+        bail!("git log returned an invalid commit identity");
     }
     let timestamp = parts
         .next()
         .unwrap_or("")
         .trim()
         .parse::<i64>()
-        .unwrap_or(0);
-    let email = parts.next().unwrap_or("").trim().to_lowercase();
-    let name = parts.next().unwrap_or("").trim().to_string();
-    let subject = parts.next().unwrap_or("");
+        .context("git log returned an invalid commit timestamp")?;
+    let email = parts
+        .next()
+        .ok_or_else(|| anyhow!("git log returned an incomplete commit header"))?
+        .trim()
+        .to_lowercase();
+    let name = parts
+        .next()
+        .ok_or_else(|| anyhow!("git log returned an incomplete commit header"))?
+        .trim()
+        .to_string();
+    let subject = parts
+        .next()
+        .ok_or_else(|| anyhow!("git log returned an incomplete commit header"))?;
     let author = if email.is_empty() { name } else { email };
     Ok(Some(CommitRecord {
         sha: sha.to_string(),
@@ -2434,6 +2530,81 @@ mod tests {
         assert!((fix_share_lower_bound(5, 5) - 0.566).abs() < 0.001);
         assert!(fix_share_lower_bound(2, 2) < fix_share_lower_bound(20, 20));
         assert!(fix_share_lower_bound(2, 2) < fix_share_lower_bound(11, 17));
+    }
+
+    #[test]
+    fn java_history_rejects_partial_and_malformed_protocol_records() {
+        let header =
+            b"\x01abcdef1234567890abcdef1234567890abcdef12\x1f1700000000\x1fd@e\x1fD\x1fFix Java";
+        for tail in [
+            &b"\nwrong\t0\tProbe.java\0"[..],
+            b"\n-1\t0\tProbe.java\0",
+            b"\n9223372036854775808\t0\tProbe.java\0",
+            b"\n-\t0\tProbe.java\0",
+            b"\n1\tProbe.java\0",
+            b"\n0\t0\t\0Old.java\0",
+            b"\n0\t0\t\0\0New.java\0",
+            b"\n1\t0\tProbe.java",
+        ] {
+            let stream = [header.as_slice(), b"\0", tail].concat();
+            assert!(
+                parse_git_log(&stream).is_err(),
+                "accepted malformed Java history"
+            );
+        }
+        for stream in [
+            &b"\x01not-a-hash\x1f1700000000\x1fd@e\x1fD\x1fFix\0"[..],
+            b"\x01abcdef1234567890abcdef1234567890abcdef12\x1fbad-time\x1fd@e\x1fD\x1fFix\0",
+            b"\x01abcdef1234567890abcdef1234567890abcdef12\0",
+            b"1\t0\tProbe.java\0",
+        ] {
+            assert!(
+                parse_git_log(stream).is_err(),
+                "accepted malformed Java header"
+            );
+        }
+        assert!(
+            parse_git_log(&[header.as_slice(), b"\0", header.as_slice(), b"\0"].concat()).is_err()
+        );
+        for graph in [
+            "broken\n",
+            "1700000000 not-a-hash\n",
+            "bad-time abcdef1234567890abcdef1234567890abcdef12\n",
+            "1700000000 abcdef1234567890abcdef1234567890abcdef12 not-a-parent\n",
+        ] {
+            assert!(
+                parse_graph(graph.as_bytes()).is_err(),
+                "accepted malformed Java graph"
+            );
+        }
+        let parent = "b".repeat(40);
+        let graph = [
+            GraphCommit {
+                sha: parent.clone(),
+                committed_at: i64::MAX,
+                parents: vec![],
+            },
+            GraphCommit {
+                sha: "c".repeat(40),
+                committed_at: 0,
+                parents: vec![parent],
+            },
+        ];
+        assert!(order_keys(&graph, |_| Ok(None), false).is_err());
+    }
+
+    #[test]
+    fn java_history_preserves_literal_rename_paths_and_subject_separators() {
+        let stream = b"\x01abcdef1234567890abcdef1234567890abcdef12\x1f1700000000\x1fd@e\x1fD\x1fSubject\x1fFix Java\0\n0\t0\t\0\nOld\t.java\0\rNew\t.java\0";
+        let commits = parse_git_log(stream).unwrap();
+        assert!(commits[0].is_fix, "subject was truncated at a separator");
+        match &commits[0].files[0] {
+            FileChange::Renamed { from, to, .. } => {
+                assert_eq!(from, "\nOld\t.java");
+                assert_eq!(to, "\rNew\t.java");
+            }
+            _ => panic!("expected literal rename paths"),
+        }
     }
 
     #[test]
