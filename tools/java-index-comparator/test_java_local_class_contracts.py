@@ -92,6 +92,15 @@ class LocalClassContractsTests(unittest.TestCase):
         with patch.object(Path, 'read_bytes', changed):
             self.assertNotEqual(adapter_digest(), before)
 
+    def test_receiver_sites_are_required_and_do_not_accept_empty_evidence(self):
+        for feature in (classes.RECEIVERS, classes.RECEIVER_EXPLORE):
+            self.assertIn(feature, required_features())
+            for observed in ({}, {'sites': []}, {'sites': 'inapplicable'}):
+                self.fixture._local_class_results = None
+                with patch.object(classes, 'exercise', return_value=(
+                        {feature: {'sites': [('Probe.java', 4, 'receiver')]}}, {feature: observed})):
+                    self.assertEqual(self.evaluate(feature)['verdict'], 'fail')
+
 
 if __name__ == '__main__':
     unittest.main()

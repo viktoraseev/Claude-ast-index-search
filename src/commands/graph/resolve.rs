@@ -2734,6 +2734,15 @@ impl Builder {
         let java = self.files[file as usize].java.as_ref()?;
         let owner = &self.syms[source as usize];
         let call = java.parameter_call(&owner.name, owner.line, line, name)?;
+        if java
+            .expression_call(&owner.name, owner.line, line, name)
+            .is_some_and(|call| {
+                call.as_ref()
+                    .is_some_and(|call| call.receiver_site.is_some())
+            })
+        {
+            return self.resolve_java_expression_call(file, source, name, line);
+        }
         let Some(call) = call else {
             if java
                 .expression_call(&owner.name, owner.line, line, name)
@@ -4882,6 +4891,40 @@ impl Builder {
         };
         let mut common = None;
         for call in calls {
+            let declared_classes = call.receiver_site.as_ref().map(|site| {
+                // Captures retain the declaring callable/type, rather than the
+                // nested callable where the receiver is used. Source-order
+                // ordinals distinguish overloads sharing a declaration line.
+                let owners: Vec<_> = self
+                    .by_short
+                    .get(&site.owner)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&candidate| {
+                        let symbol = &self.syms[candidate as usize];
+                        symbol.file == file
+                            && symbol.line == site.owner_line
+                            && match site.owner_ordinal {
+                                Some(ordinal) => {
+                                    symbol.kind == "function"
+                                        && symbol.java_callable_ordinal == ordinal
+                                }
+                                None => is_container_kind(&symbol.kind),
+                            }
+                    })
+                    .collect();
+                let [owner] = owners.as_slice() else {
+                    return Vec::new();
+                };
+                self.resolve_java_type_at(
+                    *owner,
+                    self.namespace_of(*owner),
+                    &site.path,
+                    None,
+                    Some(site.line),
+                )
+            });
             let type_classes = call.reference_type.as_deref().map(|path| {
                 // Tree-sitter represents qualified type references as field
                 // accesses. Resolve the full name, but preserve any value
@@ -4906,7 +4949,7 @@ impl Builder {
                 }
                 self.resolve_java_type(source, self.namespace_of(source), path, None)
             });
-            let type_classes = type_classes.or_else(|| {
+            let type_classes = declared_classes.or(type_classes).or_else(|| {
                 if call.arguments.is_none() {
                     return None;
                 }
@@ -4927,12 +4970,17 @@ impl Builder {
                         )
                     })
             });
-            let reference_is_type = type_classes
-                .as_ref()
-                .is_some_and(|classes| !classes.is_empty());
-            let classes = type_classes
-                .filter(|classes| !classes.is_empty())
-                .unwrap_or_else(|| self.java_receiver_classes(source, &call.receiver, 0));
+            let reference_is_type = call.receiver_site.is_none()
+                && type_classes
+                    .as_ref()
+                    .is_some_and(|classes| !classes.is_empty());
+            let classes = if call.receiver_site.is_some() {
+                type_classes.unwrap_or_default()
+            } else {
+                type_classes
+                    .filter(|classes| !classes.is_empty())
+                    .unwrap_or_else(|| self.java_receiver_classes(source, &call.receiver, 0))
+            };
             let mut targets = self.java_receiver_members(source, &classes, name, call.arguments);
             if call.arguments.is_some() {
                 targets
@@ -5052,7 +5100,12 @@ impl Builder {
         Some(match targets.len() {
             0 => Err(DropReason::ReceiverUnresolved),
             1 => {
-                let confidence = if self.syms[targets[0] as usize].file == file {
+                let confidence = if calls
+                    .iter()
+                    .any(|call| call.receiver_site.is_some() && call.arguments.is_some())
+                {
+                    Confidence::Scoped
+                } else if self.syms[targets[0] as usize].file == file {
                     Confidence::Local
                 } else {
                     Confidence::Scoped

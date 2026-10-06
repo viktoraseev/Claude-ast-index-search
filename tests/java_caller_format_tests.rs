@@ -121,6 +121,27 @@ class Top {
             10,
         ),
         (
+            "same-line declared receiver before local shadow",
+            r#"class Target {
+    void leaf() {}
+}
+
+class Caller {
+    void step(String value) {} void step(Target input) {
+        class Target { void decoy() {} }
+        input.leaf();
+    }
+}
+
+class Top {
+    void good() { new Caller().step(new Target()); }
+    void wrong() { new Caller().step("wrong"); }
+}
+"#,
+            6,
+            13,
+        ),
+        (
             "same-line constructors reversed",
             r#"class Target {
     void leaf() {}

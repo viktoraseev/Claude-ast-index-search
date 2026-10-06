@@ -11,10 +11,13 @@ from java_type_binding_contracts import edges, identity
 SCOPES = 'graph:java-local-class-shadows'
 MEMBERS = 'graph:java-local-class-members'
 EXPLORE = 'explore:java-local-class-shadows'
-FEATURES = {SCOPES, MEMBERS, EXPLORE}
+RECEIVERS = 'graph:java-local-class-receiver-sites'
+RECEIVER_EXPLORE = 'explore:java-local-class-receiver-sites'
+FEATURES = {SCOPES, MEMBERS, EXPLORE, RECEIVERS, RECEIVER_EXPLORE}
 REASON = ('independent source/state: disposable javac-validated Java local classes, '
           'member/package/import shadows, declaration/block/sibling boundaries, nested '
           'types and static qualifiers, graph pages/reverse/path and exploration; '
+          'distinct-line direct nominal receiver declaration sites across later local shadows; '
           'not MCP equivalence or compiler-wide receiver dispatch')
 SOURCES = {
     'Leaf.java': '''package fixture;
@@ -90,7 +93,61 @@ class ImportedProbe {
  Object outside() { return new Leaf.Nested(); }
 }
 ''',
+    'ReceiverProbe.java': '''package fixture;
+class ReceiverProbe {
+ Leaf field;
+ int parameter(Leaf input) {
+  class Leaf { int marker() { return 2; } }
+  return input.marker();
+ }
+ int variable() {
+  Leaf input = null;
+  class Leaf { int marker() { return 3; } }
+  return input.marker();
+ }
+ int inferred() {
+  var input = new Leaf();
+  class Leaf { int marker() { return 4; } }
+  return input.marker();
+ }
+ int fieldCall() {
+  class Leaf { int marker() { return 5; } }
+  return this.field.marker();
+ }
+ int local() {
+  class Leaf { int marker() { return 6; } }
+  Leaf input = null;
+  return input.marker();
+ }
+ int captured(Leaf input) {
+  class Worker {
+   int invoke() {
+    class Leaf { int marker() { return 7; } }
+    return input.marker();
+   }
+  }
+  return 0;
+ }
+ int reference(Leaf input) {
+  class Leaf { int marker() { return 8; } }
+  java.util.function.IntSupplier task = input::marker;
+  return 0;
+ }
+ int sibling() { Leaf input = null; return input.marker(); }
 }
+''',
+}
+SOURCES['Leaf.java'] = SOURCES['Leaf.java'].replace(' static class Nested {}',
+    ' static class Nested {}\n int marker() { return 1; }')
+RECEIVER_BINDINGS = {name: ('Leaf.java', 4, 'marker') for name in
+                     ('parameter', 'variable', 'inferred', 'fieldCall', 'invoke', 'reference', 'sibling')}
+RECEIVER_BINDINGS['local'] = ('ReceiverProbe.java', 23, 'marker')
+for name in ('Leaf.java', 'ReceiverProbe.java'):
+    SOURCES['receiver-view/' + name] = SOURCES[name].replace('package fixture;', 'package fixture.receiverview;')
+SOURCES['receiver-view/ReceiverProbe.java'] = SOURCES['receiver-view/ReceiverProbe.java'].replace(
+    'int invoke()', 'int viewInvoke()').replace('int marker()', 'int decoy()').replace(
+    'class Leaf { int decoy() { return 6; } }\n  Leaf input = null;\n  return input.marker();',
+    'class Leaf { int decoy() { return 6; } }\n  Leaf input = null;\n  return input.decoy();')
 
 
 def authored(file, name):
@@ -139,6 +196,14 @@ def plan_classes(state, root):
             state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)', (feature, 'implemented', REASON))
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
+        for parent in ('graph', 'explore:semantic-resolution'):
+            state.execute("UPDATE coverage SET reason=replace(reason,?,?) WHERE feature=? AND status='pending'",
+                          ('declaration-site local-class receiver binding',
+                           'chained/generic declaration-site local-class receiver binding', parent))
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending'",
+                          ('; separate Java fixture checks direct nominal receiver declaration sites across '
+                           'later local shadows, including captures and method references; chained/generic '
+                           'receivers, same-line type sites and compiler-wide dispatch remain unresolved', parent))
 
 
 def exercise(binary, base):
@@ -152,7 +217,9 @@ def exercise(binary, base):
     (runner.root / '.git').mkdir()
     runner.environment['AST_INDEX_ROOT'] = str(runner.root)
     for name, source in SOURCES.items():
-        (runner.root / name).write_text(source)
+        path = runner.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
     (runner.root / 'Inventory.kt').write_text('// inventory only\n')
     (runner.root / 'descriptor.xml').write_text('<fixture/>\n')
     state = connect(runner.directory / 'inventory.sqlite')
@@ -182,6 +249,45 @@ def exercise(binary, base):
         expected[feature][key], actual[feature][key] = want, got
     runner.command('rebuild', '--force')
     runner.json('graph', 'build')
+    for name, target in RECEIVER_BINDINGS.items():
+        seed = 'invoke' if name == 'invoke' else 'fixture.ReceiverProbe.' + name
+        source = authored('ReceiverProbe.java', name)
+        wanted = [(target, 'scoped')]
+        if name == 'fieldCall':
+            wanted.append((('ReceiverProbe.java', 3, 'field'), 'local'))
+        elif name != 'invoke':
+            wanted.append((('ReceiverProbe.java', 23, 'Leaf') if name == 'local'
+                           else ('Leaf.java', 2, 'Leaf'), 'scoped'))
+        wanted.sort()
+        for limit in (0, 1, 100):
+            for ambiguous in (False, True):
+                doc = runner.json('graph', 'dependencies', seed, '--limit', limit,
+                                  *(['--include-ambiguous'] if ambiguous else []))
+                record(RECEIVERS, f'{name}:{limit}:{ambiguous}',
+                       {'matched': [source], 'total': len(wanted), 'count': min(limit, len(wanted)),
+                        'valid': True, 'complete': True},
+                       {'matched': [identity(row) for row in doc['matched']],
+                        'total': doc.get('pagination', {}).get('total'), 'count': len(doc['items']),
+                        'valid': len(set(edges(doc))) == len(doc['items']) and all(edge in wanted for edge in edges(doc)),
+                        'complete': limit < len(wanted) or edges(doc) == wanted})
+        qualifier = 'fixture.Leaf.marker' if target[0] == 'Leaf.java' else 'marker'
+        doc = runner.json('graph', 'path', seed, qualifier, '--max-depth', 1)
+        record(RECEIVERS, name + ':path', [(source, target)],
+               sorted(tuple(identity(hop['symbol']) for hop in hops) for hops in doc['items']))
+    doc = runner.json('graph', 'dependents', 'fixture.Leaf.marker', '--limit', 100)
+    record(RECEIVERS, 'package:reverse',
+           sorted(authored('ReceiverProbe.java', name) for name, target in RECEIVER_BINDINGS.items()
+                  if target[0] == 'Leaf.java'), sorted(identity(row['other']) for row in doc['items']))
+    # The scoped copy has one marker declaration. Later local types expose
+    # only decoy(), so lexical seeding cannot mask misbound receiver calls.
+    # Seven authored callers fit below the ten-neighbour renderer budget.
+    doc = runner.json('explore', 'marker', '--rwr', '--max-files', 100,
+                      cwd=runner.root / 'receiver-view')
+    record(RECEIVER_EXPLORE, 'marker:callers',
+           sorted(('receiver-view/ReceiverProbe.java', authored('ReceiverProbe.java', name)[1],
+                   'viewInvoke' if name == 'invoke' else 'fixture.receiverview.ReceiverProbe.' + name)
+                  for name, target in RECEIVER_BINDINGS.items() if target[0] == 'Leaf.java'),
+           sorted((row['path'], row['line'], row['name']) for row in doc['neighbours'] if row['link'] == 'caller'))
     for (file, name), bound in BINDINGS.items():
         for limit in (0, 1, 100):
             for ambiguous in (False, True):
@@ -217,6 +323,22 @@ def exercise(binary, base):
            sorted((row['path'], row['line'], row['name']) for row in doc['neighbours'] if row['link'] == 'caller'))
     doc = runner.json('graph', 'dependencies', 'same', '--include-ambiguous', '--limit', 100)
     record(MEMBERS, 'local-self-field', [(local_targets('Probe.java', 'self', ('Leaf',))[0], 'scoped')], edges(doc))
+    # The local receiver cannot borrow a package callable absent from its
+    # declared type. Validate rejection independently with the compiler.
+    receiver_guard = SOURCES['ReceiverProbe.java'].replace(
+        'class Leaf { int marker() { return 6; } }', 'class Leaf {}')
+    if receiver_guard == SOURCES['ReceiverProbe.java']:
+        raise ToolError('receiver member guard was not injected')
+    (runner.root / 'ReceiverProbe.java').write_text(receiver_guard)
+    if not compile_sources([runner.root / name for name in SOURCES], 'javac-receiver-negative'):
+        raise ToolError('javac accepted a receiver shadow member leak')
+    runner.command('rebuild', '--force')
+    runner.json('graph', 'build')
+    for ambiguous in (False, True):
+        doc = runner.json('graph', 'dependencies', 'fixture.ReceiverProbe.local', '--limit', 100,
+                          *(['--include-ambiguous'] if ambiguous else []))
+        record(RECEIVERS, f'missing-callable:{ambiguous}',
+               [(('ReceiverProbe.java', 23, 'Leaf'), 'scoped')], edges(doc))
     # Keep erroneous source separate from the positive javac fixture. The
     # index must retain the local type dependency without inventing Nested.
     changed = SOURCES['Probe.java'].replace('  return new Leaf();\n }\n}',
@@ -224,6 +346,7 @@ def exercise(binary, base):
     if changed == SOURCES['Probe.java']:
         raise ToolError('local shadow negative fixture was not injected')
     (runner.root / 'Probe.java').write_text(changed)
+    (runner.root / 'ReceiverProbe.java').write_text(SOURCES['ReceiverProbe.java'])
     if not compile_sources([runner.root / name for name in SOURCES], 'javac-shadow-negative'):
         raise ToolError('javac accepted an enclosing-member leak')
     runner.command('rebuild', '--force')

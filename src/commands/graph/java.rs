@@ -159,11 +159,21 @@ pub(super) enum JavaReceiver {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct ExpressionCall {
     pub receiver: JavaReceiver,
+    pub receiver_site: Option<ReceiverTypeSite>,
     /// A method reference has no invocation argument list.
     pub arguments: Option<usize>,
     pub reference_context: Option<JavaReceiver>,
     /// A syntax candidate; qualified names must still resolve as types, not fields.
     pub reference_type: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ReceiverTypeSite {
+    pub path: String,
+    pub line: i64,
+    pub owner: String,
+    pub owner_line: i64,
+    pub owner_ordinal: Option<usize>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -184,13 +194,18 @@ struct VariableBinding {
     declared: Option<String>,
     inferred: Option<JavaReceiver>,
     invocation_type: Option<String>,
+    site: Option<ReceiverTypeSite>,
 }
 
 type VariableScopes = HashMap<usize, HashMap<String, Vec<VariableBinding>>>;
 
 /// Temporary per-file lexical inventory, discarded after deriving calls.
 /// Index scopes once instead of rescanning every declaration for each call.
-fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
+fn variable_scopes(
+    root: Node<'_>,
+    source: &str,
+    declarations: &HashMap<usize, InvocationOwner>,
+) -> VariableScopes {
     let mut scopes = VariableScopes::new();
     walk_tree_preorder(&root, |declaration| {
         if declaration.kind() == "catch_formal_parameter" {
@@ -225,6 +240,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                         invocation_type: declared.clone(),
                         declared,
                         inferred: None,
+                        site: None,
                     });
             }
         }
@@ -253,6 +269,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                                 .then(|| type_name(ty, source))
                                 .flatten(),
                             inferred: generic_receiver(ty, declaration, source),
+                            site: receiver_type_site(ty, source, declarations),
                         });
                 }
             }
@@ -280,6 +297,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                             invocation_type: declared_invocation_type(ty, declaration, source),
                             declared: type_name(ty, source),
                             inferred: generic_receiver(ty, owner, source),
+                            site: receiver_type_site(ty, source, declarations),
                         });
                 }
             }
@@ -301,6 +319,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                             invocation_type: declared_invocation_type(ty, declaration, source),
                             declared: type_name(ty, source),
                             inferred: generic_receiver(ty, declaration, source),
+                            site: receiver_type_site(ty, source, declarations),
                         });
                 }
             }
@@ -323,6 +342,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                                 invocation_type: declared_invocation_type(*ty, declaration, source),
                                 declared: type_name(*ty, source),
                                 inferred: generic_receiver(*ty, scope, source),
+                                site: receiver_type_site(*ty, source, declarations),
                             });
                         break;
                     }
@@ -349,6 +369,9 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                         declared: declaration
                             .child_by_field_name("type")
                             .and_then(|ty| type_name(ty, source)),
+                        site: declaration
+                            .child_by_field_name("type")
+                            .and_then(|ty| receiver_type_site(ty, source, declarations)),
                         inferred: declaration
                             .child_by_field_name("type")
                             .and_then(|ty| generic_receiver(ty, declaration, source)),
@@ -377,6 +400,9 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                                 declared: component
                                     .child_by_field_name("type")
                                     .and_then(|ty| type_name(ty, source)),
+                                site: component
+                                    .child_by_field_name("type")
+                                    .and_then(|ty| receiver_type_site(ty, source, declarations)),
                                 inferred: component
                                     .child_by_field_name("type")
                                     .and_then(|ty| generic_receiver(ty, declaration, source)),
@@ -441,6 +467,9 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                     invocation_type: declared_invocation_type(declared_type, variable, source),
                     declared,
                     inferred: generic_receiver(declared_type, declaration, source),
+                    site: (!array_suffix)
+                        .then(|| receiver_type_site(declared_type, source, declarations))
+                        .flatten(),
                 });
         }
         WalkControl::Continue
@@ -494,6 +523,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                 variable.child_by_field_name("value"),
             ) {
                 let inferred = expression_receiver(value, owner, source, &scopes, 0);
+                let site = expression_receiver_site(value, source, &scopes, declarations);
                 let invocation_type = invocation_argument_type(value, owner, source, &scopes, 0);
                 for scope in scopes.values_mut() {
                     if let Some(bindings) = scope.get_mut(text(name, source)) {
@@ -502,6 +532,7 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                             .filter(|binding| binding.position == name.start_byte())
                         {
                             binding.inferred = Some(inferred.clone());
+                            binding.site = site.clone();
                             binding.invocation_type = invocation_type.clone();
                         }
                     }
@@ -601,6 +632,114 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
 
+/// Keep a nominal variable type in its declaring lexical scope. Generic and
+/// array receiver projection remains separate evidence.
+fn receiver_type_site(
+    ty: Node<'_>,
+    source: &str,
+    declarations: &HashMap<usize, InvocationOwner>,
+) -> Option<ReceiverTypeSite> {
+    if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+        return None;
+    }
+    if ty.parent().is_some_and(|declaration| {
+        let mut cursor = declaration.walk();
+        declaration.kind() == "spread_parameter"
+            || declaration
+                .named_children(&mut cursor)
+                .any(|node| node.kind() == "dimensions")
+    }) {
+        return None;
+    }
+    let path = type_name(ty, source)?;
+    if type_parameter(ty, path.split("::").next()?, source) || path == "var" {
+        return None;
+    }
+    let mut ancestor = ty.parent();
+    while let Some(owner) = ancestor {
+        if matches!(
+            owner.kind(),
+            "method_declaration"
+                | "constructor_declaration"
+                | "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) {
+            let name = owner.child_by_field_name("name")?;
+            return Some(ReceiverTypeSite {
+                path,
+                line: ty.start_position().row as i64 + 1,
+                owner: text(name, source).to_owned(),
+                owner_line: name.start_position().row as i64 + 1,
+                owner_ordinal: declarations.get(&owner.id()).map(|owner| owner.ordinal),
+            });
+        }
+        ancestor = owner.parent();
+    }
+    None
+}
+
+fn expression_receiver_site(
+    call: Node<'_>,
+    source: &str,
+    scopes: &VariableScopes,
+    declarations: &HashMap<usize, InvocationOwner>,
+) -> Option<ReceiverTypeSite> {
+    let (name, fields_only) = match call.kind() {
+        "identifier" => (text(call, source), false),
+        "field_access"
+            if call
+                .child_by_field_name("object")
+                .is_some_and(|node| node.kind() == "this") =>
+        {
+            (text(call.child_by_field_name("field")?, source), true)
+        }
+        "object_creation_expression" | "cast_expression" => {
+            return receiver_type_site(call.child_by_field_name("type")?, source, declarations)
+        }
+        "parenthesized_expression" => {
+            return expression_receiver_site(call.named_child(0)?, source, scopes, declarations)
+        }
+        _ => return None,
+    };
+    let mut ancestor = Some(call);
+    let mut fields_blocked = false;
+    while let Some(node) = ancestor {
+        // An untyped lambda binding must not borrow an outer variable's site.
+        if !fields_only && node.kind() == "lambda_expression" {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                let mut shadowed = false;
+                walk_tree_preorder(&parameters, |binding| {
+                    shadowed |= binding.kind() == "identifier" && text(binding, source) == name;
+                    WalkControl::Continue
+                });
+                if shadowed {
+                    return None;
+                }
+            }
+        }
+        if let Some(bindings) = scopes.get(&node.id()).and_then(|scope| scope.get(name)) {
+            if let Some(binding) = bindings
+                .iter()
+                .filter(|binding| {
+                    (!fields_only || binding.field)
+                        && (!fields_blocked || !binding.field)
+                        && (binding.field || binding.position < call.start_byte())
+                })
+                .max_by_key(|binding| binding.position)
+            {
+                return binding.site.clone();
+            }
+        }
+        if blocks_enclosing_fields(node, source) {
+            fields_blocked = true;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
 fn type_name(node: Node<'_>, source: &str) -> Option<String> {
     if matches!(
         node.kind(),
@@ -650,10 +789,9 @@ fn callable(mut node: Node<'_>) -> Option<Node<'_>> {
 }
 
 /// Retain source-order callable identities instead of breaking line-range ties.
-fn invocation_owners(root: Node<'_>, source: &str) -> HashMap<(i64, String), Vec<InvocationOwner>> {
+fn callable_declarations(root: Node<'_>, source: &str) -> HashMap<usize, InvocationOwner> {
     let mut declarations = HashMap::new();
     let mut ordinals: HashMap<(String, i64), usize> = HashMap::new();
-    let mut sites: HashMap<(i64, String), Vec<InvocationOwner>> = HashMap::new();
     walk_tree_preorder(&root, |node| {
         if matches!(
             node.kind(),
@@ -677,6 +815,19 @@ fn invocation_owners(root: Node<'_>, source: &str) -> HashMap<(i64, String), Vec
                 *next += 1;
             }
         }
+        WalkControl::Continue
+    });
+    declarations
+}
+
+/// Attribute invocations with the same callable identities as receiver sites.
+fn invocation_owners(
+    root: Node<'_>,
+    source: &str,
+    declarations: &HashMap<usize, InvocationOwner>,
+) -> HashMap<(i64, String), Vec<InvocationOwner>> {
+    let mut sites: HashMap<(i64, String), Vec<InvocationOwner>> = HashMap::new();
+    walk_tree_preorder(&root, |node| {
         if node.has_error() {
             return WalkControl::Continue;
         }
@@ -2076,9 +2227,10 @@ fn collector_projection(
 impl JavaSource {
     pub fn parse(source: &str) -> Result<Self> {
         let tree = parse_tree(source, &LANGUAGE)?;
-        let scopes = variable_scopes(tree.root_node(), source);
+        let declarations = callable_declarations(tree.root_node(), source);
+        let scopes = variable_scopes(tree.root_node(), source, &declarations);
         let mut result = Self {
-            invocation_owners: invocation_owners(tree.root_node(), source),
+            invocation_owners: invocation_owners(tree.root_node(), source, &declarations),
             ..Self::default()
         };
         let mut cursor = tree.root_node().walk();
@@ -3163,6 +3315,7 @@ impl JavaSource {
             if let Some(object) = object {
                 let call = Some(ExpressionCall {
                     receiver: expression_receiver(object, owner, source, &scopes, 0),
+                    receiver_site: expression_receiver_site(object, source, &scopes, &declarations),
                     arguments: if reference {
                         None
                     } else {

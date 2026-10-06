@@ -223,6 +223,11 @@ def exercise(binary, base):
             ('same-line-methods', 'class Caller {\n void decoy() {}'
                                   ' void step(int n) { new Target().leaf(); }\n}\n',
              'new Caller().step(1)', 'new Caller().decoy()', 5, 8),
+            ('same-line-declared-receiver', 'class Caller {\n void step(String s) {}'
+                                           ' void step(Target input) {\n'
+                                           '  class Target { void decoy() {} }\n'
+                                           '  input.leaf();\n }\n}\n',
+             'new Caller().step(new Target())', 'new Caller().step("wrong")', 5, 11),
             ('same-line-constructors-reversed', 'class Caller {\n Caller(String s) {}'
                                                 ' Caller(int n) { new Target().leaf(); }\n}\n',
              'new Caller(1)', 'new Caller("wrong")', 5, 8)):
