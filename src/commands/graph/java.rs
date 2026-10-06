@@ -177,6 +177,120 @@ struct VariableBinding {
 
 type VariableScopes = HashMap<usize, HashMap<String, Vec<VariableBinding>>>;
 
+/// Check where a pattern is definitely matched, without lending its type to
+/// the opposite branch or to expressions evaluated before the match.
+fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(Node<'a>, usize)> {
+    let mut scopes = Vec::new();
+    let mut expression = pattern;
+    let (mut on_true, mut on_false) = (true, false);
+    let position = pattern.end_byte();
+    while let Some(parent) = expression.parent() {
+        match parent.kind() {
+            "parenthesized_expression" => {}
+            "unary_expression"
+                if parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| text(op, source) == "!") =>
+            {
+                std::mem::swap(&mut on_true, &mut on_false);
+            }
+            "binary_expression" => {
+                let operator = parent.child_by_field_name("operator");
+                let operator = operator.map(|op| text(op, source)).unwrap_or_default();
+                if !matches!(operator, "&&" | "||") {
+                    break;
+                }
+                if parent
+                    .child_by_field_name("left")
+                    .is_some_and(|left| left.id() == expression.id())
+                    && ((operator == "&&" && on_true) || (operator == "||" && on_false))
+                {
+                    if let Some(right) = parent.child_by_field_name("right") {
+                        scopes.push((right, position));
+                    }
+                }
+                // A conjunction can be false without evaluating the pattern;
+                // a disjunction can be true without matching it.
+                if operator == "&&" {
+                    on_false = false;
+                } else {
+                    on_true = false;
+                }
+            }
+            "ternary_expression" | "if_statement" => {
+                if !parent
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| condition.id() == expression.id())
+                {
+                    break;
+                }
+                let consequence = parent.child_by_field_name("consequence");
+                let alternative = parent.child_by_field_name("alternative");
+                for (branch, matched) in [(consequence, on_true), (alternative, on_false)] {
+                    if matched {
+                        scopes.extend(branch.map(|branch| (branch, position)));
+                    }
+                }
+                if parent.kind() == "if_statement" {
+                    let terminal = |branch: Option<Node<'_>>| {
+                        branch
+                            .and_then(|branch| {
+                                if branch.kind() == "block" {
+                                    branch.named_child(
+                                        branch.named_child_count().saturating_sub(1) as u32
+                                    )
+                                } else {
+                                    Some(branch)
+                                }
+                            })
+                            .is_some_and(|node| {
+                                matches!(node.kind(), "return_statement" | "throw_statement")
+                            })
+                    };
+                    // Retain simple abrupt guards. General reachability,
+                    // labelled breaks and loop-exit flow need more evidence.
+                    if (on_false && terminal(consequence) && alternative.is_none())
+                        || (on_true && terminal(alternative) && !terminal(consequence))
+                    {
+                        if let Some(block) = parent
+                            .parent()
+                            .filter(|node| matches!(node.kind(), "block" | "constructor_body"))
+                        {
+                            scopes.push((block, parent.end_byte()));
+                        }
+                    }
+                }
+                break;
+            }
+            "while_statement" | "for_statement" => {
+                if on_true
+                    && parent
+                        .child_by_field_name("condition")
+                        .is_some_and(|condition| condition.id() == expression.id())
+                {
+                    scopes.extend(
+                        parent
+                            .child_by_field_name("body")
+                            .map(|body| (body, position)),
+                    );
+                    if parent.kind() == "for_statement" {
+                        let mut cursor = parent.walk();
+                        scopes.extend(
+                            parent
+                                .children_by_field_name("update", &mut cursor)
+                                .map(|update| (update, position)),
+                        );
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+        expression = parent;
+    }
+    scopes
+}
+
 /// Temporary per-file lexical inventory, discarded after deriving calls.
 /// Index scopes once instead of rescanning every declaration for each call.
 fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
@@ -278,94 +392,19 @@ fn variable_scopes(root: Node<'_>, source: &str) -> VariableScopes {
                 declaration.child_by_field_name("name"),
                 declaration.child_by_field_name("right"),
             ) {
-                let mut ancestor = declaration.parent();
-                let mut negated = false;
-                while let Some(parent) = ancestor {
-                    if parent.kind() == "if_statement" {
-                        if let Some(condition) = parent.child_by_field_name("condition") {
-                            if condition.start_byte() <= declaration.start_byte()
-                                && declaration.end_byte() <= condition.end_byte()
-                            {
-                                let mut flow_scopes = Vec::new();
-                                let mut position = name.start_byte();
-                                if negated {
-                                    if let Some(consequence) =
-                                        parent.child_by_field_name("consequence")
-                                    {
-                                        let terminal = if consequence.kind() == "block" {
-                                            consequence.named_child(
-                                                consequence.named_child_count().saturating_sub(1)
-                                                    as u32,
-                                            )
-                                        } else {
-                                            Some(consequence)
-                                        };
-                                        if parent.child_by_field_name("alternative").is_none()
-                                            && terminal.is_some_and(|node| {
-                                                matches!(
-                                                    node.kind(),
-                                                    "return_statement" | "throw_statement"
-                                                )
-                                            })
-                                        {
-                                            if let Some(block) = parent.parent().filter(|node| {
-                                                matches!(node.kind(), "block" | "constructor_body")
-                                            }) {
-                                                flow_scopes.push(block);
-                                                position = parent.end_byte();
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    flow_scopes.extend(
-                                        [
-                                            Some(condition),
-                                            parent.child_by_field_name("consequence"),
-                                        ]
-                                        .into_iter()
-                                        .flatten(),
-                                    );
-                                }
-                                for scope in flow_scopes {
-                                    scopes
-                                        .entry(scope.id())
-                                        .or_default()
-                                        .entry(text(name, source).to_owned())
-                                        .or_default()
-                                        .push(VariableBinding {
-                                            position,
-                                            field: false,
-                                            invocation_type: declared_invocation_type(
-                                                ty,
-                                                declaration,
-                                                source,
-                                            ),
-                                            declared: type_name(ty, source),
-                                            inferred: generic_receiver(ty, parent, source),
-                                        });
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    if parent.kind() == "unary_expression"
-                        && !negated
-                        && parent
-                            .child_by_field_name("operator")
-                            .is_some_and(|node| text(node, source) == "!")
-                    {
-                        negated = true;
-                    } else if parent.kind() == "binary_expression" {
-                        if !parent
-                            .child_by_field_name("operator")
-                            .is_some_and(|op| text(op, source) == if negated { "||" } else { "&&" })
-                        {
-                            break;
-                        }
-                    } else if parent.kind() != "parenthesized_expression" {
-                        break;
-                    }
-                    ancestor = parent.parent();
+                for (scope, position) in pattern_flow_scopes(declaration, source) {
+                    scopes
+                        .entry(scope.id())
+                        .or_default()
+                        .entry(text(name, source).to_owned())
+                        .or_default()
+                        .push(VariableBinding {
+                            position,
+                            field: false,
+                            invocation_type: declared_invocation_type(ty, declaration, source),
+                            declared: type_name(ty, source),
+                            inferred: generic_receiver(ty, declaration, source),
+                        });
                 }
             }
         }
@@ -605,7 +644,7 @@ fn variable_inferred<'a>(
     scopes: &'a VariableScopes,
     source: &str,
 ) -> Option<&'a JavaReceiver> {
-    let mut ancestor = call.parent();
+    let mut ancestor = Some(call);
     let mut fields_blocked = false;
     while let Some(node) = ancestor {
         if let Some(bindings) = scopes.get(&node.id()).and_then(|scope| scope.get(name)) {
@@ -636,7 +675,7 @@ fn variable_type<'a>(
     scopes: &'a VariableScopes,
     source: &str,
 ) -> Option<Option<&'a str>> {
-    let mut ancestor = call.parent();
+    let mut ancestor = Some(call);
     let mut fields_blocked = false;
     while let Some(node) = ancestor {
         if let Some(bindings) = scopes.get(&node.id()).and_then(|scope| scope.get(name)) {
@@ -1183,7 +1222,7 @@ fn variable_invocation_type(
     scopes: &VariableScopes,
     source: &str,
 ) -> Option<Option<String>> {
-    let mut ancestor = call.parent();
+    let mut ancestor = Some(call);
     let mut fields_blocked = false;
     while let Some(node) = ancestor {
         if !fields_only && node.kind() == "lambda_expression" {
