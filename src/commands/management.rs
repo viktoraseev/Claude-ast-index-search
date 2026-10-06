@@ -586,12 +586,6 @@ fn rebuild_index(
             [],
         )
         .ok();
-        lifecycle_progress!(
-            "{}",
-            "Persisted --force opt-in for this project. Future `rebuild` runs \
-             will not hit the candidate-file cap on this root."
-                .green()
-        );
     }
     db::set_experimental_fast_rebuild_enabled(&conn, experimental_fast_rebuild).ok();
 
@@ -604,6 +598,9 @@ fn rebuild_index(
     let mut is_ios = indexer::has_ios_markers(root);
     let mut is_android = indexer::has_android_markers(root);
 
+    // A staged generation is not the published index. Retain the terminal
+    // summary until sealing and the publication handoff have both succeeded.
+    let summary;
     match index_type {
         "all" => {
             lifecycle_progress!("{}", "Rebuilding full index...".cyan());
@@ -667,7 +664,7 @@ fn rebuild_index(
                     lifecycle_progress!(
                         "{}",
                         format!(
-                            "Indexed {} files from extra root: {}",
+                            "Staged {} files from extra root: {}",
                             extra_walk.file_count, extra_root
                         )
                         .dimmed()
@@ -831,43 +828,29 @@ fn rebuild_index(
                 }
             }
 
-            // Print summary based on which platform-specific indexes ran.
+            // Choose the summary based on which platform-specific indexes ran.
             finalize_rebuild_schema(&conn, verbose)?;
 
             if is_android && is_ios {
-                lifecycle_progress!(
-                    "{}",
-                    format!(
+                summary = format!(
                         "Indexed {} files, {} modules, {} deps, {} XML usages, {} resources, {} storyboard usages, {} assets",
                         file_count, module_count, dep_count, xml_count, res_count, sb_count, asset_count
-                    ).green()
-                );
+                    );
             } else if is_ios {
-                lifecycle_progress!(
-                    "{}",
-                    format!(
-                        "Indexed {} files, {} modules, {} storyboard usages, {} assets ({} usages)",
-                        file_count, module_count, sb_count, asset_count, asset_usage_count
-                    )
-                    .green()
+                summary = format!(
+                    "Indexed {} files, {} modules, {} storyboard usages, {} assets ({} usages)",
+                    file_count, module_count, sb_count, asset_count, asset_usage_count
                 );
             } else if dts_count > 0 {
-                lifecycle_progress!(
-                    "{}",
-                    format!(
-                        "Indexed {} files (+{} .d.ts), {} modules, {} deps",
-                        file_count, dts_count, module_count, dep_count
-                    )
-                    .green()
+                summary = format!(
+                    "Indexed {} files (+{} .d.ts), {} modules, {} deps",
+                    file_count, dts_count, module_count, dep_count
                 );
             } else {
-                lifecycle_progress!(
-                    "{}",
-                    format!(
+                summary = format!(
                         "Indexed {} files, {} modules, {} deps, {} transitive, {} XML usages, {} resources ({} usages)",
                         file_count, module_count, dep_count, trans_count, xml_count, res_count, res_usage_count
-                    ).green()
-                );
+                    );
             }
         }
         "files" | "symbols" => {
@@ -883,7 +866,7 @@ fn rebuild_index(
                 config_exclude.as_deref(),
             )?;
             finalize_rebuild_schema(&conn, verbose)?;
-            lifecycle_progress!("{}", format!("Indexed {} files", walk.file_count).green());
+            summary = format!("Indexed {} files", walk.file_count);
         }
         "modules" => {
             lifecycle_progress!("{}", "Rebuilding modules index...".cyan());
@@ -916,17 +899,13 @@ fn rebuild_index(
                 let dep_count =
                     indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
                 finalize_rebuild_schema(&conn, verbose)?;
-                lifecycle_progress!(
-                    "{}",
-                    format!(
-                        "Indexed {} modules, {} dependencies",
-                        module_count, dep_count
-                    )
-                    .green()
+                summary = format!(
+                    "Indexed {} modules, {} dependencies",
+                    module_count, dep_count
                 );
             } else {
                 finalize_rebuild_schema(&conn, verbose)?;
-                lifecycle_progress!("{}", format!("Indexed {} modules", module_count).green());
+                summary = format!("Indexed {} modules", module_count);
             }
         }
         "deps" => {
@@ -935,10 +914,10 @@ fn rebuild_index(
             let dep_count =
                 indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
             finalize_rebuild_schema(&conn, verbose)?;
-            lifecycle_progress!("{}", format!("Indexed {} dependencies", dep_count).green());
+            summary = format!("Indexed {} dependencies", dep_count);
         }
         _ => {
-            lifecycle_progress!("{}", format!("Unknown index type: {}", index_type).red());
+            anyhow::bail!("Unknown index type: {}", index_type);
         }
     }
 
@@ -963,6 +942,15 @@ fn rebuild_index(
     db::seal_staged_db(conn, staged.db_path())?;
     let publication = db::acquire_index_publication_guard(root)?;
     publication.install_staged(staged.db_path())?;
+    lifecycle_progress!("{}", summary.green());
+    if std::env::var("AST_INDEX_REMEMBER_BYPASS").is_ok() {
+        lifecycle_progress!(
+            "{}",
+            "Persisted --force opt-in for this project. Future `rebuild` runs \
+             will not hit the candidate-file cap on this root."
+                .green()
+        );
+    }
     Ok(true)
 }
 
@@ -1204,7 +1192,7 @@ fn cmd_rebuild_sub_projects(
         lifecycle_progress!(
             "{}",
             format!(
-                "Indexed {} files from extra root: {}",
+                "Staged {} files from extra root: {}",
                 extra_walk.file_count, extra_root
             )
             .dimmed()
@@ -1293,14 +1281,6 @@ fn cmd_rebuild_sub_projects(
     db::mark_index_updated(&conn)?;
     db::mark_modules_indexed(&conn)?;
 
-    lifecycle_progress!();
-    lifecycle_progress!(
-        "{}",
-        format!(
-            "Done: {} sub-projects indexed ({} files, {} modules, {} deps, {} transitive), {} failed",
-            success_count, total_files, module_count, dep_count, trans_count, fail_count
-        ).green()
-    );
     carry_git_history(&conn, root, verbose)?;
     if verbose {
         eprintln!("{}", format!("Total time: {:?}", start.elapsed()).dimmed());
@@ -1309,6 +1289,14 @@ fn cmd_rebuild_sub_projects(
     db::seal_staged_db(conn, staged.db_path())?;
     let publication = db::acquire_index_publication_guard(root)?;
     publication.install_staged(staged.db_path())?;
+    lifecycle_progress!();
+    lifecycle_progress!(
+        "{}",
+        format!(
+            "Done: {} sub-projects indexed ({} files, {} modules, {} deps, {} transitive), {} failed",
+            success_count, total_files, module_count, dep_count, trans_count, fail_count
+        ).green()
+    );
     Ok(true)
 }
 
