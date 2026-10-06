@@ -754,11 +754,7 @@ struct StatusReport {
 }
 
 pub fn cmd_graph_build(root: &Path, verbose: bool, format: &str) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
     let mut conn = db::open_db_leased(root)?;
@@ -772,11 +768,7 @@ pub fn cmd_graph_build(root: &Path, verbose: bool, format: &str) -> Result<()> {
 }
 
 pub fn cmd_graph_status(root: &Path, format: &str) -> Result<()> {
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
     let conn = db::open_db_leased(root)?;

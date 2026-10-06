@@ -88,6 +88,7 @@ import project_format_contracts
 import module_scope_contracts
 import module_root_contracts
 import module_alias_contracts
+import selector_error_contracts
 import graph_root_contracts
 import graph_directory_contracts
 import graph_ambiguity_contracts
@@ -563,6 +564,7 @@ class Fixture:
         self._module_scope_results = None
         self._module_root_results = None
         self._module_alias_results = None
+        self._selector_error_results = None
         self._graph_root_results = None
         self._graph_directory_results = None
         self._graph_ambiguity_results = None
@@ -1986,6 +1988,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def selector_error_check(self, check: sqlite3.Row):
+        if self._selector_error_results is None:
+            self._selector_error_results = selector_error_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._selector_error_results)
+        return {'source': selector_error_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def project_format_check(self, check: sqlite3.Row):
         if self._project_format_results is None:
             self._project_format_results = project_format_contracts.exercise(self.binary, self.database.parent)
@@ -2193,6 +2203,8 @@ class Fixture:
                 handler = self.mutation_format_check
             if check['feature'] in project_format_contracts.FEATURES:
                 handler = self.project_format_check
+            if check['feature'] in selector_error_contracts.FEATURES:
+                handler = self.selector_error_check
             if check['feature'] in management_format_contracts.FEATURES:
                 handler = self.management_format_check
             if check['feature'] in graph_root_contracts.FEATURES:
@@ -2334,6 +2346,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(module_scope_contracts.FEATURES)
     features.update(module_root_contracts.FEATURES)
     features.update(module_alias_contracts.FEATURES)
+    features.update(selector_error_contracts.FEATURES)
     features.update(graph_root_contracts.FEATURES)
     features.update(graph_directory_contracts.FEATURES)
     features.update(graph_ambiguity_contracts.FEATURES)
@@ -2506,6 +2519,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     project_format_contracts.plan_formats(state, root)
     graph_ambiguity_contracts.plan_contracts(state, root)
     module_alias_contracts.plan_aliases(state, root)
+    selector_error_contracts.plan_errors(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

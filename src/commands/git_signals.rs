@@ -2070,11 +2070,7 @@ pub fn cmd_hotspots(
     if !SORT_KEYS.contains(&sort) {
         bail!("--sort must be one of: {}", SORT_KEYS.join(", "));
     }
-    if !db::db_exists(root) {
-        println!(
-            "{}",
-            "Index not found. Run 'ast-index rebuild' first.".red()
-        );
+    if !super::index_available(root, format)? {
         return Ok(());
     }
 

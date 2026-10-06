@@ -1054,6 +1054,12 @@ enum GraphAction {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Validate the shared scope conflict before command-specific guards or
+    // discovery, so every command preserves the same diagnostic and exit code.
+    if cli.subtree.is_some() && cli.local {
+        eprintln!("Error: --subtree and --local are mutually exclusive.");
+        std::process::exit(2);
+    }
     // Reject unsupported diagram formats before cache discovery or mutation.
     if matches!(cli.format.as_str(), "mermaid" | "dot")
         && !matches!(&cli.command, Commands::ModuleRoute { .. })
@@ -1092,12 +1098,6 @@ fn main() -> Result<()> {
             "--subtree/--local do not apply to 'graph build' or 'graph status': \
              the graph always spans every indexed root; pass them to graph queries instead"
         ));
-    }
-    // Conflict guard: --subtree and --local both narrow the workspace, but
-    // they narrow it differently, so combining them is meaningless.
-    if cli.subtree.is_some() && cli.local {
-        eprintln!("Error: --subtree and --local are mutually exclusive.");
-        std::process::exit(2);
     }
     if let Some(name) = &cli.subtree {
         std::env::set_var("AST_INDEX_SUBTREE", name);
