@@ -99,7 +99,7 @@ fn module_display_path(
     Ok(raw)
 }
 
-/// Exact names take precedence; path aliases must identify one selected owner.
+/// Exact names take precedence; aliases must identify one selected owner.
 fn selected_module(conn: &Connection, root: &Path, query: &str) -> Result<Option<(i64, String)>> {
     let exact = conn
         .query_row(
@@ -111,10 +111,31 @@ fn selected_module(conn: &Connection, root: &Path, query: &str) -> Result<Option
     if exact.is_some() {
         return Ok(exact);
     }
+    // An excluded exact name still belongs to its indexed owner. Reusing it
+    // as shorthand would redirect an explicitly selected module across roots.
+    let excluded_exact: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.modules WHERE name=?1)",
+        params![query],
+        |row| row.get(0),
+    )?;
+    if excluded_exact {
+        return Ok(None);
+    }
+    let (namespace, alias) = query
+        .split_once("::")
+        .filter(|(namespace, _)| !namespace.is_empty() && !Path::new(query).is_absolute())
+        .map_or((None, query), |(namespace, alias)| (Some(namespace), alias));
+    let normalized = alias
+        .trim_start_matches(':')
+        .replace(':', ".")
+        .replace('/', ".");
     let mut stmt = conn.prepare("SELECT id,name,path,root_path FROM modules ORDER BY name")?;
     let mut rows = stmt.query([])?;
     let mut selected = None;
+    let mut normalized_selected = None;
+    let mut normalized_ambiguous = false;
     while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
         let path: String = row.get(2)?;
         let owner: String = row.get(3)?;
         let absolute = if owner.is_empty() {
@@ -122,32 +143,39 @@ fn selected_module(conn: &Connection, root: &Path, query: &str) -> Result<Option
         } else {
             Path::new(&owner).join(&path)
         };
-        if query == path || query == absolute.to_string_lossy() {
+        let (module_namespace, local_name) = name
+            .split_once("::")
+            .map_or((None, name.as_str()), |(namespace, local_name)| {
+                (Some(namespace), local_name)
+            });
+        // A normalized alias is still owner-ambiguous, even when one of its
+        // candidates happens to have an unqualified primary-root name.
+        let matches_namespace =
+            namespace.is_none_or(|namespace| Some(namespace) == module_namespace);
+        let matches_path = matches_namespace && alias == path;
+        if (namespace.is_none() && query == absolute.to_string_lossy()) || matches_path {
             anyhow::ensure!(
                 selected.is_none(),
-                "Ambiguous module path; use a qualified module name"
+                "Ambiguous module alias; use a qualified module name"
             );
-            selected = Some((row.get(0)?, row.get(1)?));
+            selected = Some((row.get(0)?, name.clone()));
+        }
+        if !Path::new(alias).is_absolute()
+            && matches_namespace
+            && (normalized == local_name || normalized == path.replace('/', "."))
+        {
+            normalized_ambiguous |= normalized_selected.is_some();
+            normalized_selected = Some((row.get(0)?, name));
         }
     }
-    if selected.is_none() {
-        let normalized = if query.contains("::") {
-            query.replace('/', ".")
-        } else {
-            query
-                .trim_start_matches(':')
-                .replace(':', ".")
-                .replace('/', ".")
-        };
-        selected = conn
-            .query_row(
-                "SELECT id,name FROM modules WHERE name=?1",
-                params![normalized],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+    if selected.is_some() {
+        return Ok(selected);
     }
-    Ok(selected)
+    anyhow::ensure!(
+        !normalized_ambiguous,
+        "Ambiguous module alias; use a qualified module name"
+    );
+    Ok(normalized_selected)
 }
 
 fn module_location(conn: &Connection, name: &str) -> Result<(String, String)> {
