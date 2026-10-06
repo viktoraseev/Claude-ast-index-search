@@ -2209,18 +2209,10 @@ pub fn cmd_query(root: &Path, sql: &str, limit: usize) -> Result<()> {
     if !upper.starts_with("SELECT") && !upper.starts_with("WITH") && !upper.starts_with("EXPLAIN") {
         anyhow::bail!("Only SELECT, WITH, and EXPLAIN queries are allowed");
     }
-    // Block dangerous patterns
-    for keyword in &[
-        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "ATTACH", "DETACH", "PRAGMA",
-    ] {
-        // Check that these keywords appear as statements, not inside strings
-        if upper.contains(&format!(" {} ", keyword)) || upper.starts_with(&format!("{} ", keyword))
-        {
-            anyhow::bail!("Mutation queries are not allowed (found {})", keyword);
-        }
-    }
-
     let conn = db::open_db_leased(root)?;
+    // SQLite, rather than whitespace-sensitive keyword matching, determines
+    // whether a CTE writes. This connection is never used for index mutations.
+    conn.pragma_update(None, "query_only", true)?;
 
     // Apply LIMIT if not already in query
     let query = if !upper.contains("LIMIT") {
@@ -2230,6 +2222,10 @@ pub fn cmd_query(root: &Path, sql: &str, limit: usize) -> Result<()> {
     };
 
     let mut stmt = conn.prepare(&query)?;
+    anyhow::ensure!(
+        stmt.readonly() || upper.starts_with("EXPLAIN"),
+        "Mutation queries are not allowed"
+    );
     let column_count = stmt.column_count();
     let column_names: Vec<String> = (0..column_count)
         .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
@@ -2297,13 +2293,13 @@ pub fn cmd_schema(root: &Path) -> Result<()> {
 
     let tables: Vec<String> = stmt
         .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
 
     let mut schema = serde_json::Map::new();
 
     for table in &tables {
-        let mut cols_stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let identifier = format!("\"{}\"", table.replace('"', "\"\""));
+        let mut cols_stmt = conn.prepare(&format!("PRAGMA table_info({})", identifier))?;
         let columns: Vec<serde_json::Value> = cols_stmt
             .query_map([], |row| {
                 let name: String = row.get(1)?;
@@ -2317,15 +2313,13 @@ pub fn cmd_schema(root: &Path) -> Result<()> {
                     "primary_key": pk,
                 }))
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<rusqlite::Result<_>>()?;
 
         // Get row count
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+        let count: i64 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM {}", identifier), [], |row| {
                 row.get(0)
-            })
-            .unwrap_or(0);
+            })?;
 
         schema.insert(
             table.clone(),

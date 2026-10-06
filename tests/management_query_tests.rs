@@ -124,6 +124,75 @@ fn cmd_query_rejects_pragma() {
     assert!(err.to_string().to_uppercase().contains("ALLOWED"));
 }
 
+#[test]
+fn cmd_query_cte_writes_are_rejected_by_sqlite_without_changing_java_rows() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let database = dir.path().join("index.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    db::init_db(&conn).unwrap();
+    db::upsert_file(&conn, "Probe.java", 0, 100).unwrap();
+    drop(conn);
+
+    for sql in [
+        "WITH x AS (SELECT 1) DELETE\nFROM files RETURNING path /* LIMIT */",
+        "WITH x AS (SELECT 1) UPDATE/*gap*/files SET size=0 RETURNING path /* LIMIT */",
+        "WITH x AS (SELECT 1) INSERT\nINTO files(path,mtime,size) VALUES('Lost.java',0,1) RETURNING path /* LIMIT */",
+    ] {
+        let output = artifact_query(dir.path(), &database, sql);
+        assert!(!output.status.success(), "CTE writes must be rejected");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not allowed"));
+    }
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let rows: Vec<(String, i64)> = conn
+        .prepare("SELECT path,size FROM files ORDER BY path")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, vec![("Probe.java".into(), 100)]);
+}
+
+#[test]
+fn cmd_query_sql_keywords_in_data_and_explain_do_not_write() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let database = dir.path().join("index.sqlite");
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    db::init_db(&conn).unwrap();
+    drop(conn);
+    for sql in [
+        "SELECT ' DROP table ' AS text",
+        "EXPLAIN WITH x AS (SELECT 1) DELETE\nFROM files /* LIMIT */",
+    ] {
+        let output = artifact_query(dir.path(), &database, sql);
+        assert!(output.status.success(), "read-only SQL must be accepted");
+        assert!(output.stderr.is_empty());
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(!document["rows"].as_array().unwrap().is_empty());
+    }
+}
+
+fn artifact_query(
+    root: &std::path::Path,
+    database: &std::path::Path,
+    sql: &str,
+) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ast-index"))
+        .current_dir(root)
+        .env("AST_INDEX_ROOT", root)
+        .env("AST_INDEX_DB_PATH", database)
+        .env("AST_INDEX_CACHE_DIR", root.join("cache"))
+        .env("AST_INDEX_DISABLE_GC", "1")
+        .args(["--format", "json", "query", sql])
+        .output()
+        .unwrap()
+}
+
 // ----------------------------------------------------------------------
 // cmd_add_root / cmd_remove_root / cmd_list_roots
 // ----------------------------------------------------------------------
