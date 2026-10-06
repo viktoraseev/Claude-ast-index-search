@@ -3,12 +3,14 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import Mock, patch
 
 from audit import Fixture, SCHEMA, plan, required_features
 from common import ToolError, adapter_digest, connect
 import java_receiver_contracts as receivers
+from root_contracts import Runner
 
 
 class ReceiverContractsTests(unittest.TestCase):
@@ -81,6 +83,31 @@ class ReceiverContractsTests(unittest.TestCase):
         for doc in ({}, {'error': 'unbuilt graph', 'items': []}, {'items': [{'other': {}}]}):
             with self.assertRaises(ToolError):
                 receivers.call_edges(doc)
+
+    def test_same_line_zero_argument_calls_have_two_compiler_valid_targets(self):
+        runner = Runner(self.binary, self.directory / 'distinct-sites')
+        runner.root.mkdir(parents=True)
+        sources = []
+        for relative in ('a/Leaf.java', 'b/Leaf.java', 'local/Probe.java'):
+            source = runner.root / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            content = receivers.SOURCES[relative]
+            if relative == 'local/Probe.java':
+                line = receivers.SOURCE_IDS['fixture.local.Probe.collision'][1]
+                content = ('package fixture.local;\nimport fixture.a.Leaf;\nclass Probe {\n'
+                           + content.splitlines()[line - 1] + '\n}\n')
+            source.write_text(content)
+            sources.append(str(source))
+        with (runner.directory / 'javac.log').open('wb') as log:
+            result = subprocess.run(['javac', '-proc:none', '-d', str(runner.directory / 'classes'),
+                                     *sources], stdout=log, stderr=log, timeout=30)
+        self.assertEqual(result.returncode, 0)
+        runner.command('rebuild', '--force')
+        runner.command('graph', 'build')
+        want = [(('a/Leaf.java', 3, 'ping'), 'scoped'), (('b/Leaf.java', 3, 'ping'), 'scoped')]
+        for flags in ((), ('--include-ambiguous',)):
+            self.assertEqual(receivers.call_edges(runner.json(
+                'graph', 'dependencies', 'fixture.local.Probe.collision', *flags)), want)
 
     def test_contract_changes_invalidate_evidence(self):
         before = adapter_digest()

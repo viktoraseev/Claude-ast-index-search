@@ -202,13 +202,18 @@ def exercise(binary, base):
                    [tuple(identity(hop.get('symbol', {})) for hop in hops)
                     for hops in overlap.get('items', [])])
     for seed in GUARDS:
+        # Distinct zero-argument sites retain both declared receivers. The row
+        # collision is not Java ambiguity; do not erase its proven call edges.
+        scoped = [(('a/Leaf.java', 3, 'ping'), 'scoped'),
+                  (('b/Leaf.java', 3, 'ping'), 'scoped')] \
+            if seed == 'fixture.local.Probe.collision' else []
         doc = runner.json('graph', 'dependencies', seed)
         record('graph:java-receiver-guards', seed,
-               {'matched': [SOURCE_IDS[seed]], 'calls': []},
+               {'matched': [SOURCE_IDS[seed]], 'calls': scoped},
                {'matched': [identity(row) for row in doc['matched']], 'calls': call_edges(doc)})
         doc = runner.json('graph', 'dependencies', seed, '--include-ambiguous')
         wanted = [(('overload/Leaf.java', line, 'ping'), 'ambiguous') for line in (3, 4)] \
-            if seed == 'fixture.overload.Leaf.unresolved' else []
+            if seed == 'fixture.overload.Leaf.unresolved' else scoped
         record('graph:java-receiver-guards', seed + ':ambiguous-page',
                {'matched': [SOURCE_IDS[seed]], 'calls': wanted},
                {'matched': [identity(row) for row in doc['matched']], 'calls': call_edges(doc)})

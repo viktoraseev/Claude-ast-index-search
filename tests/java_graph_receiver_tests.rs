@@ -7,6 +7,46 @@ use std::process::{Command, Output};
 use serde_json::Value;
 
 #[test]
+fn invocation_formals_are_bound_before_same_name_body_local_types() {
+    for middle in [
+        "void step(String unused) {} void step(Target input) { class Target {} new Marker().leaf(); }",
+        "void step(Target input) { class Target {} new Marker().leaf(); } void step(String unused) {}",
+        "void step(Target[] input) { class Target {} new Marker().leaf(); }",
+        "void step(java.util.List<Target> input) { class Target {} new Marker().leaf(); }",
+    ] {
+        let argument = if middle.contains("Target[]") {
+            "new Target[1]"
+        } else if middle.contains("List<Target>") {
+            "new java.util.ArrayList<Target>()"
+        } else {
+            "new Target()"
+        };
+        let source = format!(
+            "class Target {{}} class Marker {{ void leaf() {{}} }}\nclass Caller {{ {middle} }}\nclass Top {{ void good() {{ new Caller().step({argument}); }} }}\n"
+        );
+        check_direct_callers(&source, "step", &[("good", 3)]);
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        let project = tempfile::tempdir_in(&artifacts).unwrap();
+        let cache = tempfile::tempdir_in(&artifacts).unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        fs::write(project.path().join("Probe.java"), &source).unwrap();
+        run(project.path(), cache.path(), &["rebuild", "--force"]);
+        run(project.path(), cache.path(), &["graph", "build"]);
+        let output = run(
+            project.path(),
+            cache.path(),
+            &["--format", "json", "call-tree", "leaf", "--depth", "2"],
+        );
+        let tree: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let branches: Vec<_> = tree["items"].as_array().unwrap().iter().map(|item| {
+            (item["depth"].as_u64().unwrap(), item["name"].as_str().unwrap(),
+             item["line"].as_u64().unwrap())
+        }).collect();
+        assert_eq!(branches, [(1, "step", 2), (2, "good", 3)], "{middle}");
+    }
+}
+
+#[test]
 fn record_constructor_overload_keeps_declared_variable_argument_types() {
     let source = r#"import java.math.BigDecimal;
 record Code(String value) {}

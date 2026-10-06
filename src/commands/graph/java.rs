@@ -20,10 +20,29 @@ pub(super) enum TypeAccess {
 }
 
 pub(super) struct TypeDeclaration {
+    pub site: usize,
     pub access: TypeAccess,
     pub static_member: bool,
     pub local: bool,
     pub local_scope: Option<Range<usize>>,
+}
+
+/// Synthetic accessors may lack an indexed syntax site. Only unique metadata
+/// can bind them; colliding name/line entries must never borrow another owner.
+fn declaration_metadata<'a, T>(
+    entries: &'a HashMap<(String, i64, usize), T>,
+    name: &str,
+    line: i64,
+    site: Option<usize>,
+) -> Option<&'a T> {
+    if let Some(site) = site {
+        return entries.get(&(name.to_owned(), line, site));
+    }
+    let mut matches = entries
+        .iter()
+        .filter(|((candidate, row, _), _)| candidate == name && *row == line);
+    let (_, first) = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -49,7 +68,12 @@ pub(super) struct JavaSource {
     pub package: String,
     pub imports: Vec<String>,
     pub static_imports: Vec<String>,
-    declarations: HashMap<(String, i64), TypeDeclaration>,
+    declarations: HashMap<(String, i64), Vec<TypeDeclaration>>,
+    /// Source order bridges indexed rows to exact syntax occurrences. Local
+    /// type names, lines and qualified names are not declaration identities.
+    symbol_sites: HashMap<(String, i64, String), Vec<usize>>,
+    site_containers: HashMap<usize, Option<usize>>,
+    site_ranges: HashMap<usize, Range<usize>>,
     declaration_ranges: HashMap<(String, i64), Option<Range<usize>>>,
     member_containers: HashMap<(String, i64), Option<(String, i64)>>,
     type_positions: HashMap<(i64, String), Vec<usize>>,
@@ -60,17 +84,17 @@ pub(super) struct JavaSource {
     type_owners: HashMap<(i64, String), Option<(String, i64)>>,
     /// Graph binding needs the full syntax path; legacy inheritance rows may
     /// contain only its short name.
-    parents: HashMap<(String, i64), Vec<String>>,
+    parents: HashMap<usize, Vec<String>>,
     /// Callable identity, reference line and name; None means colliding or
     /// unsupported invocations. Never confidently choose the first on a line.
     invocations: HashMap<(String, i64, i64, String), Option<ParameterCall>>,
     direct_calls: HashMap<(String, i64, i64, String), Option<usize>>,
     bare_calls: HashMap<(String, i64, i64, String), Option<usize>>,
     parameters: HashMap<(String, i64), Option<(usize, bool)>>,
-    returns: HashMap<(String, i64), Option<String>>,
-    return_receivers: HashMap<(String, i64), JavaReceiver>,
-    member_receivers: HashMap<(String, i64), JavaReceiver>,
-    member_invocation_types: HashMap<(String, i64), Option<String>>,
+    returns: HashMap<(String, i64, usize), Option<String>>,
+    return_receivers: HashMap<(String, i64, usize), JavaReceiver>,
+    member_receivers: HashMap<(String, i64, usize), JavaReceiver>,
+    member_invocation_types: HashMap<(String, i64, usize), Option<String>>,
     getter_receivers: HashMap<(String, i64, String), Option<(i64, JavaReceiver)>>,
     type_parameters: HashMap<(String, i64), Vec<String>>,
     return_parameters: HashMap<(String, i64), String>,
@@ -168,6 +192,7 @@ pub(super) enum JavaReceiver {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct ExpressionCall {
+    pub owner_site: usize,
     pub receiver: JavaReceiver,
     pub receiver_site: Option<ReceiverTypeSite>,
     /// A method reference has no invocation argument list.
@@ -184,6 +209,7 @@ pub(super) struct ReceiverTypeSite {
     pub position: usize,
     pub owner: String,
     pub owner_line: i64,
+    pub owner_site: usize,
     pub owner_ordinal: Option<usize>,
 }
 
@@ -708,6 +734,7 @@ fn receiver_type_site(
                 position: ty.start_byte(),
                 owner: text(name, source).to_owned(),
                 owner_line: name.start_position().row as i64 + 1,
+                owner_site: name.start_byte(),
                 owner_ordinal: declarations.get(&owner.id()).map(|owner| owner.ordinal),
             });
         }
@@ -2481,6 +2508,7 @@ impl JavaSource {
                                 (
                                     text(name, source).to_owned(),
                                     name.start_position().row as i64 + 1,
+                                    name.start_byte(),
                                 ),
                                 declared_invocation_type(ty, variable, source),
                             );
@@ -2488,6 +2516,7 @@ impl JavaSource {
                                 (
                                     text(name, source).to_owned(),
                                     name.start_position().row as i64 + 1,
+                                    name.start_byte(),
                                 ),
                                 receiver.clone(),
                             );
@@ -2506,6 +2535,7 @@ impl JavaSource {
                         (
                             text(name, source).to_owned(),
                             name.start_position().row as i64 + 1,
+                            name.start_byte(),
                         ),
                         JavaReceiver::Type(text(declaration, source).to_owned()),
                     );
@@ -2578,9 +2608,12 @@ impl JavaSource {
                     } else {
                         format!("{}::{}", result.package, path.join("::"))
                     };
-                    result.declarations.insert(
-                        (qualified, name.start_position().row as i64 + 1),
-                        TypeDeclaration {
+                    result
+                        .declarations
+                        .entry((qualified, name.start_position().row as i64 + 1))
+                        .or_default()
+                        .push(TypeDeclaration {
+                            site: name.start_byte(),
                             access,
                             local: node.parent().is_some_and(|parent| {
                                 matches!(
@@ -2626,8 +2659,7 @@ impl JavaSource {
                                             | "enum_declaration"
                                             | "record_declaration"
                                     )),
-                        },
-                    );
+                        });
                     let mut parents = Vec::new();
                     let mut cursor = node.walk();
                     for branch in node.named_children(&mut cursor) {
@@ -2649,13 +2681,7 @@ impl JavaSource {
                             });
                         }
                     }
-                    result.parents.insert(
-                        (
-                            text(name, source).to_owned(),
-                            name.start_position().row as i64 + 1,
-                        ),
-                        parents,
-                    );
+                    result.parents.insert(name.start_byte(), parents);
                 }
             }
             if matches!(
@@ -2696,6 +2722,7 @@ impl JavaSource {
                     let mut ancestor = declaration.parent();
                     let mut path = Vec::new();
                     let mut owner_line = None;
+                    let mut owner_site = None;
                     while let Some(owner) = ancestor {
                         if matches!(
                             owner.kind(),
@@ -2707,6 +2734,7 @@ impl JavaSource {
                         ) {
                             if let Some(name) = owner.child_by_field_name("name") {
                                 owner_line.get_or_insert(name.start_position().row as i64 + 1);
+                                owner_site.get_or_insert(name.start_byte());
                                 path.push(text(name, source));
                             }
                         }
@@ -2746,6 +2774,47 @@ impl JavaSource {
                         })
                         .unwrap_or(declaration)
                         .byte_range();
+                    let kind = match declaration.kind() {
+                        "class_declaration" | "record_declaration" => Some("class"),
+                        "interface_declaration" | "annotation_type_declaration" => {
+                            Some("interface")
+                        }
+                        "enum_declaration" => Some("enum"),
+                        "method_declaration"
+                        | "constructor_declaration"
+                        | "compact_constructor_declaration" => Some("function"),
+                        "enum_constant" => Some("constant"),
+                        "variable_declarator"
+                            if declaration
+                                .parent()
+                                .is_some_and(|p| p.kind() == "field_declaration") =>
+                        {
+                            Some("property")
+                        }
+                        "formal_parameter"
+                            if declaration
+                                .parent()
+                                .and_then(|p| p.parent())
+                                .is_some_and(|p| p.kind() == "record_declaration") =>
+                        {
+                            Some("property")
+                        }
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        let site = node.start_byte();
+                        result
+                            .symbol_sites
+                            .entry((
+                                text(node, source).to_owned(),
+                                node.start_position().row as i64 + 1,
+                                kind.to_owned(),
+                            ))
+                            .or_default()
+                            .push(site);
+                        result.site_containers.insert(site, owner_site);
+                        result.site_ranges.insert(site, range.clone());
+                    }
                     result
                         .declaration_ranges
                         .entry((
@@ -2934,6 +3003,7 @@ impl JavaSource {
                             (
                                 text(name, source).to_owned(),
                                 name.start_position().row as i64 + 1,
+                                name.start_byte(),
                             ),
                             component
                                 .child_by_field_name("type")
@@ -2958,6 +3028,7 @@ impl JavaSource {
                                 (
                                     text(name, source).to_owned(),
                                     name.start_position().row as i64 + 1,
+                                    name.start_byte(),
                                 ),
                                 receiver,
                             );
@@ -3011,6 +3082,7 @@ impl JavaSource {
                                     (
                                         text(name, source).to_owned(),
                                         name.start_position().row as i64 + 1,
+                                        name.start_byte(),
                                     ),
                                     receiver,
                                 );
@@ -3019,6 +3091,7 @@ impl JavaSource {
                                 (
                                     text(name, source).to_owned(),
                                     name.start_position().row as i64 + 1,
+                                    name.start_byte(),
                                 ),
                                 component
                                     .child_by_field_name("type")
@@ -3056,6 +3129,7 @@ impl JavaSource {
                             (
                                 text(name, source).to_owned(),
                                 name.start_position().row as i64 + 1,
+                                name.start_byte(),
                             ),
                             receiver,
                         );
@@ -3086,6 +3160,7 @@ impl JavaSource {
                         .entry((
                             text(name, source).to_owned(),
                             name.start_position().row as i64 + 1,
+                            name.start_byte(),
                         ))
                         .and_modify(|previous| *previous = None)
                         .or_insert(declared);
@@ -3350,6 +3425,7 @@ impl JavaSource {
             };
             if let Some(object) = object {
                 let call = Some(ExpressionCall {
+                    owner_site: owner_name.start_byte(),
                     receiver: expression_receiver(object, owner, source, &scopes, 0),
                     receiver_site: expression_receiver_site(object, source, &scopes, &declarations),
                     arguments: if reference {
@@ -3614,10 +3690,16 @@ impl JavaSource {
             .as_ref()
     }
 
+    pub fn parent_types_at(&self, site: Option<usize>) -> Option<&[String]> {
+        self.parents.get(&site?).map(Vec::as_slice)
+    }
+
+    #[cfg(test)]
     pub fn parent_types(&self, name: &str, line: i64) -> Option<&[String]> {
-        self.parents
-            .get(&(name.to_owned(), line))
-            .map(Vec::as_slice)
+        let site = self
+            .symbol_site(name, line, "class", 0)
+            .or_else(|| self.symbol_site(name, line, "interface", 0))?;
+        self.parent_types_at(Some(site))
     }
 
     pub fn constructor_call(
@@ -3735,18 +3817,26 @@ impl JavaSource {
             .unwrap_or_default()
     }
 
-    pub fn return_type(&self, name: &str, line: i64) -> Option<&str> {
-        self.returns
-            .get(&(name.to_owned(), line))
-            .and_then(|ty| ty.as_deref())
+    pub fn return_type(&self, name: &str, line: i64, site: Option<usize>) -> Option<&str> {
+        declaration_metadata(&self.returns, name, line, site)?.as_deref()
     }
 
-    pub fn return_receiver(&self, name: &str, line: i64) -> Option<&JavaReceiver> {
-        self.return_receivers.get(&(name.to_owned(), line))
+    pub fn return_receiver(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+    ) -> Option<&JavaReceiver> {
+        declaration_metadata(&self.return_receivers, name, line, site)
     }
 
-    pub fn member_receiver(&self, name: &str, line: i64) -> Option<&JavaReceiver> {
-        self.member_receivers.get(&(name.to_owned(), line))
+    pub fn member_receiver(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+    ) -> Option<&JavaReceiver> {
+        declaration_metadata(&self.member_receivers, name, line, site)
     }
 
     pub fn generated_getter_receiver(
@@ -3779,8 +3869,38 @@ impl JavaSource {
             .map(String::as_str)
     }
 
+    pub fn type_declaration_at(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+    ) -> Option<&TypeDeclaration> {
+        let declarations = self.declarations.get(&(name.to_owned(), line))?;
+        match site {
+            Some(site) => declarations
+                .iter()
+                .find(|declaration| declaration.site == site),
+            None => match declarations.as_slice() {
+                [declaration] => Some(declaration),
+                _ => None,
+            },
+        }
+    }
+
+    #[cfg(test)]
     pub fn type_declaration(&self, name: &str, line: i64) -> Option<&TypeDeclaration> {
-        self.declarations.get(&(name.to_owned(), line))
+        self.type_declaration_at(name, line, None)
+    }
+
+    pub fn symbol_site(&self, name: &str, line: i64, kind: &str, ordinal: usize) -> Option<usize> {
+        self.symbol_sites
+            .get(&(name.to_owned(), line, kind.to_owned()))?
+            .get(ordinal)
+            .copied()
+    }
+
+    pub fn site_container(&self, site: usize) -> Option<&Option<usize>> {
+        self.site_containers.get(&site)
     }
 
     pub fn member_container(&self, name: &str, line: i64) -> Option<&(String, i64)> {
@@ -3796,6 +3916,7 @@ impl JavaSource {
         declaration: &TypeDeclaration,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         reference: Option<TypeReference<'_>>,
     ) -> bool {
         let Some(scope) = &declaration.local_scope else {
@@ -3805,7 +3926,10 @@ impl JavaSource {
             return scope.contains(&position);
         }
         let key = (owner.to_owned(), owner_line);
-        let Some(range) = self.declaration_ranges.get(&key).and_then(Option::as_ref) else {
+        let Some(range) = owner_site
+            .and_then(|site| self.site_ranges.get(&site))
+            .or_else(|| self.declaration_ranges.get(&key).and_then(Option::as_ref))
+        else {
             return false;
         };
         if let Some(positions) = reference.and_then(|reference| match reference {
@@ -3829,6 +3953,23 @@ impl JavaSource {
 
     pub fn type_reference(&self, line: i64, name: &str) -> Option<&Option<String>> {
         self.types.get(&(line, name.to_owned()))
+    }
+
+    pub fn type_positions_at(
+        &self,
+        line: i64,
+        name: &str,
+        owner_site: usize,
+    ) -> Option<Vec<usize>> {
+        let range = self.site_ranges.get(&owner_site)?;
+        Some(
+            self.type_positions
+                .get(&(line, name.to_owned()))?
+                .iter()
+                .copied()
+                .filter(|position| range.contains(position))
+                .collect(),
+        )
     }
 
     pub fn value_receiver(&self, line: i64, name: &str) -> bool {
@@ -3910,10 +4051,13 @@ impl JavaSource {
             .as_deref()
     }
 
-    pub fn member_invocation_type(&self, name: &str, line: i64) -> Option<&str> {
-        self.member_invocation_types
-            .get(&(name.to_owned(), line))?
-            .as_deref()
+    pub fn member_invocation_type(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+    ) -> Option<&str> {
+        declaration_metadata(&self.member_invocation_types, name, line, site)?.as_deref()
     }
 
     pub fn invocation_signature(&self, name: &str, line: i64) -> Option<(&[Option<String>], bool)> {
@@ -3959,20 +4103,72 @@ mod tests {
     use super::{JavaSource, TypeReference};
 
     #[test]
+    fn colliding_local_types_keep_sites_containers_and_parents() {
+        let source = r#"class Probe { void run() { { class Leaf extends Left { int same() { return 1; } } } { class Leaf extends Right { int same() { return 2; } } } } }"#;
+        let java = JavaSource::parse(source).unwrap();
+        let first = java.symbol_site("Leaf", 1, "class", 0).unwrap();
+        let second = java.symbol_site("Leaf", 1, "class", 1).unwrap();
+        assert_ne!(first, second);
+        assert!(java.type_declaration("Probe::Leaf", 1).is_none());
+        for (ordinal, site, parent) in [(0, first, "Left"), (1, second, "Right")] {
+            assert_eq!(java.parent_types_at(Some(site)).unwrap(), [parent]);
+            let member = java.symbol_site("same", 1, "function", ordinal).unwrap();
+            assert_eq!(java.site_container(member), Some(&Some(site)));
+            let declaration = java
+                .type_declaration_at("Probe::Leaf", 1, Some(site))
+                .unwrap();
+            assert!(java.type_in_scope(declaration, "same", 1, Some(member), None));
+            let other = java
+                .symbol_site("same", 1, "function", 1 - ordinal)
+                .unwrap();
+            assert!(!java.type_in_scope(declaration, "same", 1, Some(other), None));
+        }
+    }
+
+    #[test]
+    fn member_metadata_requires_its_declaration_site_when_names_collide() {
+        let source = r#"class Probe { void run() { { class Holder { Alpha slot; Alpha read() { return null; } } } { class Holder { Beta slot; Beta read() { return null; } } } } }"#;
+        let java = JavaSource::parse(source).unwrap();
+        assert!(java.member_receiver("slot", 1, None).is_none());
+        assert!(java.return_type("read", 1, None).is_none());
+        for (ordinal, ty) in [(0, "Alpha"), (1, "Beta")] {
+            let field = java.symbol_site("slot", 1, "property", ordinal);
+            assert!(
+                matches!(java.member_receiver("slot", 1, field), Some(super::JavaReceiver::Type(name)) if name == ty)
+            );
+            let method = java.symbol_site("read", 1, "function", ordinal);
+            assert_eq!(java.return_type("read", 1, method), Some(ty));
+        }
+    }
+
+    #[test]
     fn receiver_type_sites_distinguish_positions_on_a_shared_line() {
         let source = "package fixture;\nclass Probe { int use() { Leaf before = null; class Leaf {} Leaf after = null; return 0; } }\n";
         let java = JavaSource::parse(source).unwrap();
         let declaration = java.type_declaration("fixture::Probe::Leaf", 2).unwrap();
         let before = source.find("Leaf before").unwrap();
         let after = source.find("Leaf after").unwrap();
-        assert!(!java.type_in_scope(declaration, "use", 2, Some(TypeReference::Position(before))));
-        assert!(java.type_in_scope(declaration, "use", 2, Some(TypeReference::Position(after))));
+        assert!(!java.type_in_scope(
+            declaration,
+            "use",
+            2,
+            None,
+            Some(TypeReference::Position(before))
+        ));
+        assert!(java.type_in_scope(
+            declaration,
+            "use",
+            2,
+            None,
+            Some(TypeReference::Position(after))
+        ));
         // A line-only reference cannot establish which of the two sites was
         // meant. Preserve that conservative contract for stored reference rows.
         assert!(!java.type_in_scope(
             declaration,
             "use",
             2,
+            None,
             Some(TypeReference::Occurrences(2, "Leaf"))
         ));
     }
@@ -3989,11 +4185,12 @@ mod tests {
                 declaration,
                 field,
                 5,
+                None,
                 Some(TypeReference::Occurrences(5, "Leaf"))
             ));
-            assert!(java.type_in_scope(declaration, field, 5, None));
+            assert!(java.type_in_scope(declaration, field, 5, None, None));
         }
-        assert!(!java.type_in_scope(declaration, "Probe", 2, None));
+        assert!(!java.type_in_scope(declaration, "Probe", 2, None, None));
     }
 
     #[test]

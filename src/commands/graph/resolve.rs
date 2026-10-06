@@ -628,6 +628,7 @@ struct SymNode {
     line: i64,
     /// Java syntax and indexed declarations both preserve source order.
     java_callable_ordinal: usize,
+    java_site: Option<usize>,
     /// `end_line`, or the start line when the parser reports no range.
     end: i64,
     has_range: bool,
@@ -665,6 +666,8 @@ struct Builder {
     /// rather than by definition because Ruby classes are reopened across
     /// files and every reopening shares the same ancestors.
     parents: HashMap<String, Vec<u32>>,
+    /// Java local types and attached roots can share a namespace path.
+    java_parents: HashMap<u32, Vec<u32>>,
     /// Namespace path of a class -> its superclass as written and, when the
     /// graph resolved it, the superclass's namespace path.
     superclasses: HashMap<String, (String, Option<String>)>,
@@ -775,7 +778,7 @@ impl Builder {
 
         let symbol_rows = db::load_graph_symbols(conn)?;
         let mut syms = Vec::with_capacity(symbol_rows.len());
-        let mut java_callable_ordinals: HashMap<(u32, String, i64), usize> = HashMap::new();
+        let mut java_symbol_ordinals: HashMap<(u32, String, i64, String), usize> = HashMap::new();
         for row in symbol_rows {
             let Some(&file) = file_index.get(&row.file_id) else {
                 continue;
@@ -791,9 +794,9 @@ impl Builder {
                     file_node.imports.push(target);
                 }
             }
-            let java_callable_ordinal = if file_node.java.is_some() && row.kind == "function" {
-                let next = java_callable_ordinals
-                    .entry((file, row.name.clone(), row.line))
+            let java_callable_ordinal = if file_node.java.is_some() {
+                let next = java_symbol_ordinals
+                    .entry((file, row.name.clone(), row.line, row.kind.clone()))
                     .or_default();
                 let ordinal = *next;
                 *next += 1;
@@ -801,6 +804,9 @@ impl Builder {
             } else {
                 0
             };
+            let java_site = file_node.java.as_ref().and_then(|java| {
+                java.symbol_site(&row.name, row.line, &row.kind, java_callable_ordinal)
+            });
             syms.push(SymNode {
                 id: row.id,
                 file,
@@ -810,6 +816,7 @@ impl Builder {
                 kind: row.kind,
                 line: row.line,
                 java_callable_ordinal,
+                java_site,
                 container: None,
                 qual: if file_node.java.is_some() {
                     row.qualified_name.unwrap_or_default().replace('.', "::")
@@ -829,6 +836,7 @@ impl Builder {
             by_short: HashMap::new(),
             by_qual: HashMap::new(),
             parents: HashMap::new(),
+            java_parents: HashMap::new(),
             superclasses: HashMap::new(),
             model_tables: HashMap::new(),
             table_columns: HashMap::new(),
@@ -853,6 +861,12 @@ impl Builder {
             }
             let ruby = file.family == "ruby";
             let namespace = file.namespace.clone();
+            let java_sites: HashMap<_, _> = file
+                .symbols
+                .iter()
+                .copied()
+                .filter_map(|s| self.syms[s as usize].java_site.map(|site| (site, s)))
+                .collect();
             let mut order = file.symbols.clone();
             order.sort_by_key(|&s| {
                 let sym = &self.syms[s as usize];
@@ -878,7 +892,7 @@ impl Builder {
                 {
                     stack.pop();
                 }
-                let container = stack.iter().rev().copied().find(|&c| {
+                let range_container = stack.iter().rev().copied().find(|&c| {
                     self.syms[c as usize].end >= end
                         && syntax_container.is_none_or(|(qual, owner_line)| {
                             self.syms[c as usize].qual == *qual
@@ -889,6 +903,14 @@ impl Builder {
                                 .is_some_and(|(parent, _)| parent == self.syms[c as usize].qual)
                         })
                 });
+                let container = match file
+                    .java
+                    .as_ref()
+                    .and_then(|java| java.site_container(self.syms[s as usize].java_site?))
+                {
+                    Some(site) => site.and_then(|site| java_sites.get(&site).copied()),
+                    None => range_container,
+                };
                 let qual = {
                     let sym = &self.syms[s as usize];
                     let reopened = is_container_kind(&sym.kind)
@@ -1038,7 +1060,7 @@ impl Builder {
             if let Some(parents) = self.files[child_sym.file as usize]
                 .java
                 .as_ref()
-                .and_then(|java| java.parent_types(&child_sym.name, child_sym.line))
+                .and_then(|java| java.parent_types_at(child_sym.java_site))
             {
                 if java_children.insert(child) {
                     links.extend(
@@ -1119,20 +1141,16 @@ impl Builder {
     /// Recompute successful bindings too: newly inherited members can shadow a
     /// same-package fallback or make a previously unique name ambiguous.
     fn resolve_java_parents(&mut self, links: &[(u32, String, String)]) -> Result<()> {
-        let children: HashSet<_> = links
-            .iter()
-            .map(|(child, _, _)| self.syms[*child as usize].qual.clone())
-            .collect();
+        let children: HashSet<_> = links.iter().map(|(child, _, _)| *child).collect();
         // Each dependency level needs at most one round plus a stability check.
         // Keep only two edge maps, without recursive expansion or depth caps.
         for _ in 0..=links.len() {
-            let mut next: HashMap<String, Vec<u32>> = HashMap::new();
+            let mut next: HashMap<u32, Vec<u32>> = HashMap::new();
             for (child, path, namespace) in links {
                 let types = self.resolve_type(*child, namespace, path, Some(*child));
                 if let [parent] = types.as_slice() {
-                    let child_qual = &self.syms[*child as usize].qual;
-                    if self.syms[*parent as usize].qual != *child_qual {
-                        next.entry(child_qual.clone()).or_default().push(*parent);
+                    if parent != child {
+                        next.entry(*child).or_default().push(*parent);
                     }
                 }
             }
@@ -1142,16 +1160,27 @@ impl Builder {
             }
             if children
                 .iter()
-                .all(|child| self.parents.get(child) == next.get(child))
+                .all(|child| self.java_parents.get(child) == next.get(child))
             {
                 return Ok(());
             }
             for child in &children {
-                self.parents.remove(child);
+                self.java_parents.remove(child);
             }
-            self.parents.extend(next);
+            self.java_parents.extend(next);
         }
         anyhow::bail!("Java inherited parent aliases did not converge within the dependency budget")
+    }
+
+    fn parents_of(&self, class: u32) -> Option<&Vec<u32>> {
+        if self.files[self.syms[class as usize].file as usize]
+            .java
+            .is_some()
+        {
+            self.java_parents.get(&class)
+        } else {
+            self.parents.get(&self.syms[class as usize].qual)
+        }
     }
 
     /// Match Rails models to the tables of `db/schema.rb` (see
@@ -1689,7 +1718,7 @@ impl Builder {
             if depth >= MAX_ANCESTOR_DEPTH {
                 continue;
             }
-            if let Some(parents) = self.parents.get(&self.syms[current as usize].qual) {
+            if let Some(parents) = self.parents_of(current) {
                 for &parent in parents {
                     if seen.insert(parent) {
                         queue.push_back((parent, depth + 1));
@@ -1820,6 +1849,15 @@ impl Builder {
 
     /// Recognize library types only after excluding project/import shadows.
     fn java_lang_type(&self, context: u32, path: &str) -> Option<String> {
+        self.java_lang_type_at(context, path, None)
+    }
+
+    fn java_lang_type_at(
+        &self,
+        context: u32,
+        path: &str,
+        position: Option<usize>,
+    ) -> Option<String> {
         const TYPES: &[&str] = &[
             "Object",
             "String",
@@ -1835,7 +1873,7 @@ impl Builder {
             "Cloneable",
         ];
         if !self
-            .resolve_java_type(context, self.namespace_of(context), path, None)
+            .java_invocation_classes(context, path, position)
             .is_empty()
         {
             return None;
@@ -1890,14 +1928,37 @@ impl Builder {
         loose: bool,
         depth: usize,
     ) -> Option<bool> {
+        self.java_invocation_conversion_at(
+            (input_owner, input, None),
+            (parameter_owner, parameter, None),
+            loose,
+            depth,
+        )
+    }
+
+    /// Bind formal types at the declaration, outside any body-local shadows.
+    fn java_invocation_conversion_at(
+        &self,
+        input: (u32, &str, Option<usize>),
+        parameter: (u32, &str, Option<usize>),
+        loose: bool,
+        depth: usize,
+    ) -> Option<bool> {
+        let (input_owner, input, input_position) = input;
+        let (parameter_owner, parameter, parameter_position) = parameter;
         if depth >= 32 {
             return None;
         }
         if input != "null"
             && input != "?"
             && self
-                .java_invocation_identity(input_owner, input, 0)
-                .zip(self.java_invocation_identity(parameter_owner, parameter, 0))
+                .java_invocation_identity_at(input_owner, input, 0, input_position)
+                .zip(self.java_invocation_identity_at(
+                    parameter_owner,
+                    parameter,
+                    0,
+                    parameter_position,
+                ))
                 .is_some_and(|(input, parameter)| input == parameter)
         {
             return Some(true);
@@ -1911,29 +1972,22 @@ impl Builder {
             if Self::java_primitive(input) || Self::java_primitive(parameter) {
                 return Some(input == parameter);
             }
-            return self.java_invocation_conversion(
-                input_owner,
-                input,
-                parameter_owner,
-                parameter,
+            return self.java_invocation_conversion_at(
+                (input_owner, input, input_position),
+                (parameter_owner, parameter, parameter_position),
                 false,
                 depth + 1,
             );
         }
         if input_array.is_some() {
             if !self
-                .resolve_java_type(
-                    parameter_owner,
-                    self.namespace_of(parameter_owner),
-                    parameter,
-                    None,
-                )
+                .java_invocation_classes(parameter_owner, parameter, parameter_position)
                 .is_empty()
             {
                 return Some(false);
             }
             return self
-                .java_lang_type(parameter_owner, parameter)
+                .java_lang_type_at(parameter_owner, parameter, parameter_position)
                 .map(|parameter| {
                     matches!(
                         parameter.as_str(),
@@ -1948,7 +2002,9 @@ impl Builder {
             let split = |ty: &str| ty.split('<').next().unwrap_or(ty).to_owned();
             let input_raw = split(input);
             let parameter_raw = split(parameter);
-            if self.java_lang_type(parameter_owner, parameter).as_deref()
+            if self
+                .java_lang_type_at(parameter_owner, parameter, parameter_position)
+                .as_deref()
                 == Some("java::lang::Object")
             {
                 return Some(true);
@@ -1957,7 +2013,7 @@ impl Builder {
             let parameter_container = self.java_known_container(parameter_owner, &parameter_raw);
             if input_container.is_some()
                 && self
-                    .java_lang_type(parameter_owner, &parameter_raw)
+                    .java_lang_type_at(parameter_owner, &parameter_raw, parameter_position)
                     .is_some()
             {
                 return Some(false);
@@ -1978,20 +2034,13 @@ impl Builder {
             }
             // A parameterized subclass needs type-argument substitution. Only
             // identical declaring types establish invariant arguments here.
-            let inputs = self.resolve_java_type(
-                input_owner,
-                self.namespace_of(input_owner),
-                &input_raw,
-                None,
-            );
-            let parameters = self.resolve_java_type(
-                parameter_owner,
-                self.namespace_of(parameter_owner),
-                &parameter_raw,
-                None,
-            );
+            let inputs = self.java_invocation_classes(input_owner, &input_raw, input_position);
+            let parameters =
+                self.java_invocation_classes(parameter_owner, &parameter_raw, parameter_position);
             if parameters.len() == 1
-                && self.java_lang_type(input_owner, &input_raw).as_deref()
+                && self
+                    .java_lang_type_at(input_owner, &input_raw, input_position)
+                    .as_deref()
                     == Some("java::lang::Object")
             {
                 return Some(false);
@@ -2005,7 +2054,7 @@ impl Builder {
                         && self.files[symbol.file as usize]
                             .java
                             .as_ref()
-                            .and_then(|java| java.parent_types(&symbol.name, symbol.line))
+                            .and_then(|java| java.parent_types_at(symbol.java_site))
                             .is_some_and(|parents| parents.is_empty())
                         && self
                             .java_known_container(parameter_owner, &parameter_raw)
@@ -2021,8 +2070,13 @@ impl Builder {
                     return Some(false);
                 }
                 if self
-                    .java_invocation_identity(input_owner, &input_raw, 0)
-                    .zip(self.java_invocation_identity(parameter_owner, &parameter_raw, 0))
+                    .java_invocation_identity_at(input_owner, &input_raw, 0, input_position)
+                    .zip(self.java_invocation_identity_at(
+                        parameter_owner,
+                        &parameter_raw,
+                        0,
+                        parameter_position,
+                    ))
                     .is_some_and(|(input, parameter)| input == parameter)
                 {
                     let Some(parameters) = Self::java_invariant_arguments(parameter) else {
@@ -2038,11 +2092,17 @@ impl Builder {
                             continue;
                         }
                         let identity = self
-                            .java_invocation_identity(input_owner, input, depth + 1)
-                            .zip(self.java_invocation_identity(
+                            .java_invocation_identity_at(
+                                input_owner,
+                                input,
+                                depth + 1,
+                                input_position,
+                            )
+                            .zip(self.java_invocation_identity_at(
                                 parameter_owner,
                                 parameter,
                                 depth + 1,
+                                parameter_position,
                             ));
                         match identity {
                             Some((input, parameter)) if input == parameter => {}
@@ -2071,19 +2131,15 @@ impl Builder {
                 }
                 // Invariance requires identity, rather than argument widening.
                 match (
-                    self.java_invocation_conversion(
-                        input_owner,
-                        input,
-                        parameter_owner,
-                        parameter,
+                    self.java_invocation_conversion_at(
+                        (input_owner, input, input_position),
+                        (parameter_owner, parameter, parameter_position),
                         false,
                         depth + 1,
                     ),
-                    self.java_invocation_conversion(
-                        parameter_owner,
-                        parameter,
-                        input_owner,
-                        input,
+                    self.java_invocation_conversion_at(
+                        (parameter_owner, parameter, parameter_position),
+                        (input_owner, input, input_position),
                         false,
                         depth + 1,
                     ),
@@ -2105,16 +2161,14 @@ impl Builder {
                 return Some(false);
             }
             if input_primitive {
-                return self.java_invocation_conversion(
-                    input_owner,
-                    Self::java_boxed_type(input)?,
-                    parameter_owner,
-                    parameter,
+                return self.java_invocation_conversion_at(
+                    (input_owner, Self::java_boxed_type(input)?, input_position),
+                    (parameter_owner, parameter, parameter_position),
                     false,
                     depth + 1,
                 );
             }
-            let input = self.java_lang_type(input_owner, input)?;
+            let input = self.java_lang_type_at(input_owner, input, input_position)?;
             let primitive = [
                 "boolean", "byte", "short", "char", "int", "long", "float", "double",
             ]
@@ -2125,8 +2179,8 @@ impl Builder {
                     .is_some_and(|primitive| Self::java_primitive_widens(primitive, parameter)),
             );
         }
-        let input_jdk = self.java_lang_type(input_owner, input);
-        let parameter_jdk = self.java_lang_type(parameter_owner, parameter);
+        let input_jdk = self.java_lang_type_at(input_owner, input, input_position);
+        let parameter_jdk = self.java_lang_type_at(parameter_owner, parameter, parameter_position);
         if parameter_jdk.as_deref() == Some("java::lang::Object") {
             return Some(true);
         }
@@ -2150,14 +2204,9 @@ impl Builder {
                         ),
             );
         }
-        let inputs =
-            self.resolve_java_type(input_owner, self.namespace_of(input_owner), input, None);
-        let parameters = self.resolve_java_type(
-            parameter_owner,
-            self.namespace_of(parameter_owner),
-            parameter,
-            None,
-        );
+        let inputs = self.java_invocation_classes(input_owner, input, input_position);
+        let parameters =
+            self.java_invocation_classes(parameter_owner, parameter, parameter_position);
         let ([input_class], [parameter_class]) = (inputs.as_slice(), parameters.as_slice()) else {
             // Final library scalars cannot extend/implement a project declaration.
             if input_jdk
@@ -2186,7 +2235,7 @@ impl Builder {
             let declared = self.files[symbol.file as usize]
                 .java
                 .as_ref()?
-                .parent_types(&symbol.name, symbol.line)?;
+                .parent_types_at(symbol.java_site)?;
             for parent in declared {
                 let parents = self.resolve_java_type(class, self.namespace_of(class), parent, None);
                 complete &= parents.len() == 1 || self.java_lang_type(class, parent).is_some();
@@ -2221,40 +2270,63 @@ impl Builder {
         Some(result)
     }
 
+    /// Resolve nominal signature types at their declaration position.
+    fn java_invocation_classes(&self, context: u32, ty: &str, position: Option<usize>) -> Vec<u32> {
+        self.resolve_java_type_reference(
+            context,
+            self.namespace_of(context),
+            ty,
+            None,
+            position.map(TypeReference::Position),
+        )
+    }
+
     /// Canonical identity proves equality without inventing library ancestry.
     fn java_invocation_identity(&self, context: u32, ty: &str, depth: usize) -> Option<String> {
+        self.java_invocation_identity_at(context, ty, depth, None)
+    }
+
+    fn java_invocation_identity_at(
+        &self,
+        context: u32,
+        ty: &str,
+        depth: usize,
+        position: Option<usize>,
+    ) -> Option<String> {
         if depth >= 32 || ty == "?" || ty == "null" {
             return None;
         }
         if let Some(element) = ty.strip_suffix("[]") {
             return Some(format!(
                 "{}[]",
-                self.java_invocation_identity(context, element, depth + 1)?
+                self.java_invocation_identity_at(context, element, depth + 1, position)?
             ));
         }
         if let Some(arguments) = Self::java_invariant_arguments(ty) {
             let raw = ty.split('<').next()?;
             let arguments: Option<Vec<_>> = arguments
                 .into_iter()
-                .map(|argument| self.java_invocation_identity(context, argument, depth + 1))
+                .map(|argument| {
+                    self.java_invocation_identity_at(context, argument, depth + 1, position)
+                })
                 .collect();
             return Some(format!(
                 "{}<{}>",
-                self.java_invocation_identity(context, raw, depth + 1)?,
+                self.java_invocation_identity_at(context, raw, depth + 1, position)?,
                 arguments?.join(",")
             ));
         }
         if Self::java_primitive(ty) {
             return Some(ty.to_owned());
         }
-        let classes = self.resolve_java_type(context, self.namespace_of(context), ty, None);
+        let classes = self.java_invocation_classes(context, ty, position);
         if let [class] = classes.as_slice() {
             return Some(self.syms[*class as usize].qual.clone());
         }
         if !classes.is_empty() {
             return None;
         }
-        if let Some(path) = self.java_lang_type(context, ty) {
+        if let Some(path) = self.java_lang_type_at(context, ty, position) {
             return Some(path);
         }
         let java = self.files[self.syms[context as usize].file as usize]
@@ -2356,7 +2428,7 @@ impl Builder {
                 self.files[symbol.file as usize]
                     .java
                     .as_ref()?
-                    .member_invocation_type(&symbol.name, symbol.line)
+                    .member_invocation_type(&symbol.name, symbol.line, symbol.java_site)
                     .map(|ty| (*target, ty.to_owned()))
             }
             InvocationArgument::Field(_) => None,
@@ -2584,11 +2656,9 @@ impl Builder {
                     .zip(parameter.as_deref())
                     .and_then(|(input, parameter)| {
                         let (input_owner, input) = self.java_invocation_argument(source, input)?;
-                        self.java_invocation_conversion(
-                            input_owner,
-                            &input,
-                            target,
-                            parameter,
+                        self.java_invocation_conversion_at(
+                            (input_owner, &input, None),
+                            (target, parameter, symbol.java_site),
                             phase > 0,
                             0,
                         )
@@ -2682,7 +2752,12 @@ impl Builder {
                                 let (owner, input) =
                                     self.java_invocation_argument(source, input)?;
                                 self.java_invocation_identity(owner, &input, 0)
-                                    .zip(self.java_invocation_identity(target, parameter, 0))
+                                    .zip(self.java_invocation_identity_at(
+                                        target,
+                                        parameter,
+                                        0,
+                                        self.syms[target as usize].java_site,
+                                    ))
                             })
                             .is_some_and(|(input, parameter)| input == parameter)
                     })
@@ -2715,11 +2790,12 @@ impl Builder {
                 let (Some(lp), Some(rp)) = (left_parameter, right_parameter) else {
                     return false;
                 };
-                if self.java_invocation_conversion(left, lp, right, rp, false, 0) != Some(true) {
+                let left = (left, lp.as_str(), self.syms[left as usize].java_site);
+                let right = (right, rp.as_str(), self.syms[right as usize].java_site);
+                if self.java_invocation_conversion_at(left, right, false, 0) != Some(true) {
                     return false;
                 }
-                strict |=
-                    self.java_invocation_conversion(right, rp, left, lp, false, 0) == Some(false);
+                strict |= self.java_invocation_conversion_at(right, left, false, 0) == Some(false);
             }
             strict
         };
@@ -2744,7 +2820,7 @@ impl Builder {
             .expression_call(&owner.name, owner.line, line, name)
             .is_some_and(|call| {
                 call.as_ref()
-                    .is_some_and(|call| call.receiver_site.is_some())
+                    .is_none_or(|call| call.receiver_site.is_some())
             })
         {
             return self.resolve_java_expression_call(file, source, name, line);
@@ -2816,7 +2892,7 @@ impl Builder {
                     return true;
                 }
                 if visited.insert(candidate) {
-                    if let Some(parents) = self.parents.get(&self.syms[candidate as usize].qual) {
+                    if let Some(parents) = self.parents_of(candidate) {
                         queue.extend(parents.iter().copied());
                     }
                 }
@@ -2837,14 +2913,16 @@ impl Builder {
         let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
             return true;
         };
-        let Some(declaration) = java.type_declaration(&symbol.qual, symbol.line) else {
+        let Some(declaration) =
+            java.type_declaration_at(&symbol.qual, symbol.line, symbol.java_site)
+        else {
             return false;
         };
         if declaration.local_scope.is_some() {
             let owner = &self.syms[source as usize];
             if at_import
                 || symbol.file != source_file
-                || !java.type_in_scope(declaration, &owner.name, owner.line, None)
+                || !java.type_in_scope(declaration, &owner.name, owner.line, owner.java_site, None)
             {
                 return false;
             }
@@ -2884,7 +2962,7 @@ impl Builder {
         self.files[symbol.file as usize]
             .java
             .as_ref()
-            .and_then(|java| java.type_declaration(&symbol.qual, symbol.line))
+            .and_then(|java| java.type_declaration_at(&symbol.qual, symbol.line, symbol.java_site))
             .is_some_and(|declaration| declaration.static_member)
     }
 
@@ -2914,7 +2992,13 @@ impl Builder {
                         && !self.files[member.file as usize]
                             .java
                             .as_ref()
-                            .and_then(|java| java.type_declaration(&member.qual, member.line))
+                            .and_then(|java| {
+                                java.type_declaration_at(
+                                    &member.qual,
+                                    member.line,
+                                    member.java_site,
+                                )
+                            })
                             .is_some_and(|declaration| declaration.local)
                 })
                 .collect();
@@ -2923,7 +3007,7 @@ impl Builder {
                 members.insert(class, declared);
                 continue;
             }
-            if let Some(parents) = self.parents.get(&symbol.qual) {
+            if let Some(parents) = self.parents_of(class) {
                 for &parent in parents {
                     dependents.entry(parent).or_default().push(class);
                     pending.push(parent);
@@ -2938,7 +3022,9 @@ impl Builder {
             let Some(java) = self.files[member.file as usize].java.as_ref() else {
                 continue;
             };
-            let Some(declaration) = java.type_declaration(&member.qual, member.line) else {
+            let Some(declaration) =
+                java.type_declaration_at(&member.qual, member.line, member.java_site)
+            else {
                 continue;
             };
             for &child in dependents.get(&parent).into_iter().flatten() {
@@ -2991,7 +3077,7 @@ impl Builder {
                         .java
                         .as_ref()
                         .and_then(|java| {
-                            java.type_declaration(&member.qual, member.line)
+                            java.type_declaration_at(&member.qual, member.line, member.java_site)
                                 .map(|declaration| (java, declaration))
                         })
                         .is_none_or(|(java, declaration)| {
@@ -3003,6 +3089,7 @@ impl Builder {
                                             declaration,
                                             &self.syms[source as usize].name,
                                             self.syms[source as usize].line,
+                                            self.syms[source as usize].java_site,
                                             reference,
                                         ))
                         });
@@ -3021,7 +3108,9 @@ impl Builder {
                     self.files[symbol.file as usize]
                         .java
                         .as_ref()
-                        .and_then(|java| java.type_declaration(&symbol.qual, symbol.line))
+                        .and_then(|java| {
+                            java.type_declaration_at(&symbol.qual, symbol.line, symbol.java_site)
+                        })
                         .and_then(|declaration| declaration.local_scope.as_ref())
                 };
                 if let Some(length) = reference.and_then(|_| {
@@ -3087,6 +3176,35 @@ impl Builder {
         line: Option<i64>,
     ) -> Vec<u32> {
         let head = declared.split("::").next().unwrap_or(declared);
+        let owner = &self.syms[source as usize];
+        if let Some(positions) = line
+            .and_then(|line| {
+                self.files[owner.file as usize]
+                    .java
+                    .as_ref()?
+                    .type_positions_at(line, head, owner.java_site?)
+            })
+            .filter(|positions| !positions.is_empty())
+        {
+            // A line can contain separate lexical type sites. Bind each site
+            // before unioning the row; testing every site against one local
+            // scope would incorrectly fall back to a package declaration.
+            let mut types: Vec<_> = positions
+                .into_iter()
+                .flat_map(|position| {
+                    self.resolve_java_type_reference(
+                        source,
+                        namespace,
+                        declared,
+                        exclude,
+                        Some(TypeReference::Position(position)),
+                    )
+                })
+                .collect();
+            types.sort_unstable();
+            types.dedup();
+            return types;
+        }
         self.resolve_java_type_reference(
             source,
             namespace,
@@ -3467,7 +3585,9 @@ impl Builder {
                 self.files[symbol.file as usize]
                     .java
                     .as_ref()
-                    .and_then(|java| java.member_receiver(&symbol.name, symbol.line))
+                    .and_then(|java| {
+                        java.member_receiver(&symbol.name, symbol.line, symbol.java_site)
+                    })
                     .map(|receiver| self.java_receiver_classes(*target, receiver, depth + 1))
                     .unwrap_or_default()
             }
@@ -3509,7 +3629,7 @@ impl Builder {
             JavaReceiver::This => self.class_scope(source).into_iter().collect(),
             JavaReceiver::Super => self
                 .class_scope(source)
-                .and_then(|class| self.parents.get(&self.syms[class as usize].qual))
+                .and_then(|class| self.parents_of(class))
                 .cloned()
                 .unwrap_or_default(),
             JavaReceiver::Invocation {
@@ -3536,43 +3656,13 @@ impl Builder {
                     let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
                         return Vec::new();
                     };
-                    let classes = if let Some(parameter) =
-                        java.return_parameter(&symbol.name, symbol.line)
-                    {
-                        if java
-                            .parameter_index(&symbol.name, symbol.line, parameter)
-                            .is_some()
-                        {
-                            java.type_bound(&symbol.name, symbol.line, parameter)
-                                .map(|bound| {
-                                    self.resolve_java_type(
-                                        target,
-                                        self.namespace_of(target),
-                                        bound,
-                                        None,
-                                    )
-                                })
-                                .unwrap_or_default()
-                        } else if let Some(class) = self.class_scope(target) {
-                            let owner = &self.syms[class as usize];
-                            let bound = receiver
-                                .as_deref()
-                                .and_then(|receiver| {
-                                    java.parameter_index(&owner.name, owner.line, parameter)
-                                        .map(|index| {
-                                            self.java_argument_classes(
-                                                source,
-                                                receiver,
-                                                index,
-                                                depth + 1,
-                                            )
-                                        })
-                                })
-                                .unwrap_or_default();
-                            if !bound.is_empty() {
-                                bound
-                            } else {
-                                java.type_bound(&owner.name, owner.line, parameter)
+                    let classes =
+                        if let Some(parameter) = java.return_parameter(&symbol.name, symbol.line) {
+                            if java
+                                .parameter_index(&symbol.name, symbol.line, parameter)
+                                .is_some()
+                            {
+                                java.type_bound(&symbol.name, symbol.line, parameter)
                                     .map(|bound| {
                                         self.resolve_java_type(
                                             target,
@@ -3582,17 +3672,50 @@ impl Builder {
                                         )
                                     })
                                     .unwrap_or_default()
+                            } else if let Some(class) = self.class_scope(target) {
+                                let owner = &self.syms[class as usize];
+                                let bound = receiver
+                                    .as_deref()
+                                    .and_then(|receiver| {
+                                        java.parameter_index(&owner.name, owner.line, parameter)
+                                            .map(|index| {
+                                                self.java_argument_classes(
+                                                    source,
+                                                    receiver,
+                                                    index,
+                                                    depth + 1,
+                                                )
+                                            })
+                                    })
+                                    .unwrap_or_default();
+                                if !bound.is_empty() {
+                                    bound
+                                } else {
+                                    java.type_bound(&owner.name, owner.line, parameter)
+                                        .map(|bound| {
+                                            self.resolve_java_type(
+                                                target,
+                                                self.namespace_of(target),
+                                                bound,
+                                                None,
+                                            )
+                                        })
+                                        .unwrap_or_default()
+                                }
+                            } else {
+                                Vec::new()
                             }
+                        } else if let Some(receiver) =
+                            java.return_receiver(&symbol.name, symbol.line, symbol.java_site)
+                        {
+                            self.java_receiver_classes(target, receiver, depth + 1)
+                        } else if let Some(path) =
+                            java.return_type(&symbol.name, symbol.line, symbol.java_site)
+                        {
+                            self.resolve_java_type(target, self.namespace_of(target), path, None)
                         } else {
-                            Vec::new()
-                        }
-                    } else if let Some(receiver) = java.return_receiver(&symbol.name, symbol.line) {
-                        self.java_receiver_classes(target, receiver, depth + 1)
-                    } else if let Some(path) = java.return_type(&symbol.name, symbol.line) {
-                        self.resolve_java_type(target, self.namespace_of(target), path, None)
-                    } else {
-                        return Vec::new();
-                    };
+                            return Vec::new();
+                        };
                     if classes.len() != 1
                         || common.as_ref().is_some_and(|previous| *previous != classes)
                     {
@@ -3627,7 +3750,9 @@ impl Builder {
                 self.files[symbol.file as usize]
                     .java
                     .as_ref()
-                    .and_then(|java| java.member_receiver(&symbol.name, symbol.line))
+                    .and_then(|java| {
+                        java.member_receiver(&symbol.name, symbol.line, symbol.java_site)
+                    })
                     .and_then(|receiver| self.java_collection_kind(*target, receiver, depth + 1))
             }
             JavaReceiver::Parameterized { path, .. } => {
@@ -3834,7 +3959,9 @@ impl Builder {
                 self.files[symbol.file as usize]
                     .java
                     .as_ref()
-                    .and_then(|java| java.member_receiver(&symbol.name, symbol.line))
+                    .and_then(|java| {
+                        java.member_receiver(&symbol.name, symbol.line, symbol.java_site)
+                    })
                     .map(|receiver| self.java_element_classes(*target, receiver, depth + 1))
                     .unwrap_or_default()
             }
@@ -3994,6 +4121,7 @@ impl Builder {
                 let symbol = &self.syms[candidate as usize];
                 symbol.file == file
                     && symbol.line == site.owner_line
+                    && symbol.java_site == Some(site.owner_site)
                     && match site.owner_ordinal {
                         Some(ordinal) => {
                             symbol.kind == "function" && symbol.java_callable_ordinal == ordinal
@@ -4046,7 +4174,9 @@ impl Builder {
             let local = self.files[symbol.file as usize]
                 .java
                 .as_ref()
-                .and_then(|java| java.type_declaration(&symbol.qual, symbol.line))
+                .and_then(|java| {
+                    java.type_declaration_at(&symbol.qual, symbol.line, symbol.java_site)
+                })
                 .is_some_and(|declaration| declaration.local_scope.is_some());
             return if local {
                 JavaReceiver::BoundType {
@@ -4555,7 +4685,7 @@ impl Builder {
                     self.files[symbol.file as usize]
                         .java
                         .as_ref()?
-                        .member_receiver(&symbol.name, symbol.line)
+                        .member_receiver(&symbol.name, symbol.line, symbol.java_site)
                         .cloned()
                         .map(|value| (*target, value))
                 }
@@ -4571,7 +4701,7 @@ impl Builder {
                     self.files[symbol.file as usize]
                         .java
                         .as_ref()?
-                        .member_receiver(&symbol.name, symbol.line)?
+                        .member_receiver(&symbol.name, symbol.line, symbol.java_site)?
                         .clone(),
                 ))
             }
@@ -4905,10 +5035,10 @@ impl Builder {
                         .type_bound(&symbol.name, symbol.line, parameter)
                         .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
                 }
-                java.return_receiver(&symbol.name, symbol.line)
+                java.return_receiver(&symbol.name, symbol.line, symbol.java_site)
                     .cloned()
                     .or_else(|| {
-                        java.return_type(&symbol.name, symbol.line)
+                        java.return_type(&symbol.name, symbol.line, symbol.java_site)
                             .map(|path| JavaReceiver::Type(path.to_owned()))
                     })
                     .map(|receiver| (*target, receiver))
@@ -5085,7 +5215,9 @@ impl Builder {
                 self.files[symbol.file as usize]
                     .java
                     .as_ref()
-                    .and_then(|java| java.return_receiver(&symbol.name, symbol.line))
+                    .and_then(|java| {
+                        java.return_receiver(&symbol.name, symbol.line, symbol.java_site)
+                    })
                     .map(|returned| self.java_array_element_classes(*target, returned, depth + 1))
                     .unwrap_or_default()
             }
@@ -5107,8 +5239,15 @@ impl Builder {
             Some(call) => std::slice::from_ref(call),
             None => java.expression_variants(&owner.name, owner.line, line, name),
         };
+        let calls: Vec<_> = calls
+            .iter()
+            .filter(|call| Some(call.owner_site) == owner.java_site)
+            .collect();
         let mut common = None;
-        for call in calls {
+        let mut distinct_sites = Vec::new();
+        let mut exact_sites = true;
+        let mut differing_targets = false;
+        for call in &calls {
             let declared_classes = call.receiver_site.as_ref().map(|site| {
                 // Captures retain the declaring callable/type, rather than the
                 // nested callable where the receiver is used. Source-order
@@ -5285,17 +5424,36 @@ impl Builder {
                 }
             }
             targets.sort_unstable();
+            // Keep conservative overload metadata when line-only argument
+            // rows collide. Separate zero-arity calls or method references
+            // with one target each establish real edges when names coincide.
+            exact_sites &= matches!(call.arguments, Some(0) | None) && targets.len() <= 1;
+            distinct_sites.extend(targets.iter().copied());
             // An unindexed library call cannot erase a separate resolved call.
-            // Distinct indexed targets still exceed the row's line-only identity.
             if targets.is_empty() {
                 continue;
             }
             if common.as_ref().is_some_and(|previous| *previous != targets) {
-                return Some(Err(DropReason::ReceiverUnresolved));
+                differing_targets = true;
+                if !exact_sites {
+                    return Some(Err(DropReason::ReceiverUnresolved));
+                }
             }
             common = Some(targets);
         }
-        let targets = common.unwrap_or_default();
+        if differing_targets && !exact_sites {
+            return Some(Err(DropReason::ReceiverUnresolved));
+        }
+        let targets = if exact_sites {
+            distinct_sites.sort_unstable();
+            distinct_sites.dedup();
+            distinct_sites
+        } else {
+            common.unwrap_or_default()
+        };
+        if targets.len() > 1 && exact_sites {
+            return Some(Ok(Resolution::new(Confidence::Scoped, targets)));
+        }
         Some(match targets.len() {
             0 => Err(DropReason::ReceiverUnresolved),
             1 => {
@@ -5348,7 +5506,7 @@ impl Builder {
             && self.files[input_symbol.file as usize]
                 .java
                 .as_ref()
-                .and_then(|java| java.parent_types(&input_symbol.name, input_symbol.line))
+                .and_then(|java| java.parent_types_at(input_symbol.java_site))
                 .is_some_and(|parents| parents.is_empty());
         if !no_parents {
             return true;
@@ -5464,10 +5622,7 @@ impl Builder {
                     if call.receiver == "this" {
                         vec![class]
                     } else {
-                        self.parents
-                            .get(&self.syms[class as usize].qual)
-                            .cloned()
-                            .unwrap_or_default()
+                        self.parents_of(class).cloned().unwrap_or_default()
                     }
                 })
                 .collect();
