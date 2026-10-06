@@ -2199,6 +2199,40 @@ impl UsedDependencySymbols {
     }
 }
 
+/// Check accessible import declarations with one bounded source tree at a time.
+fn java_dependency_declaration(
+    conn: &Connection,
+    root: &Path,
+    resolver: &super::PathResolver,
+    qualified: &str,
+    accessing_package: &str,
+) -> Result<Option<crate::parsers::treesitter::java::DependencyImportDeclaration>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT f.path,f.root_path FROM symbols s JOIN files f ON s.file_id=f.id
+         WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
+         AND s.kind IN ('class','interface','enum') ORDER BY f.path,f.root_path",
+    )?;
+    let mut rows = statement.query(params![qualified])?;
+    while let Some(row) = rows.next()? {
+        let path: String = row.get(0)?;
+        let owner: String = row.get(1)?;
+        let content = super::grep::read_java_syntax_source(
+            &root.join(resolver.resolve_with_root_raw(&path, Some(&owner))),
+            crate::indexer::max_file_size_bytes(),
+        )?;
+        if let Some(declaration) = crate::parsers::treesitter::java::dependency_import_declaration(
+            &content,
+            qualified,
+            accessing_package,
+        )? {
+            if declaration.accessible {
+                return Ok(Some(declaration));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Check dependency identities using Java syntax and other languages' indexed refs.
 fn count_symbols_used_in_module(
     conn: &Connection,
@@ -2240,12 +2274,16 @@ fn count_symbols_used_in_module(
             crate::indexer::max_file_size_bytes(),
         )?;
         let syntax = crate::parsers::treesitter::java::dependency_syntax(&content)?;
+        let declaration =
+            |name: &str| java_dependency_declaration(conn, root, &resolver, name, &syntax.package);
         let mut identities = std::collections::BTreeSet::new();
         let mut explicit = HashMap::new();
-        let mut wildcards = vec!["java.lang".to_string()];
+        let mut explicit_static = HashSet::new();
+        let mut invalid_static_types = HashSet::new();
+        let mut wildcards = vec![("java.lang".to_string(), false)];
         for (import, is_static) in &syntax.imports {
-            if !is_static && import.ends_with(".*") {
-                wildcards.push(import.trim_end_matches(".*").to_owned());
+            if import.ends_with(".*") {
+                wildcards.push((import.trim_end_matches(".*").to_owned(), *is_static));
                 continue;
             }
             let mut owner = import.as_str();
@@ -2261,13 +2299,48 @@ fn count_symbols_used_in_module(
                 };
                 owner = prefix;
             }
-            if exists.query_row(params![owner], |row| row.get::<_, bool>(0))? {
-                identities.insert(owner.to_owned());
+            if let Some(found) = declaration(owner)? {
+                let member = import
+                    .strip_prefix(owner)
+                    .and_then(|suffix| suffix.strip_prefix('.'));
+                let valid = if *is_static {
+                    member.map_or(found.static_member, |name| {
+                        found
+                            .static_names
+                            .iter()
+                            .any(|(candidate, _)| candidate == name)
+                    })
+                } else {
+                    true
+                };
+                if valid {
+                    identities.insert(owner.to_owned());
+                }
                 if !import.ends_with(".*") && owner == import {
+                    if !valid {
+                        invalid_static_types
+                            .insert(import.rsplit('.').next().unwrap_or(import).to_owned());
+                    }
                     explicit.insert(
                         import.rsplit('.').next().unwrap_or(import).to_owned(),
                         import.clone(),
                     );
+                } else if *is_static {
+                    if let Some(member) = member {
+                        // Even an external or inaccessible single import must
+                        // block fallback to an unrelated on-demand member.
+                        let mut found_member = false;
+                        for (name, method) in &found.static_names {
+                            if name == member {
+                                explicit_static.insert((name.clone(), *method));
+                                found_member = true;
+                            }
+                        }
+                        if !found_member {
+                            explicit_static.insert((member.to_owned(), false));
+                            explicit_static.insert((member.to_owned(), true));
+                        }
+                    }
                 }
             } else if !is_static {
                 // An external explicit import still blocks matching a project
@@ -2276,6 +2349,11 @@ fn count_symbols_used_in_module(
                     import.rsplit('.').next().unwrap_or(import).to_owned(),
                     import.clone(),
                 );
+            } else if let Some((_, member)) = import.rsplit_once('.') {
+                // External single imports still take precedence; no platform
+                // symbol inference is needed to reject a wildcard fallback.
+                explicit_static.insert((member.to_owned(), false));
+                explicit_static.insert((member.to_owned(), true));
             }
         }
         for name in &syntax.types {
@@ -2284,8 +2362,34 @@ fn count_symbols_used_in_module(
                 .map_or((name.as_str(), ""), |(first, _)| {
                     (first, &name[first.len()..])
                 });
+            if syntax.expression_types.contains(name) {
+                let member = (first.to_owned(), false);
+                let mut value_import = explicit_static.contains(&member);
+                if !value_import {
+                    for (owner, is_static) in &wildcards {
+                        if *is_static
+                            && declaration(owner)?
+                                .is_some_and(|found| found.static_names.contains(&member))
+                        {
+                            value_import = true;
+                            break;
+                        }
+                    }
+                }
+                // Imported values shadow expression qualifiers, while a
+                // same-spelled type annotation remains in the type namespace.
+                if value_import {
+                    continue;
+                }
+            }
             if let Some(import) = explicit.get(first) {
-                identities.insert(format!("{import}{suffix}"));
+                if invalid_static_types.contains(first) {
+                    continue;
+                }
+                let candidate = format!("{import}{suffix}");
+                if declaration(&candidate)?.is_some() {
+                    identities.insert(candidate);
+                }
                 continue;
             }
             let local = if syntax.package.is_empty() {
@@ -2294,18 +2398,43 @@ fn count_symbols_used_in_module(
                 format!("{}.{name}", syntax.package)
             };
             if exists.query_row(params![&local], |row| row.get::<_, bool>(0))? {
-                identities.insert(local);
+                if declaration(&local)?.is_some() {
+                    identities.insert(local);
+                }
                 continue;
             }
             if name.contains('.') && exists.query_row(params![name], |row| row.get::<_, bool>(0))? {
-                identities.insert(name.clone());
+                if declaration(name)?.is_some() {
+                    identities.insert(name.clone());
+                }
                 continue;
             }
-            for package in &wildcards {
+            let mut matches = std::collections::BTreeSet::new();
+            for (package, is_static) in &wildcards {
                 let candidate = format!("{package}.{name}");
-                if exists.query_row(params![&candidate], |row| row.get::<_, bool>(0))? {
-                    identities.insert(candidate);
+                if declaration(&candidate)?.is_some_and(|found| !is_static || found.static_member) {
+                    matches.insert(candidate);
                 }
+            }
+            // Ambiguous on-demand imports are not evidence of either owner.
+            if matches.len() == 1 {
+                identities.extend(matches);
+            }
+        }
+        for member in &syntax.static_names {
+            if explicit_static.contains(member) {
+                continue;
+            }
+            let mut matches = std::collections::BTreeSet::new();
+            for (owner, is_static) in &wildcards {
+                if *is_static
+                    && declaration(owner)?.is_some_and(|found| found.static_names.contains(member))
+                {
+                    matches.insert(owner.clone());
+                }
+            }
+            if matches.len() == 1 {
+                identities.extend(matches);
             }
         }
         for identity in identities {

@@ -54,6 +54,15 @@ class CycleTests(unittest.TestCase):
         self.assertIn("Do not run git restore, git checkout or git reset", prompt)
         self.assertIn("retain unrelated and concurrent", prompt)
 
+    def test_pending_parent_requires_finite_evidence_based_closure(self):
+        prompt = cycle.agent_prompt({"evidence": "evidence.sqlite", "counts": {"pass": 100},
+                                     "unimplemented_features": 7}, Path("project"))
+        for requirement in ("finite acceptance checklist", "commands/options and entity mappings",
+                            "not a substitute for executable criteria",
+                            "Do not mark a parent implemented by relabeling",
+                            "every existing case ID"):
+            self.assertTrue(requirement in prompt, "missing concrete coverage-closure requirement")
+
     def test_recorded_problems_and_failed_verification_take_priority(self):
         cases = [{"counts": {kind: 1}} for kind in ("fail", "unsupported", "error")]
         cases.append({"counts": {"pass": 100}, "verification": {"verified": False}})

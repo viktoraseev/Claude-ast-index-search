@@ -124,7 +124,17 @@ def agent_prompt(summary: dict, root: Path) -> str:
 not just one easy command followed by another expensive full audit. Inspect the
 pending list first, group commands sharing an oracle or fixture, and implement
 the related contracts together. Do not trade correctness for a coverage count;
-leave genuinely unresolved contracts pending and explain the remaining gap."""
+leave genuinely unresolved contracts pending and explain the remaining gap.
+For each pending parent, derive a finite acceptance checklist from the actual
+commands/options and entity mappings, documented source/CLI contracts and target
+MCP evidence. Keep this checklist privately with the round evidence; connect
+each missing item to a production code path and executable test or oracle check.
+Vague labels such as 'compiler-wide' are not a substitute for executable criteria.
+The checklist must preserve the full Java API scope; narrowing it to currently
+passing fixtures is forbidden. Finish the chosen family's listed gaps together,
+and report the concrete remaining items if it cannot yet be closed.
+Do not mark a parent implemented by relabeling or dropping uncertain behaviours;
+require executed evidence for its acceptance checklist and preserve every existing case ID."""
     return f"""Read AGENTS.md and repository contributor rules. This is one round of an
 automated differential repair, not permission to redefine the goal.
 Scope is JAVA ONLY, including shared ast-index functionality on Java sources.

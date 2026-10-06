@@ -267,6 +267,169 @@ pub(crate) struct DependencySyntax {
     pub imports: Vec<(String, bool)>,
     pub types: std::collections::BTreeSet<String>,
     pub declarations: std::collections::HashSet<String>,
+    pub static_names: std::collections::BTreeSet<(String, bool)>,
+    pub expression_types: std::collections::BTreeSet<String>,
+}
+
+/// Direct importable members retain declaration modifiers, including implicit
+/// interface members. Inherited and protected-subclass lookup is separate.
+pub(crate) struct DependencyImportDeclaration {
+    pub accessible: bool,
+    pub static_member: bool,
+    pub static_names: std::collections::HashSet<(String, bool)>,
+}
+
+pub(crate) fn dependency_import_declaration(
+    content: &str,
+    qualified: &str,
+    accessing_package: &str,
+) -> Result<Option<DependencyImportDeclaration>> {
+    fn is_type(node: Node<'_>) -> bool {
+        matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        )
+    }
+    fn modifier(node: Node<'_>, content: &str, keyword: &str) -> bool {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "modifiers")
+            .is_some_and(|modifiers| {
+                let mut cursor = modifiers.walk();
+                let found = modifiers
+                    .children(&mut cursor)
+                    .any(|child| node_text(content, &child) == keyword);
+                found
+            });
+        found
+    }
+    fn interface_member(node: Node<'_>) -> bool {
+        node.parent()
+            .is_some_and(|body| matches!(body.kind(), "interface_body" | "annotation_type_body"))
+    }
+    fn accessible(node: Node<'_>, content: &str, same_package: bool) -> bool {
+        !modifier(node, content, "private")
+            && (modifier(node, content, "public") || interface_member(node) || same_package)
+    }
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let mut package = String::new();
+    let mut cursor = tree.root_node().walk();
+    for node in tree.root_node().named_children(&mut cursor) {
+        if node.kind() == "package_declaration" {
+            let mut parts = Vec::new();
+            super::walk_tree_preorder(&node, |child| {
+                if matches!(child.kind(), "annotation" | "marker_annotation") {
+                    return super::WalkControl::SkipChildren;
+                }
+                if child.kind() == "identifier" {
+                    parts.push(node_text(content, &child));
+                }
+                super::WalkControl::Continue
+            });
+            package = parts.join(".");
+        }
+    }
+    let mut result = None;
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        if !is_type(node) {
+            return super::WalkControl::Continue;
+        }
+        let mut names = Vec::new();
+        let mut current = Some(node);
+        let mut allowed = true;
+        while let Some(ancestor) = current {
+            if is_type(ancestor) {
+                if let Some(name) = ancestor.child_by_field_name("name") {
+                    names.push(node_text(content, &name));
+                }
+                allowed &= accessible(ancestor, content, package == accessing_package);
+            } else if !matches!(
+                ancestor.kind(),
+                "program"
+                    | "class_body"
+                    | "interface_body"
+                    | "enum_body"
+                    | "enum_body_declarations"
+                    | "annotation_type_body"
+            ) {
+                // Local and anonymous types cannot be imported by canonical name.
+                return super::WalkControl::Continue;
+            }
+            current = ancestor.parent();
+        }
+        names.reverse();
+        let name = if package.is_empty() {
+            names.join(".")
+        } else {
+            format!("{package}.{}", names.join("."))
+        };
+        if name != qualified {
+            return super::WalkControl::Continue;
+        }
+        let static_member = node
+            .parent()
+            .is_some_and(|parent| parent.kind() != "program")
+            && (modifier(node, content, "static")
+                || interface_member(node)
+                || matches!(
+                    node.kind(),
+                    "interface_declaration"
+                        | "annotation_type_declaration"
+                        | "enum_declaration"
+                        | "record_declaration"
+                ));
+        let mut static_names = std::collections::HashSet::new();
+        if let Some(body) = node.child_by_field_name("body") {
+            super::walk_tree_preorder(&body, |member| {
+                if member.id() == body.id() || member.kind() == "enum_body_declarations" {
+                    return super::WalkControl::Continue;
+                }
+                if member.kind() == "enum_constant" {
+                    if let Some(name) = member.child_by_field_name("name") {
+                        static_names.insert((node_text(content, &name).to_owned(), false));
+                    }
+                    return super::WalkControl::SkipChildren;
+                }
+                if !matches!(
+                    member.kind(),
+                    "field_declaration" | "constant_declaration" | "method_declaration"
+                ) || !accessible(member, content, package == accessing_package)
+                    || !(modifier(member, content, "static")
+                        || interface_member(member) && member.kind() != "method_declaration")
+                {
+                    return super::WalkControl::SkipChildren;
+                }
+                if member.kind() == "method_declaration" {
+                    if let Some(name) = member.child_by_field_name("name") {
+                        static_names.insert((node_text(content, &name).to_owned(), true));
+                    }
+                } else {
+                    let mut cursor = member.walk();
+                    for variable in member
+                        .named_children(&mut cursor)
+                        .filter(|n| n.kind() == "variable_declarator")
+                    {
+                        if let Some(name) = variable.child_by_field_name("name") {
+                            static_names.insert((node_text(content, &name).to_owned(), false));
+                        }
+                    }
+                }
+                super::WalkControl::SkipChildren
+            });
+        }
+        result = Some(DependencyImportDeclaration {
+            accessible: allowed,
+            static_member,
+            static_names,
+        });
+        super::WalkControl::SkipChildren
+    });
+    Ok(result)
 }
 
 /// Check where a pattern is definitely matched, without lending its type to
@@ -417,7 +580,27 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     }
     let mut type_shadows = Shadows::new();
     let mut value_shadows = Shadows::new();
+    let mut method_shadows = Shadows::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
+        if node.kind() == "method_declaration" {
+            if let (Some(name), Some(body)) = (
+                node.child_by_field_name("name"),
+                ancestor(
+                    node,
+                    &[
+                        "class_body",
+                        "interface_body",
+                        "enum_body",
+                        "annotation_type_body",
+                    ],
+                ),
+            ) {
+                method_shadows
+                    .entry(node_text(content, &name).to_owned())
+                    .or_default()
+                    .push(body.byte_range());
+            }
+        }
         if node.kind() == "instanceof_expression" {
             if let Some(name) = node.child_by_field_name("name") {
                 for (scope, position) in pattern_flow_scopes(node, content) {
@@ -573,6 +756,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
         visible(&type_shadows) || (expression && visible(&value_shadows))
     };
     let mut result = DependencySyntax::default();
+    let mut actual_types = std::collections::BTreeSet::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
         match node.kind() {
             "package_declaration" => {
@@ -603,6 +787,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                     if !declaration {
                         let name = spelling(node, content);
                         if !shadowed(&name, node, false) {
+                            actual_types.insert(name.clone());
                             result.types.insert(name);
                         }
                     }
@@ -612,11 +797,26 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                 if let Some(name) = node.child_by_field_name("name") {
                     let spelling = spelling(name, content);
                     if !shadowed(&spelling, name, false) {
+                        actual_types.insert(spelling.clone());
                         result.types.insert(spelling);
                     }
                 }
             }
             "method_invocation" | "field_access" => {
+                if node.kind() == "method_invocation"
+                    && node.child_by_field_name("object").is_none()
+                {
+                    if let Some(name) = node.child_by_field_name("name") {
+                        let text = node_text(content, &name);
+                        if !method_shadows.get(text).is_some_and(|ranges| {
+                            ranges
+                                .iter()
+                                .any(|range| range.contains(&name.start_byte()))
+                        }) {
+                            result.static_names.insert((text.to_owned(), true));
+                        }
+                    }
+                }
                 if let Some(object) = node.child_by_field_name("object") {
                     if matches!(
                         object.kind(),
@@ -624,7 +824,43 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                     ) {
                         let name = spelling(object, content);
                         if !shadowed(&name, object, true) {
+                            result.expression_types.insert(name.clone());
+                            result.static_names.insert((
+                                name.split('.').next().unwrap_or(&name).to_owned(),
+                                false,
+                            ));
                             result.types.insert(name);
+                        }
+                    }
+                }
+            }
+            "identifier" => {
+                if let Some(parent) = node.parent() {
+                    let is_name = parent
+                        .child_by_field_name("name")
+                        .is_some_and(|name| name.id() == node.id());
+                    let is_parameter = parent.kind() == "inferred_parameters"
+                        || parent.kind() == "lambda_expression"
+                            && parent
+                                .child_by_field_name("parameters")
+                                .is_some_and(|p| p.id() == node.id());
+                    if !is_name
+                        && !is_parameter
+                        && !matches!(
+                            parent.kind(),
+                            "field_access"
+                                | "scoped_identifier"
+                                | "method_invocation"
+                                | "package_declaration"
+                                | "import_declaration"
+                                | "annotation"
+                                | "marker_annotation"
+                                | "scoped_type_identifier"
+                        )
+                    {
+                        let name = node_text(content, &node);
+                        if !shadowed(name, node, true) {
+                            result.static_names.insert((name.to_owned(), false));
                         }
                     }
                 }
@@ -652,6 +888,9 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
         }
         super::WalkControl::Continue
     });
+    result
+        .expression_types
+        .retain(|name| !actual_types.contains(name));
     Ok(result)
 }
 
