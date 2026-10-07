@@ -1810,7 +1810,7 @@ class Fixture:
         if self._java_resource_results is None:
             self._java_resource_results = java_resource_contracts.exercise(self.binary, self.database.parent)
         expected, actual = (section[check['feature']] for section in self._java_resource_results)
-        return {'source': java_resource_contracts.REASON, 'samples': expected}, actual, \
+        return {'source': java_resource_contracts.reason(check['feature']), 'samples': expected}, actual, \
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 

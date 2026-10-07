@@ -22,11 +22,12 @@ class SyntheticTextOracle:
 
     def call(self, tool, arguments):
         self.calls.append((tool, arguments))
-        path, = arguments['paths']
-        if self.interrupt == path:
+        paths = arguments['paths']
+        if self.interrupt in paths:
             raise ToolError('synthetic network interruption')
         assert tool == 'ide_search_text' and arguments['regex'] is True
         return {'matches': [{'file': path, 'line': index, 'context': line.strip()}
+                            for path in paths
                             for index, line in enumerate((self.root / path).read_text().split('\n'), 1)
                             if line], 'hasMore': False}
 
@@ -57,16 +58,17 @@ class TextSnapshotTests(unittest.TestCase):
         for identity, query in (('type', 'Example'), ('unicode', 'Ω'), ('absent', 'Missing')):
             result = self.snapshot.search(identity, query)
             self.assertEqual(bool(result), identity != 'absent')
-        self.assertEqual(len(self.client.calls), 2)
+        self.assertEqual(len(self.client.calls), 1)
         self.assertEqual(self.state.execute('SELECT count(*) FROM text_snapshot_dependencies').fetchone()[0], 3)
         self.assertEqual(self.state.execute('SELECT count(*) FROM text_snapshot_pages').fetchone()[0], 2)
         self.assertEqual(self.state.execute('SELECT count(*) FROM pages').fetchone()[0], 0)
-        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0], 2)
+        self.assertEqual(self.state.execute('SELECT count(*) FROM oracle_responses').fetchone()[0], 1)
 
     def test_interruption_resumes_at_file_checkpoint_even_with_invocation_cache(self):
         self.client.interrupt = 'Other.java'
         cached = InvocationOracle(self.client, self.state)
         interrupted = TextSnapshot(self.root, self.state, cached, cached.metrics)
+        interrupted.GROUP_FILES = 1  # Explicit legacy per-file checkpoint contract.
         with self.assertRaises(ToolError):
             interrupted.search('type', 'Example')
         self.assertIsNone(self.state.execute("SELECT value FROM metadata WHERE key='text_snapshot_complete'").fetchone())
@@ -126,9 +128,9 @@ class TextSnapshotTests(unittest.TestCase):
             for _ in range(2):
                 fixture.evaluate(self.state.execute("SELECT * FROM checks WHERE id='type'").fetchone())
         self.assertEqual(self.state.execute("SELECT verdict FROM checks WHERE id='type'").fetchone()[0], 'pass')
-        self.assertEqual(len(responses), 3)  # One failed bulk probe, two actual literal calls.
-        self.assertEqual(responses[1]['query'], 'Example')
-        self.assertNotIn('regex', responses[1])
+        self.assertEqual(len(responses), 4)  # Group and legacy capability probes, then two literal calls.
+        self.assertEqual(responses[2]['query'], 'Example')
+        self.assertNotIn('regex', responses[2])
         self.assertEqual(self.state.execute('SELECT count(*) FROM text_snapshot_dependencies').fetchone()[0], 0)
 
     def test_production_cli_and_archived_replay_use_the_same_fixture(self):
@@ -143,7 +145,7 @@ class TextSnapshotTests(unittest.TestCase):
         for check in list(self.state.execute('SELECT * FROM checks')):
             fixture.evaluate(check)
         self.assertEqual([row[0] for row in self.state.execute('SELECT verdict FROM checks')], ['pass'] * 3)
-        self.assertEqual(len(self.client.calls), 2)
+        self.assertEqual(len(self.client.calls), 1)
         # Force archived cases into the replay batch: this checks replay
         # plumbing, not a claim of a production regression being repaired.
         with self.state:

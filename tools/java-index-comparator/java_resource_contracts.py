@@ -10,12 +10,20 @@ import tempfile
 from common import ToolError, stable_id
 from root_contracts import Runner
 from android_contracts import observation
+import java_resource_binding_contracts
 
 FEATURES = {'resource-usages:java-lexical', 'resource-usages:java-imports',
-            'resource-usages:java-namespace-literals'}
+            'resource-usages:java-namespace-literals', *java_resource_binding_contracts.FEATURES}
 REASON = ('independent source/state: disposable Java expression locations, comment/literal '
           'exclusion, explicit/static R imports and literal Gradle namespace ownership; '
           'not MCP equivalence or compiler-wide resource resolution')
+
+
+def reason(feature):
+    return (java_resource_binding_contracts.REASON
+            if feature in java_resource_binding_contracts.FEATURES else REASON)
+
+
 SOURCES = {
     'app/Local.java': '''class Local {
  int direct = R.string.direct;
@@ -67,11 +75,14 @@ def plan_java_resources(state, root):
         return
     with state:
         for feature in sorted(FEATURES):
+            if feature in java_resource_binding_contracts.FEATURES:
+                continue
             state.execute('INSERT OR REPLACE INTO coverage VALUES (?,?,?)',
                           (feature, 'implemented', REASON))
             subject = 'disposable-java-resource-syntax-v1'
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
+    java_resource_binding_contracts.plan_bindings(state, root)
 
 
 def exercise(binary, base):
@@ -128,4 +139,7 @@ def exercise(binary, base):
         expected[ownership]['unused:' + module] = {**observation(''),
             'unused': sorted('string/' + name for name in unused), 'unused_total': len(unused)}
         actual[ownership]['unused:' + module] = observation(output)
+    binding_expected, binding_actual = java_resource_binding_contracts.exercise(binary, base)
+    expected.update(binding_expected)
+    actual.update(binding_actual)
     return expected, actual

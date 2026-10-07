@@ -114,6 +114,231 @@ pub(crate) struct ResourceReference {
     pub offset: usize,
 }
 
+/// Byte-scoped lexical names shared by Java dependencies and resource expressions.
+#[derive(Default)]
+struct LexicalShadows {
+    types: HashMap<String, Vec<std::ops::Range<usize>>>,
+    values: HashMap<String, Vec<std::ops::Range<usize>>>,
+    methods: HashMap<String, Vec<std::ops::Range<usize>>>,
+}
+
+impl LexicalShadows {
+    fn visible(
+        names: &HashMap<String, Vec<std::ops::Range<usize>>>,
+        name: &str,
+        node: Node<'_>,
+    ) -> bool {
+        names.get(name).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|range| range.contains(&node.start_byte()))
+        })
+    }
+
+    fn expression(&self, name: &str, node: Node<'_>) -> bool {
+        let first = name.split('.').next().unwrap_or(name);
+        Self::visible(&self.types, first, node) || Self::visible(&self.values, first, node)
+    }
+}
+
+fn lexical_shadows(root: Node<'_>, content: &str) -> LexicalShadows {
+    // A declaration's spelling is not a file-wide shadow. Keep byte ranges
+    // per name so adjacent blocks/methods, including sites on one line, retain
+    // their own Java type and expression namespaces.
+    fn ancestor<'a>(node: tree_sitter::Node<'a>, kinds: &[&str]) -> Option<tree_sitter::Node<'a>> {
+        let mut parent = node.parent();
+        while let Some(scope) = parent {
+            if kinds.contains(&scope.kind()) {
+                return Some(scope);
+            }
+            parent = scope.parent();
+        }
+        None
+    }
+    let mut type_shadows: HashMap<String, Vec<std::ops::Range<usize>>> = HashMap::new();
+    let mut value_shadows: HashMap<String, Vec<std::ops::Range<usize>>> = HashMap::new();
+    let mut method_shadows: HashMap<String, Vec<std::ops::Range<usize>>> = HashMap::new();
+    super::walk_tree_preorder(&root, |node| {
+        if node.kind() == "enum_constant" {
+            if let (Some(name), Some(body)) = (
+                node.child_by_field_name("name"),
+                ancestor(node, &["enum_body"]),
+            ) {
+                value_shadows
+                    .entry(node_text(content, &name).to_owned())
+                    .or_default()
+                    .push(body.byte_range());
+            }
+        }
+        if node.kind() == "method_declaration" {
+            if let (Some(name), Some(body)) = (
+                node.child_by_field_name("name"),
+                ancestor(
+                    node,
+                    &[
+                        "class_body",
+                        "interface_body",
+                        "enum_body",
+                        "annotation_type_body",
+                    ],
+                ),
+            ) {
+                method_shadows
+                    .entry(node_text(content, &name).to_owned())
+                    .or_default()
+                    .push(body.byte_range());
+            }
+        }
+        if node.kind() == "instanceof_expression" {
+            if let Some(name) = node.child_by_field_name("name") {
+                for (scope, position) in pattern_flow_scopes(node, content) {
+                    value_shadows
+                        .entry(node_text(content, &name).to_owned())
+                        .or_default()
+                        .push(position.max(scope.start_byte())..scope.end_byte());
+                }
+            }
+        }
+        if node.kind() == "resource" {
+            if let (Some(name), Some(specification)) =
+                (node.child_by_field_name("name"), node.parent())
+            {
+                // Resources are visible in their own and subsequent
+                // initializers and in the try body, never catch/finally.
+                for scope in [
+                    Some(specification),
+                    specification
+                        .parent()
+                        .and_then(|statement| statement.child_by_field_name("body")),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    value_shadows
+                        .entry(node_text(content, &name).to_owned())
+                        .or_default()
+                        .push(name.start_byte().max(scope.start_byte())..scope.end_byte());
+                }
+            }
+        }
+        let type_declaration = matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        );
+        let binding = if type_declaration {
+            ancestor(
+                node,
+                &[
+                    "program",
+                    "class_body",
+                    "interface_body",
+                    "enum_body",
+                    "block",
+                    "switch_block",
+                ],
+            )
+            .map(|scope| {
+                (
+                    true,
+                    node.child_by_field_name("name"),
+                    if matches!(scope.kind(), "block" | "switch_block") {
+                        node.start_byte()..scope.end_byte()
+                    } else {
+                        scope.byte_range()
+                    },
+                )
+            })
+        } else if node.kind() == "type_parameter" {
+            node.parent()
+                .and_then(|parameters| parameters.parent())
+                .map(|owner| (true, node.named_child(0), owner.byte_range()))
+        } else if node.kind() == "variable_declarator" {
+            ancestor(
+                node,
+                &[
+                    "class_body",
+                    "interface_body",
+                    "enum_body",
+                    "block",
+                    "for_statement",
+                ],
+            )
+            .map(|scope| {
+                (
+                    false,
+                    node.child_by_field_name("name"),
+                    if matches!(scope.kind(), "block" | "for_statement") {
+                        node.start_byte()..scope.end_byte()
+                    } else {
+                        scope.byte_range()
+                    },
+                )
+            })
+        } else if matches!(
+            node.kind(),
+            "formal_parameter" | "spread_parameter" | "catch_formal_parameter"
+        ) {
+            ancestor(
+                node,
+                &[
+                    "method_declaration",
+                    "constructor_declaration",
+                    "lambda_expression",
+                    "catch_clause",
+                    "record_declaration",
+                ],
+            )
+            .map(|scope| {
+                let name = node.child_by_field_name("name").or_else(|| {
+                    let mut cursor = node.walk();
+                    let mut children = node.named_children(&mut cursor);
+                    children
+                        .find(|child| child.kind() == "variable_declarator")
+                        .and_then(|child| child.child_by_field_name("name"))
+                });
+                (false, name, scope.byte_range())
+            })
+        } else if node.kind() == "identifier"
+            && node.parent().is_some_and(|parent| {
+                parent.kind() == "inferred_parameters"
+                    || (parent.kind() == "lambda_expression"
+                        && parent
+                            .child_by_field_name("parameters")
+                            .is_some_and(|p| p.id() == node.id()))
+            })
+        {
+            ancestor(node, &["lambda_expression"])
+                .map(|scope| (false, Some(node), scope.byte_range()))
+        } else if node.kind() == "enhanced_for_statement" {
+            node.child_by_field_name("body")
+                .map(|scope| (false, node.child_by_field_name("name"), scope.byte_range()))
+        } else {
+            None
+        };
+        if let Some((is_type, Some(name), range)) = binding {
+            let shadows = if is_type {
+                &mut type_shadows
+            } else {
+                &mut value_shadows
+            };
+            shadows
+                .entry(node_text(content, &name).to_owned())
+                .or_default()
+                .push(range);
+        }
+        super::WalkControl::Continue
+    });
+    LexicalShadows {
+        types: type_shadows,
+        values: value_shadows,
+        methods: method_shadows,
+    }
+}
+
 /// Read Java R expressions and imported resource constants, excluding literals/import sites.
 pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference>> {
     fn parts(node: tree_sitter::Node<'_>, content: &str) -> Option<Vec<String>> {
@@ -141,8 +366,11 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
     }
 
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    let shadows = lexical_shadows(tree.root_node(), content);
     let mut imported_r = Vec::new();
+    let mut explicit_types = std::collections::HashSet::new();
     let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+    let mut type_wildcards = Vec::new();
     let mut constants: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut wildcards = Vec::new();
     let mut cursor = tree.root_node().walk();
@@ -157,6 +385,15 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
             }
             super::WalkControl::Continue
         });
+        let mut cursor = declaration.walk();
+        let is_static = declaration
+            .children(&mut cursor)
+            .any(|n| n.kind() == "static");
+        if !is_static {
+            if let Some(name) = names.last().filter(|name| *name != "*") {
+                explicit_types.insert(name.clone());
+            }
+        }
         let Some(r) = names.iter().rposition(|p| p == "R") else {
             continue;
         };
@@ -164,13 +401,10 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
             continue;
         }
         let namespace = names[..r].join(".");
-        let mut cursor = declaration.walk();
-        let is_static = declaration
-            .children(&mut cursor)
-            .any(|n| n.kind() == "static");
         match (&names[r + 1..], is_static) {
             ([], false) => imported_r.push(namespace),
-            ([kind], false) => aliases.entry(kind.clone()).or_default().push(namespace),
+            ([kind], _) if kind == "*" => type_wildcards.push(namespace),
+            ([kind], _) => aliases.entry(kind.clone()).or_default().push(namespace),
             ([kind, name], true) => {
                 let target = (namespace, kind.clone());
                 if name == "*" {
@@ -207,6 +441,11 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
         if node.kind() == "field_access" {
             if let Some(names) = parts(node, content) {
                 let n = names.len();
+                // Reclassification of an expression name prefers lexical
+                // variables/types over imported types and package prefixes.
+                if shadows.expression(&names[0], node) {
+                    return super::WalkControl::Continue;
+                }
                 if n >= 3 && names[n - 3] == "R" {
                     let namespace = if n > 3 {
                         Some(names[..n - 3].join("."))
@@ -222,6 +461,12 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
                 } else if n == 2 {
                     if let Some(namespace) = aliases.get(&names[0]).and_then(|v| unique(v)) {
                         emit(Some(namespace), &names[0], &names[1]);
+                    } else if !aliases.contains_key(&names[0])
+                        && !explicit_types.contains(&names[0])
+                    {
+                        for namespace in &type_wildcards {
+                            emit(Some(namespace.clone()), &names[0], &names[1]);
+                        }
                     }
                 }
             }
@@ -236,6 +481,7 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
                     && !matches!(
                         parent.kind(),
                         "field_access"
+                            | "method_reference"
                             | "scoped_identifier"
                             | "scoped_type_identifier"
                             | "marker_annotation"
@@ -246,6 +492,11 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
                     )
                 {
                     let name = node_text(content, &node);
+                    // Types and methods use separate namespaces: a type or
+                    // method named hit does not hide an imported field hit.
+                    if LexicalShadows::visible(&shadows.values, name, node) {
+                        return super::WalkControl::Continue;
+                    }
                     let targets = constants.get(name).unwrap_or(&wildcards);
                     // Explicit imports take precedence. Distinct wildcard
                     // targets need resource ownership to disambiguate later.
@@ -258,6 +509,53 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
         super::WalkControl::Continue
     });
     Ok(output)
+}
+
+#[cfg(test)]
+mod resource_binding_tests {
+    use super::resource_references;
+
+    #[test]
+    fn same_line_local_receivers_only_hide_their_own_expression_sites() {
+        let source = r#"import fixture.library.R;
+class Probe {
+    int use() { int n = R.string.hit; { Object R = null; n += R.string.hit; } return n + R.string.hit; }
+}"#;
+        let sites = resource_references(source).unwrap();
+        let offsets: Vec<_> = source
+            .match_indices("R.string.hit")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(sites.len(), 2);
+        assert_eq!(
+            sites.iter().map(|site| site.offset).collect::<Vec<_>>(),
+            vec![offsets[0], offsets[2]]
+        );
+        assert!(sites
+            .iter()
+            .all(|site| site.namespace.as_deref() == Some("fixture.library")
+                && site.resource_type == "string"
+                && site.name == "hit"));
+    }
+
+    #[test]
+    fn static_field_imports_keep_type_and_method_namespaces_separate() {
+        let source = r#"import static fixture.library.R.string.hit;
+class Probe {
+    static class hit {}
+    int hit() { return hit; }
+    int use(int hit) { return hit; }
+    java.util.function.Supplier<hit> callback = hit::new;
+}
+enum Choice { hit; Object use() { return hit; } }
+class Other { int use() { return hit; } }
+"#;
+        let sites = resource_references(source).unwrap();
+        assert_eq!(
+            sites.iter().map(|site| site.line).collect::<Vec<_>>(),
+            vec![4, 9]
+        );
+    }
 }
 
 /// Java dependency anchors retain qualified type spelling and import ownership.
@@ -762,196 +1060,20 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     }
 
     let tree = parse_tree(content, &JAVA_LANGUAGE)?;
-    // A declaration's spelling is not a file-wide shadow. Keep byte ranges
-    // per name so adjacent blocks/methods, including sites on one line, retain
-    // their own Java type and expression namespaces.
-    type Shadows = std::collections::HashMap<String, Vec<std::ops::Range<usize>>>;
-    fn ancestor<'a>(node: tree_sitter::Node<'a>, kinds: &[&str]) -> Option<tree_sitter::Node<'a>> {
-        let mut parent = node.parent();
-        while let Some(scope) = parent {
-            if kinds.contains(&scope.kind()) {
-                return Some(scope);
-            }
-            parent = scope.parent();
-        }
-        None
-    }
-    let mut type_shadows = Shadows::new();
-    let mut value_shadows = Shadows::new();
-    let mut method_shadows = Shadows::new();
-    super::walk_tree_preorder(&tree.root_node(), |node| {
-        if node.kind() == "method_declaration" {
-            if let (Some(name), Some(body)) = (
-                node.child_by_field_name("name"),
-                ancestor(
-                    node,
-                    &[
-                        "class_body",
-                        "interface_body",
-                        "enum_body",
-                        "annotation_type_body",
-                    ],
-                ),
-            ) {
-                method_shadows
-                    .entry(node_text(content, &name).to_owned())
-                    .or_default()
-                    .push(body.byte_range());
-            }
-        }
-        if node.kind() == "instanceof_expression" {
-            if let Some(name) = node.child_by_field_name("name") {
-                for (scope, position) in pattern_flow_scopes(node, content) {
-                    value_shadows
-                        .entry(node_text(content, &name).to_owned())
-                        .or_default()
-                        .push(position.max(scope.start_byte())..scope.end_byte());
-                }
-            }
-        }
-        if node.kind() == "resource" {
-            if let (Some(name), Some(specification)) =
-                (node.child_by_field_name("name"), node.parent())
-            {
-                // Resources are visible in their own and subsequent
-                // initializers and in the try body, never catch/finally.
-                for scope in [
-                    Some(specification),
-                    specification
-                        .parent()
-                        .and_then(|statement| statement.child_by_field_name("body")),
-                ]
-                .into_iter()
-                .flatten()
-                {
-                    value_shadows
-                        .entry(node_text(content, &name).to_owned())
-                        .or_default()
-                        .push(name.start_byte().max(scope.start_byte())..scope.end_byte());
-                }
-            }
-        }
-        let type_declaration = matches!(
-            node.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-                | "annotation_type_declaration"
-        );
-        let binding = if type_declaration {
-            ancestor(
-                node,
-                &[
-                    "program",
-                    "class_body",
-                    "interface_body",
-                    "enum_body",
-                    "block",
-                    "switch_block",
-                ],
-            )
-            .map(|scope| {
-                (
-                    true,
-                    node.child_by_field_name("name"),
-                    if matches!(scope.kind(), "block" | "switch_block") {
-                        node.start_byte()..scope.end_byte()
-                    } else {
-                        scope.byte_range()
-                    },
-                )
-            })
-        } else if node.kind() == "type_parameter" {
-            node.parent()
-                .and_then(|parameters| parameters.parent())
-                .map(|owner| (true, node.named_child(0), owner.byte_range()))
-        } else if node.kind() == "variable_declarator" {
-            ancestor(
-                node,
-                &[
-                    "class_body",
-                    "interface_body",
-                    "enum_body",
-                    "block",
-                    "for_statement",
-                ],
-            )
-            .map(|scope| {
-                (
-                    false,
-                    node.child_by_field_name("name"),
-                    if matches!(scope.kind(), "block" | "for_statement") {
-                        node.start_byte()..scope.end_byte()
-                    } else {
-                        scope.byte_range()
-                    },
-                )
-            })
-        } else if matches!(
-            node.kind(),
-            "formal_parameter" | "spread_parameter" | "catch_formal_parameter"
-        ) {
-            ancestor(
-                node,
-                &[
-                    "method_declaration",
-                    "constructor_declaration",
-                    "lambda_expression",
-                    "catch_clause",
-                    "record_declaration",
-                ],
-            )
-            .map(|scope| {
-                let name = node.child_by_field_name("name").or_else(|| {
-                    let mut cursor = node.walk();
-                    let mut children = node.named_children(&mut cursor);
-                    children
-                        .find(|child| child.kind() == "variable_declarator")
-                        .and_then(|child| child.child_by_field_name("name"))
-                });
-                (false, name, scope.byte_range())
-            })
-        } else if node.kind() == "identifier"
-            && node.parent().is_some_and(|parent| {
-                parent.kind() == "inferred_parameters"
-                    || (parent.kind() == "lambda_expression"
-                        && parent
-                            .child_by_field_name("parameters")
-                            .is_some_and(|p| p.id() == node.id()))
-            })
-        {
-            ancestor(node, &["lambda_expression"])
-                .map(|scope| (false, Some(node), scope.byte_range()))
-        } else if node.kind() == "enhanced_for_statement" {
-            node.child_by_field_name("body")
-                .map(|scope| (false, node.child_by_field_name("name"), scope.byte_range()))
-        } else {
-            None
-        };
-        if let Some((is_type, Some(name), range)) = binding {
-            let shadows = if is_type {
-                &mut type_shadows
-            } else {
-                &mut value_shadows
-            };
-            shadows
-                .entry(node_text(content, &name).to_owned())
-                .or_default()
-                .push(range);
-        }
-        super::WalkControl::Continue
-    });
+    let lexical = lexical_shadows(tree.root_node(), content);
+    let type_shadows = &lexical.types;
+    let value_shadows = &lexical.values;
+    let method_shadows = &lexical.methods;
     let shadowed = |name: &str, node: tree_sitter::Node<'_>, expression: bool| {
         let first = name.split('.').next().unwrap_or(name);
-        let visible = |shadows: &Shadows| {
+        let visible = |shadows: &HashMap<String, Vec<std::ops::Range<usize>>>| {
             shadows.get(first).is_some_and(|ranges| {
                 ranges
                     .iter()
                     .any(|range| range.contains(&node.start_byte()))
             })
         };
-        visible(&type_shadows) || (expression && visible(&value_shadows))
+        visible(type_shadows) || (expression && visible(value_shadows))
     };
     fn record_member(
         result: &mut DependencySyntax,
