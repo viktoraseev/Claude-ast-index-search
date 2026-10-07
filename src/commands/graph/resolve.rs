@@ -2534,15 +2534,19 @@ impl Builder {
                 let java = self.files[symbol.file as usize].java.as_ref()?;
                 // A method parameter can shadow a class parameter with the same name.
                 if java
-                    .parameter_index(&symbol.name, symbol.line, parameter)
+                    .parameter_index(&symbol.name, symbol.line, symbol.java_site, parameter)
                     .is_some()
                 {
                     return None;
                 }
                 let class = self.class_scope(target)?;
                 let class_symbol = &self.syms[class as usize];
-                let index =
-                    java.parameter_index(&class_symbol.name, class_symbol.line, parameter)?;
+                let index = java.parameter_index(
+                    &class_symbol.name,
+                    class_symbol.line,
+                    class_symbol.java_site,
+                    parameter,
+                )?;
                 let owner = &self.syms[source as usize];
                 let source_java = self.files[owner.file as usize].java.as_ref()?;
                 let call = source_java
@@ -2618,7 +2622,7 @@ impl Builder {
                         if let Some(class) = self.class_scope(target) {
                             let class = &self.syms[class as usize];
                             if java
-                                .type_bound(&class.name, class.line, parameter)
+                                .type_bound(&class.name, class.line, class.java_site, parameter)
                                 .is_some_and(|bound| {
                                     self.resolve_java_type(
                                         target,
@@ -3665,13 +3669,48 @@ impl Builder {
                     let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
                         return Vec::new();
                     };
-                    let classes =
-                        if let Some(parameter) = java.return_parameter(&symbol.name, symbol.line) {
-                            if java
-                                .parameter_index(&symbol.name, symbol.line, parameter)
-                                .is_some()
-                            {
-                                java.type_bound(&symbol.name, symbol.line, parameter)
+                    let classes = if let Some(parameter) =
+                        java.return_parameter(&symbol.name, symbol.line, symbol.java_site)
+                    {
+                        if java
+                            .parameter_index(&symbol.name, symbol.line, symbol.java_site, parameter)
+                            .is_some()
+                        {
+                            java.type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
+                                .map(|bound| {
+                                    self.resolve_java_type(
+                                        target,
+                                        self.namespace_of(target),
+                                        bound,
+                                        None,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        } else if let Some(class) = self.class_scope(target) {
+                            let owner = &self.syms[class as usize];
+                            let bound = receiver
+                                .as_deref()
+                                .and_then(|receiver| {
+                                    java.parameter_index(
+                                        &owner.name,
+                                        owner.line,
+                                        owner.java_site,
+                                        parameter,
+                                    )
+                                    .map(|index| {
+                                        self.java_argument_classes(
+                                            source,
+                                            receiver,
+                                            index,
+                                            depth + 1,
+                                        )
+                                    })
+                                })
+                                .unwrap_or_default();
+                            if !bound.is_empty() {
+                                bound
+                            } else {
+                                java.type_bound(&owner.name, owner.line, owner.java_site, parameter)
                                     .map(|bound| {
                                         self.resolve_java_type(
                                             target,
@@ -3681,50 +3720,21 @@ impl Builder {
                                         )
                                     })
                                     .unwrap_or_default()
-                            } else if let Some(class) = self.class_scope(target) {
-                                let owner = &self.syms[class as usize];
-                                let bound = receiver
-                                    .as_deref()
-                                    .and_then(|receiver| {
-                                        java.parameter_index(&owner.name, owner.line, parameter)
-                                            .map(|index| {
-                                                self.java_argument_classes(
-                                                    source,
-                                                    receiver,
-                                                    index,
-                                                    depth + 1,
-                                                )
-                                            })
-                                    })
-                                    .unwrap_or_default();
-                                if !bound.is_empty() {
-                                    bound
-                                } else {
-                                    java.type_bound(&owner.name, owner.line, parameter)
-                                        .map(|bound| {
-                                            self.resolve_java_type(
-                                                target,
-                                                self.namespace_of(target),
-                                                bound,
-                                                None,
-                                            )
-                                        })
-                                        .unwrap_or_default()
-                                }
-                            } else {
-                                Vec::new()
                             }
-                        } else if let Some(receiver) =
-                            java.return_receiver(&symbol.name, symbol.line, symbol.java_site)
-                        {
-                            self.java_receiver_classes(target, receiver, depth + 1)
-                        } else if let Some(path) =
-                            java.return_type(&symbol.name, symbol.line, symbol.java_site)
-                        {
-                            self.resolve_java_type(target, self.namespace_of(target), path, None)
                         } else {
-                            return Vec::new();
-                        };
+                            Vec::new()
+                        }
+                    } else if let Some(receiver) =
+                        java.return_receiver(&symbol.name, symbol.line, symbol.java_site)
+                    {
+                        self.java_receiver_classes(target, receiver, depth + 1)
+                    } else if let Some(path) =
+                        java.return_type(&symbol.name, symbol.line, symbol.java_site)
+                    {
+                        self.resolve_java_type(target, self.namespace_of(target), path, None)
+                    } else {
+                        return Vec::new();
+                    };
                     if classes.len() != 1
                         || common.as_ref().is_some_and(|previous| *previous != classes)
                     {
@@ -4605,9 +4615,12 @@ impl Builder {
                         (self.class_scope(*target), receiver.as_deref())
                     {
                         let owner = &self.syms[class as usize];
-                        if let Some(index) =
-                            java.parameter_index(&owner.name, owner.line, parameter)
-                        {
+                        if let Some(index) = java.parameter_index(
+                            &owner.name,
+                            owner.line,
+                            owner.java_site,
+                            parameter,
+                        ) {
                             if let Some(value) =
                                 self.java_argument_receiver(source, receiver, index, depth + 1)
                             {
@@ -4656,11 +4669,11 @@ impl Builder {
                     }
                     if inferred.is_none() {
                         let bound = java
-                            .type_bound(&symbol.name, symbol.line, parameter)
+                            .type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
                             .or_else(|| {
                                 let class = self.class_scope(*target)?;
                                 let owner = &self.syms[class as usize];
-                                java.type_bound(&owner.name, owner.line, parameter)
+                                java.type_bound(&owner.name, owner.line, owner.java_site, parameter)
                             });
                         return bound.map(|path| (*target, JavaReceiver::Type(path.to_owned())));
                     }
@@ -4973,8 +4986,12 @@ impl Builder {
                                     })?;
                                 if let JavaReceiver::Parameter(parameter) = getter {
                                     let java = self.files[symbol.file as usize].java.as_ref()?;
-                                    let index =
-                                        java.parameter_index(&symbol.name, symbol.line, parameter)?;
+                                    let index = java.parameter_index(
+                                        &symbol.name,
+                                        symbol.line,
+                                        symbol.java_site,
+                                        parameter,
+                                    )?;
                                     return self.java_argument_receiver(
                                         *context,
                                         receiver,
@@ -5015,16 +5032,21 @@ impl Builder {
                 };
                 let symbol = &self.syms[*target as usize];
                 let java = self.files[symbol.file as usize].java.as_ref()?;
-                if let Some(parameter) = java.return_parameter(&symbol.name, symbol.line) {
+                if let Some(parameter) =
+                    java.return_parameter(&symbol.name, symbol.line, symbol.java_site)
+                {
                     if java
-                        .parameter_index(&symbol.name, symbol.line, parameter)
+                        .parameter_index(&symbol.name, symbol.line, symbol.java_site, parameter)
                         .is_none()
                     {
                         let class = self.class_scope(*target)?;
                         let owner = &self.syms[class as usize];
-                        if let Some(index) =
-                            java.parameter_index(&owner.name, owner.line, parameter)
-                        {
+                        if let Some(index) = java.parameter_index(
+                            &owner.name,
+                            owner.line,
+                            owner.java_site,
+                            parameter,
+                        ) {
                             if let Some((context, receiver)) = &bound {
                                 if let Some(value) = self.java_argument_receiver(
                                     *context,
@@ -5037,11 +5059,11 @@ impl Builder {
                             }
                         }
                         return java
-                            .type_bound(&owner.name, owner.line, parameter)
+                            .type_bound(&owner.name, owner.line, owner.java_site, parameter)
                             .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
                     }
                     return java
-                        .type_bound(&symbol.name, symbol.line, parameter)
+                        .type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
                         .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
                 }
                 java.return_receiver(&symbol.name, symbol.line, symbol.java_site)

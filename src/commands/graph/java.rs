@@ -96,9 +96,9 @@ pub(super) struct JavaSource {
     member_receivers: HashMap<(String, i64, usize), JavaReceiver>,
     member_invocation_types: HashMap<(String, i64, usize), Option<String>>,
     getter_receivers: HashMap<(String, i64, String), Option<(i64, JavaReceiver)>>,
-    type_parameters: HashMap<(String, i64), Vec<String>>,
-    return_parameters: HashMap<(String, i64), String>,
-    type_bounds: HashMap<(String, i64, String), String>,
+    type_parameters: HashMap<(String, i64, usize), Vec<String>>,
+    return_parameters: HashMap<(String, i64, usize), String>,
+    type_bounds: HashMap<(String, i64, usize), HashMap<String, String>>,
     expressions: HashMap<(String, i64, i64, String), Option<ExpressionCall>>,
     expression_variants: HashMap<(String, i64, i64, String), Vec<ExpressionCall>>,
     constructors: HashMap<(String, i64, i64, String), Option<ConstructorCall>>,
@@ -2296,6 +2296,7 @@ impl JavaSource {
             invocation_owners: invocation_owners(tree.root_node(), source, &declarations),
             ..Self::default()
         };
+        let mut implicit_accessors = Vec::new();
         let mut cursor = tree.root_node().walk();
         for declaration in tree.root_node().named_children(&mut cursor) {
             match declaration.kind() {
@@ -2457,6 +2458,7 @@ impl JavaSource {
                 let key = (
                     text(name, source).to_owned(),
                     name.start_position().row as i64 + 1,
+                    name.start_byte(),
                 );
                 let mut declared = Vec::new();
                 let mut cursor = parameters.walk();
@@ -2477,7 +2479,9 @@ impl JavaSource {
                         if let Some(bound) = bound {
                             result
                                 .type_bounds
-                                .insert((key.0.clone(), key.1, parameter_name), bound);
+                                .entry(key.clone())
+                                .or_default()
+                                .insert(parameter_name, bound);
                         }
                     }
                 }
@@ -3058,6 +3062,11 @@ impl JavaSource {
                             explicit
                         });
                         if !explicit {
+                            implicit_accessors.push((
+                                text(name, source).to_owned(),
+                                name.start_position().row as i64 + 1,
+                                name.start_byte(),
+                            ));
                             if let Some(parameter) = component
                                 .child_by_field_name("type")
                                 .and_then(|ty| type_name(ty, source))
@@ -3070,6 +3079,7 @@ impl JavaSource {
                                     (
                                         text(name, source).to_owned(),
                                         name.start_position().row as i64 + 1,
+                                        name.start_byte(),
                                     ),
                                     parameter,
                                 );
@@ -3145,6 +3155,7 @@ impl JavaSource {
                             (
                                 text(name, source).to_owned(),
                                 name.start_position().row as i64 + 1,
+                                name.start_byte(),
                             ),
                             parameter,
                         );
@@ -3658,6 +3669,20 @@ impl JavaSource {
         // Retain unknown binding types and collisions as negative evidence.
         // Removing them would revive an unrelated name-based fallback.
         result.invocations.retain(|key, _| tracked.contains(key));
+        // The parser appends synthetic accessors after explicit methods. Match
+        // that ordinal order while retaining each record component's byte site.
+        for (name, line, site) in implicit_accessors {
+            result
+                .symbol_sites
+                .entry((name.clone(), line, "function".to_owned()))
+                .or_default()
+                .push(site);
+            result
+                .invocation_signatures
+                .entry((name, line))
+                .or_default()
+                .push((Vec::new(), false));
+        }
         Ok(result)
     }
 
@@ -3850,22 +3875,31 @@ impl JavaSource {
             .as_ref()
     }
 
-    pub fn parameter_index(&self, name: &str, line: i64, parameter: &str) -> Option<usize> {
-        self.type_parameters
-            .get(&(name.to_owned(), line))?
+    pub fn parameter_index(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+        parameter: &str,
+    ) -> Option<usize> {
+        declaration_metadata(&self.type_parameters, name, line, site)?
             .iter()
             .position(|name| name == parameter)
     }
 
-    pub fn return_parameter(&self, name: &str, line: i64) -> Option<&str> {
-        self.return_parameters
-            .get(&(name.to_owned(), line))
-            .map(String::as_str)
+    pub fn return_parameter(&self, name: &str, line: i64, site: Option<usize>) -> Option<&str> {
+        declaration_metadata(&self.return_parameters, name, line, site).map(String::as_str)
     }
 
-    pub fn type_bound(&self, name: &str, line: i64, parameter: &str) -> Option<&str> {
-        self.type_bounds
-            .get(&(name.to_owned(), line, parameter.to_owned()))
+    pub fn type_bound(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+        parameter: &str,
+    ) -> Option<&str> {
+        declaration_metadata(&self.type_bounds, name, line, site)?
+            .get(parameter)
             .map(String::as_str)
     }
 
@@ -4138,6 +4172,41 @@ mod tests {
             );
             let method = java.symbol_site("read", 1, "function", ordinal);
             assert_eq!(java.return_type("read", 1, method), Some(ty));
+        }
+    }
+
+    #[test]
+    fn generic_metadata_requires_exact_class_and_method_sites() {
+        let source = r#"class Probe { void run() { { class Holder<T extends Alpha,X> { T read() { return null; } } } { class Holder<X,T extends Beta> { X read() { return null; } } } } }"#;
+        let java = JavaSource::parse(source).unwrap();
+        assert!(java.parameter_index("Holder", 1, None, "T").is_none());
+        assert!(java.type_bound("Holder", 1, None, "T").is_none());
+        assert!(java.return_parameter("read", 1, None).is_none());
+        for (ordinal, index, bound, parameter) in [(0, 0, "Alpha", "T"), (1, 1, "Beta", "X")] {
+            let class = java.symbol_site("Holder", 1, "class", ordinal);
+            let method = java.symbol_site("read", 1, "function", ordinal);
+            assert_eq!(java.parameter_index("Holder", 1, class, "T"), Some(index));
+            assert_eq!(java.type_bound("Holder", 1, class, "T"), Some(bound));
+            assert_eq!(java.return_parameter("read", 1, method), Some(parameter));
+            assert!(java.parameter_index("Holder", 1, method, "T").is_none());
+            assert!(java.return_parameter("read", 1, class).is_none());
+        }
+    }
+
+    #[test]
+    fn implicit_generic_accessors_keep_their_record_component_sites() {
+        let source = r#"class Probe { void run() { { record Holder<T>(T read) {} } { record Holder<X,T>(T read) {} } } }"#;
+        let java = JavaSource::parse(source).unwrap();
+        assert!(java.return_parameter("read", 1, None).is_none());
+        for ordinal in 0..2 {
+            let component = java.symbol_site("read", 1, "property", ordinal);
+            let accessor = java.symbol_site("read", 1, "function", ordinal);
+            assert_eq!(accessor, component);
+            assert_eq!(java.return_parameter("read", 1, accessor), Some("T"));
+            assert!(java.accepts_arguments_at("read", 1, ordinal, 0));
+            assert!(!java.accepts_arguments_at("read", 1, ordinal, 1));
+            let class = java.symbol_site("Holder", 1, "class", ordinal);
+            assert_eq!(java.site_container(accessor.unwrap()), Some(&class));
         }
     }
 

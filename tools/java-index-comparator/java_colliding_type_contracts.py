@@ -13,7 +13,8 @@ EXPLORE = 'explore:java-colliding-type-sites'
 FEATURES = {GRAPH, EXPLORE}
 REASON = ('independent source/state: javac-validated same-line local type occurrences, '
           'member ownership, receiver sites, block/sibling boundaries, distinct parents, '
-          'graph pages/reverse/path and RWR callers; not MCP equivalence')
+          'generic class/method parameter order, return variables and bounds, implicit '
+          'record accessor sites, graph pages/reverse/path and RWR callers; not MCP equivalence')
 SOURCE = '''package collisions;
 class Left { int inheritedLeft() { return 1; } }
 class Right { int inheritedRight() { return 2; } }
@@ -51,6 +52,21 @@ class Probe {
  int returns() { int n = 0; { class Holder { Alpha read() { return null; } } Holder a = null; n += a.read().alpha(); } { class Holder { Beta read() { return null; } } Holder b = null; n += b.read().beta(); } return n; }
  int references() { { class Holder { int refer() { return 1; } } Holder a = null; java.util.function.IntSupplier left = a::refer; } { class Holder { int refer() { return 2; } } Holder b = null; java.util.function.IntSupplier right = b::refer; } return 0; }
 }
+class Gamma {
+ int gammaOnly() { return 1; }
+}
+class Delta {
+ int deltaOnly() { return 2; }
+}
+class GenericProbe {
+ int indices() { int n = 0; { class Holder<T> { T read() { return null; } } Holder<Gamma> a = null; n += a.read().gammaOnly(); } { class Holder<X,T> { T read() { return null; } } Holder<Gamma,Delta> b = null; n += b.read().deltaOnly(); } return n; }
+ int parameters() { int n = 0; { class Holder<T,X> { T read() { return null; } } Holder<Gamma,Delta> a = null; n += a.read().gammaOnly(); } { class Holder<T,X> { X read() { return null; } } Holder<Gamma,Delta> b = null; n += b.read().deltaOnly(); } return n; }
+ int classBounds() { int n = 0; { class Holder<T extends Gamma> { T read() { return null; } } Holder a = null; n += a.read().gammaOnly(); } { class Holder<T extends Delta> { T read() { return null; } } Holder b = null; n += b.read().deltaOnly(); } return n; }
+ int methodBounds() { int n = 0; { class Holder { <T extends Gamma> T read() { return null; } } Holder a = null; n += a.read().gammaOnly(); } { class Holder { <T extends Delta> T read() { return null; } } Holder b = null; n += b.read().deltaOnly(); } return n; }
+ int shadow() { class Holder<T extends Gamma> { <T extends Delta> T read() { return null; } } Holder<Gamma> a = null; return a.read().deltaOnly(); }
+ int records() { int n = 0; { record Holder<T>(T read) {} Holder<Gamma> a = null; n += a.read().gammaOnly(); } { record Holder<X,T>(T read) {} Holder<Gamma,Delta> b = null; n += b.read().deltaOnly(); } return n; }
+ int mixedRecords() { int n = 0; { record Holder<T>(T read) {} Holder<Gamma> a = null; n += a.read().gammaOnly(); } { record Holder<X,T>(T read) { public T read() { return read; } } Holder<Gamma,Delta> b = null; n += b.read().deltaOnly(); } return n; }
+}
 '''
 
 
@@ -70,6 +86,16 @@ def plan_types(state, root):
         for parent in ('graph', 'explore:semantic-resolution'):
             state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
                           "AND instr(reason,?)=0", (note, parent, note))
+        generic_note = ('; separate executed same-line generic declaration metadata checklist '
+                        'covers class parameter order, method return variables, class/method '
+                        'bounds and shadowing, implicit record accessor ownership and negative '
+                        'sibling-bound guards through graph pages/reverse/path and exact RWR '
+                        'callers; generic field projections, callback/reference signature '
+                        'metadata, generic inference and overload/attached-root dispatch remain '
+                        'pending; independent source/state, not MCP equivalence')
+        for parent in ('graph', 'explore:semantic-resolution'):
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,?)=0", (generic_note, parent, generic_note))
 
 
 def exercise(binary, base):
@@ -176,6 +202,53 @@ def exercise(binary, base):
         record(GRAPH, 'metadata:references:' + str(ambiguous), [('Receiver.java', 7, 'refer')] * 2,
                sorted(target for target, _ in call_edges(doc)))
 
+    # Same-line generic metadata must belong to the exact class/method site,
+    # including parameter order, return variables, erasure bounds and shadows.
+    generic_targets = {name: ('Receiver.java', next(i for i, text in enumerate(METADATA_SOURCE.splitlines(), 1)
+                                                   if 'int ' + name + '(' in text), name)
+                       for name in ('gammaOnly', 'deltaOnly')}
+    generic_callers = {}
+    for name in ('indices', 'parameters', 'classBounds', 'methodBounds', 'shadow', 'records', 'mixedRecords'):
+        line = next(i for i, text in enumerate(METADATA_SOURCE.splitlines(), 1)
+                    if 'int ' + name + '(' in text)
+        caller = ('Receiver.java', line, name)
+        generic_callers[name] = caller
+        wanted = [generic_targets['deltaOnly'], ('Receiver.java', line, 'read')]
+        if name != 'shadow':
+            wanted += [generic_targets['gammaOnly'], ('Receiver.java', line, 'read')]
+        seed = 'metadata.GenericProbe.' + name
+        for ambiguous in (False, True):
+            for limit in (0, 1, 100):
+                doc = runner.json('graph', 'dependencies', seed, '--limit', limit,
+                                  *(['--include-ambiguous'] if ambiguous else []))
+                members = [target for target, _ in call_edges(doc)]
+                record(GRAPH, f'generic:{name}:{limit}:{ambiguous}',
+                       {'matched': [caller], 'valid': True, 'complete': True, 'page': True},
+                       {'matched': [identity(row) for row in doc['matched']],
+                        'valid': all(target in wanted for target in members),
+                        'complete': limit < 100 or sorted(members) == sorted(wanted),
+                        'page': len(doc['items']) == min(limit, doc['pagination']['total'])})
+        for target in ('deltaOnly',) if name == 'shadow' else ('gammaOnly', 'deltaOnly'):
+            path = runner.json('graph', 'path', seed,
+                               'metadata.' + ('Gamma' if target == 'gammaOnly' else 'Delta') + '.' + target,
+                               '--max-depth', 1)
+            record(GRAPH, f'generic:{name}:path:{target}',
+                   [(caller, generic_targets[target])],
+                   sorted(tuple(identity(hop['symbol']) for hop in hops) for hops in path['items']))
+    for target in ('gammaOnly', 'deltaOnly'):
+        callers = [caller for name, caller in generic_callers.items()
+                    if target == 'deltaOnly' or name != 'shadow']
+        reverse = runner.json('graph', 'dependents', 'metadata.' + ('Gamma' if target == 'gammaOnly' else 'Delta') + '.' + target,
+                              '--limit', 100)
+        record(GRAPH, 'generic:reverse:' + target, sorted(callers),
+               sorted(identity(row['other']) for row in reverse['items']))
+        doc = runner.json('explore', target,
+                          '--rwr', '--max-files', 100)
+        record(EXPLORE, 'generic:callers:' + target,
+               sorted((path, line, 'metadata.' + ('GenericProbe.' if name in generic_callers else 'Probe.') + name)
+                      for path, line, name in callers),
+               sorted((row['path'], row['line'], row['name']) for row in doc['neighbours'] if row['link'] == 'caller'))
+
     # A second applicable local declaration must not lend missing members to
     # the first; a sibling callable must not see either block's local class.
     source.write_text('''package collisions;
@@ -194,4 +267,25 @@ class Probe {
             record(GRAPH, name + ':guard:' + str(ambiguous), [],
                    call_edges(runner.json('graph', 'dependencies', 'collisions.Probe.' + name,
                                          *(['--include-ambiguous'] if ambiguous else []))))
+    source.write_text(SOURCE)
+    for kind, declaration in (
+            ('class', 'class Holder<T extends {bound}> {{ T read() {{ return null; }} }}'),
+            ('method', 'class Holder {{ <T extends {bound}> T read() {{ return null; }} }}')):
+        guard = ('package metadata;\n'
+                 'class Gamma {}\n'
+                 'class Delta { int delta() { return 1; } }\n'
+                 'class GenericProbe {\n'
+                 ' int invalid() { { ' + declaration.format(bound='Gamma') +
+                 ' Holder a = null; a.read().delta(); } { ' + declaration.format(bound='Delta') +
+                 ' } return 0; }\n}\n')
+        metadata.write_text(guard)
+        if not compile_source('negative-generic-' + kind + '-javac'):
+            raise ToolError('javac accepted a bound borrowed from a sibling declaration')
+        runner.command('rebuild', '--force')
+        runner.json('graph', 'build')
+        for ambiguous in (False, True):
+            record(GRAPH, f'generic:bound-guard:{kind}:{ambiguous}', [('Receiver.java', 5, 'read')],
+                   sorted(target for target, _ in call_edges(runner.json(
+                       'graph', 'dependencies', 'metadata.GenericProbe.invalid', '--limit', 100,
+                       *(['--include-ambiguous'] if ambiguous else [])))))
     return expected, actual

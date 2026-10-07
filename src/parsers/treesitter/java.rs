@@ -1557,7 +1557,7 @@ impl LanguageParser for JavaParser {
         // Distinct declarations may share a line (including overloads and constructors).
         let mut emitted: std::collections::HashSet<(String, usize)> =
             std::collections::HashSet::new();
-        let mut explicit_methods: std::collections::HashSet<(String, String)> =
+        let mut explicit_methods: std::collections::HashSet<(usize, String)> =
             std::collections::HashSet::new();
         let mut pending_record_accessors = Vec::new();
 
@@ -1678,7 +1678,7 @@ impl LanguageParser for JavaParser {
                             .child_by_field_name("parameters")
                             .is_some_and(|parameters| parameters.named_child_count() == 0)
                         {
-                            if let Some(owner) = enclosing_type_name(content, &node_cap.node) {
+                            if let Some(owner) = enclosing_type_site(&node_cap.node) {
                                 explicit_methods.insert((owner, name.to_string()));
                             }
                         }
@@ -1746,7 +1746,7 @@ impl LanguageParser for JavaParser {
                     let name = node_text(content, &name_cap.node);
                     let line = node_line(&name_cap.node);
                     let component_signature = node_text(content, &node_cap.node).trim().to_string();
-                    let owner = enclosing_type_name(content, &node_cap.node).unwrap_or_default();
+                    let owner = enclosing_type_site(&node_cap.node).unwrap_or_default();
 
                     // Record components are class-like fields
                     if emitted.insert((name.to_string(), name_cap.node.start_byte())) {
@@ -2174,7 +2174,7 @@ pub fn collect_qualified_name_occurrences(content: &str) -> Result<QualifiedName
             );
             names.entry(key).or_default().push_back(qualified.clone());
             if query.capture_names()[capture.index as usize] == "record_component_name" {
-                let owner = enclosing_type_name(content, &capture.node).unwrap_or_default();
+                let owner = enclosing_type_site(&capture.node).unwrap_or_default();
                 accessors.push((owner, name.to_string(), node_line(&capture.node), qualified));
             } else if query.capture_names()[capture.index as usize] == "method_name" {
                 if let Some(method) = capture.node.parent() {
@@ -2182,7 +2182,7 @@ pub fn collect_qualified_name_occurrences(content: &str) -> Result<QualifiedName
                         .child_by_field_name("parameters")
                         .is_some_and(|parameters| parameters.named_child_count() == 0)
                     {
-                        if let Some(owner) = enclosing_type_name(content, &method) {
+                        if let Some(owner) = enclosing_type_site(&method) {
                             explicit_accessors.insert((owner, name.to_string()));
                         }
                     }
@@ -2237,8 +2237,8 @@ fn record_component_accessor_signature(
     format!("{}()", name)
 }
 
-/// Return the nearest enclosing type declaration name (class/interface/enum/record).
-fn enclosing_type_name(content: &str, node: &tree_sitter::Node) -> Option<String> {
+/// Identify the declaring type even when local types share a name and line.
+fn enclosing_type_site(node: &tree_sitter::Node) -> Option<usize> {
     let mut cur = Some(*node);
     while let Some(n) = cur {
         if matches!(
@@ -2249,7 +2249,7 @@ fn enclosing_type_name(content: &str, node: &tree_sitter::Node) -> Option<String
                 | "record_declaration"
         ) {
             if let Some(name_node) = n.child_by_field_name("name") {
-                return Some(node_text(content, &name_node).to_string());
+                return Some(name_node.start_byte());
             }
         }
         cur = n.parent();
