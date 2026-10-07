@@ -8,6 +8,8 @@ from unittest.mock import Mock, patch
 
 from audit import Fixture, SCHEMA, plan, required_features
 from common import ToolError, connect
+from publication_error_contracts import held
+from root_contracts import Runner
 import watch_vcs_error_contracts as contracts
 
 
@@ -36,6 +38,28 @@ class WatchVcsErrorTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.fixture.evaluate(row)
         return self.state.execute('SELECT * FROM checks WHERE id=?', (row['id'],)).fetchone()
+
+    def test_watch_readiness_retries_only_publication_contention(self):
+        runner = Runner(self.binary, self.directory)
+        runner.root = self.root
+        database = self.directory / 'readiness.sqlite'
+        runner.environment.update(AST_INDEX_ROOT=str(self.root), AST_INDEX_DB_PATH=str(database))
+        runner.command('rebuild', '--force')
+        before = database.read_bytes()
+        with held(database.with_suffix('.publish.lock')):
+            # Polling a valid, present declaration during the generation swap
+            # must wait; the real CLI intentionally rejects concurrent reads.
+            for _ in range(2):
+                self.assertFalse(contracts.declarations_ready(runner, 'Sentinel'))
+        self.assertTrue(contracts.declarations_ready(runner, 'Sentinel'))
+        self.assertFalse(contracts.declarations_ready(runner, 'Missing'))
+        self.assertEqual(database.read_bytes(), before)
+        database.write_bytes(b'fixture corrupt database')
+        with self.assertRaises(ToolError):
+            contracts.declarations_ready(runner, 'Sentinel')
+        database.unlink()
+        with self.assertRaises(ToolError):
+            contracts.declarations_ready(runner, 'Sentinel')
 
     def test_production_family_with_complete_acceptance(self):
         with patch.object(contracts, 'exercise', wraps=contracts.exercise) as exercise:

@@ -62,6 +62,26 @@ def acceptance_complete(feature, expected, actual):
                and section.get('applicable-java') is True for section in (expected, actual))
 
 
+def declarations_ready(runner, name):
+    # Watch can publish a replacement after a clear. Its readiness poll must
+    # defer the documented transient rejection without hiding other failures.
+    code, output = runner.command('--format', 'json', 'class', name, acceptable=(0, 1))
+    with (runner.directory / f'{runner.sequence:03d}.stderr.log').open('rb') as stream:
+        diagnostic = stream.read(runner.output_budget + 1)
+    if len(diagnostic) > runner.output_budget:
+        raise ToolError('watch readiness diagnostic exceeded its budget')
+    if code:
+        lock = Path(runner.environment['AST_INDEX_DB_PATH']).with_suffix('.publish.lock')
+        busy = f'Error: index generation is being published or recovered; retry shortly ({lock})'
+        if output == '' and diagnostic.strip() == busy.encode('utf-8'):
+            return False
+        raise ToolError('watch readiness command failed; see private fixture logs')
+    try:
+        return bool(json.loads(output)['items'])
+    except (ValueError, KeyError, TypeError) as error:
+        raise ToolError('watch readiness expected class JSON; see private fixture logs') from error
+
+
 def plan_errors(state, root):
     if root is None:
         return
@@ -325,7 +345,7 @@ def exercise(binary, base, features=FEATURES):
                             database.unlink(missing_ok=True); saved.rename(database)
 
     def declarations(name):
-        return bool(runner.json('class', name)['items'])
+        return declarations_ready(runner, name)
 
     for fmt in (FORMATS if WATCH in features else ()):
         for suffix in POSITIONS:
