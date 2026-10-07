@@ -82,6 +82,17 @@ class PublicationRecovery(unittest.TestCase):
                     {contracts.FEATURE: samples}, {contracts.FEATURE: samples})):
                 self.assertEqual(self.evaluate()['verdict'], 'fail')
 
+    def test_combined_invalidation_and_repeated_recovery(self):
+        # One shared production fixture, rather than a test for every matrix row.
+        cases = [case for case in contracts.samples()
+                 if case[1] in ('all', 'restore', 'clear')
+                 and case[2] in contracts.INVALIDATION_SCENARIOS
+                 and case[4] == 'json' and case[5] is False]
+        expected, actual = contracts._exercise(self.binary, self.directory, cases)
+        failures = [key for key, want in expected[contracts.FEATURE].items()
+                    if actual[contracts.FEATURE][key] != want]
+        self.assertEqual(failures, [], {'failed': len(failures), 'samples': len(cases)})
+
     def test_inventory_and_artifact_boundaries(self):
         inventory = contracts.mobile_contracts.inventory
         for extension in ('.java', '.kt', '.xml', '.gradle'):

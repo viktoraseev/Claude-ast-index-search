@@ -18,9 +18,11 @@ REASON = ('internal CLI and independent source/state: late preparing/commit mark
           'write, file sync, install and directory sync; failed rollback and committed '
           'housekeeping, blocked readers and retry recovery across Java rebuild variants, '
           'restore and clear with/without a prior generation, JSON/text and flag positions; '
+          'simultaneous marker invalidation remove/sync failures and repeated process retries; '
           'bounded complete inventory; not MCP equivalence')
 MARKER_PHASES = tuple(f'{marker}-{phase}' for marker in ('state', 'commit')
-                      for phase in ('write', 'file-sync', 'install', 'installed-sync', 'directory-sync'))
+                      for phase in ('write', 'file-sync', 'pending-directory-sync', 'install',
+                                    'installed-sync', 'directory-sync'))
 ROLLBACK_PHASES = ('rollback-remove', 'rollback-rename', 'recovery-directory-sync',
                    'recovery-staging', 'recovery-state-remove', 'state-remove-sync')
 COMMITTED_PHASES = ('recovery-swap-remove', 'recovery-directory-sync', 'recovery-staging',
@@ -32,6 +34,15 @@ STAGING_PHASES = ('staging-owner-remove',
                   'staging-directory-remove', 'staging-directory-sync')
 SCENARIOS.update({f'committed:{phase}': [phase] for phase in STAGING_PHASES})
 SCENARIOS['staging-failed:staging-db-remove'] = ['state-write', 'staging-db-remove']
+INVALIDATION_SCENARIOS = {
+    f'invalidation:{marker}:{sync}:{failure}:{repeats}':
+        [f'{marker}-{sync}', *([f'{marker}-invalidate-{failure}'] * repeats)]
+    for marker in ('state', 'commit')
+    for sync in ('installed-sync', 'directory-sync')
+    for failure in ('remove', 'sync')
+    for repeats in (1, 3)
+}
+SCENARIOS.update(INVALIDATION_SCENARIOS)
 SCENARIOS['positive'] = []
 
 
@@ -78,6 +89,15 @@ def plan_errors(state, root):
                        'invalidation I/O and persistent filesystem failure durability require '
                        'additional evidence; notification backend/channel and incremental moved-path '
                        'protocol failures and other unresolved parent criteria remain pending',))
+        state.execute("UPDATE coverage SET reason=reason || ? WHERE feature='global:format' "
+                      "AND status='pending' AND instr(reason,'Java retained-marker witness fixture')=0",
+                      ('; Java retained-marker witness fixture executes simultaneous preparing/commit '
+                       'installed/directory-sync and invalidation remove/sync failures, three repeated '
+                       'process retries, blocked readers, exact prior-generation recovery, all '
+                       'rebuild profiles/restore/clear, prior/absent generations and JSON/text flag '
+                       'positions; actual power-loss/filesystem-crash durability still requires '
+                       'storage fault evidence; other recorded parent obligations remain pending; '
+                       'internal CLI/state, not MCP equivalence',))
 
 
 def exercise(binary, base):
@@ -150,7 +170,8 @@ def _exercise(binary, base, cases):
 
     def reset(prior):
         for suffix in ('', '-wal', '-shm', '-journal', '.swap', '.swap-pending',
-                       '.publish-state-v1', '.publish-commit-v1'):
+                       '.publish-state-v1', '.publish-commit-v1',
+                       '.publish-state-v1.pending', '.publish-commit-v1.pending'):
             Path(str(database) + suffix).unlink(missing_ok=True)
         for path in directory.iterdir():
             if path.name.startswith(('.rebuild-', '.restore-')) and path.is_dir():
@@ -213,7 +234,7 @@ def _exercise(binary, base, cases):
         # Durable decision markers block reads until recovery. Once the last
         # marker is removed, a sync failure may leave a safe readable generation. A failed
         # command must not advertise a complete result, even post-commit.
-        recovering = scenario.startswith(('rollback:', 'committed:', 'staging-failed:'))
+        recovering = scenario.startswith(('rollback:', 'committed:', 'staging-failed:', 'invalidation:'))
         # Full schema/row retention complements authored declarations: partial
         # module rebuilds and restore may keep the same class names while still
         # publishing a different generation. This is internal atomicity evidence,
@@ -222,6 +243,8 @@ def _exercise(binary, base, cases):
         if recovering:
             read_code, read_output = runner.command('--format', 'json', 'class', '--pattern', '*', '--limit', 100, acceptable=(0, 1, 2))
             reader_safe = read_code == 1 and read_output == ''
+            if scenario.startswith('invalidation:'):
+                reader_safe &= 'interrupted publication' in stderr()
             if scenario in ('rollback:state-remove-sync', 'committed:commit-remove-sync') or scenario.startswith('staging-failed:'):
                 try:
                     read_items = sorted(row['name'] for row in json.loads(read_output)['items'])
@@ -233,11 +256,21 @@ def _exercise(binary, base, cases):
             # A no-subproject rebuild recovers under its publication guard and
             # returns before allocating any replacement. This observes recovery
             # without a later restore overwriting the generation being tested.
-            retry_code, retry_output = runner.command('--format', 'json', 'rebuild', '--force',
-                '--sub-projects', '--include', '__absent__/**', acceptable=(0, 1, 2),
-                environment={'AST_INDEX_TEST_PUBLICATION_FAULT_FILE': str(control)})
+            retry_safe = True
+            retries = int(scenario.rsplit(':', 1)[1]) if scenario.startswith('invalidation:') else 1
+            for attempt in range(retries):
+                retry_code, retry_output = runner.command('--format', 'json', 'rebuild', '--force',
+                    '--sub-projects', '--include', '__absent__/**', acceptable=(0, 1, 2),
+                    environment={'AST_INDEX_TEST_PUBLICATION_FAULT_FILE': str(control)})
+                if attempt < retries - 1:
+                    retry_safe &= (retry_code == 1 and retry_output == ''
+                                   and 'injected publication I/O failure' in stderr())
+                    blocked, page = runner.command('--format', 'json', 'class', '--pattern', '*',
+                        acceptable=(0, 1, 2))
+                    retry_safe &= (blocked == 1 and page == ''
+                                   and 'interrupted publication' in stderr())
             try:
-                retried = retry_code == 0 and json.loads(retry_output)['status'] == 'no-sub-projects'
+                retried = retry_safe and retry_code == 0 and json.loads(retry_output)['status'] == 'no-sub-projects'
             except (ValueError, KeyError, TypeError):
                 retried = False
         else:
@@ -249,6 +282,7 @@ def _exercise(binary, base, cases):
                                  json.loads(output)['status'] == 'complete'))
         except (ValueError, KeyError, TypeError):
             success_document = False
+        hits = json.loads(control.read_text())
         got = {'success-document': success_document, 'exit': code, 'no-success': not terminal if scenario != 'positive' else terminal or fmt == 'json',
                'json-empty': fmt != 'json' or output == '' if scenario != 'positive' else True,
                'faults-reached': hits['reached'] == phases and hits['phases'] == [],

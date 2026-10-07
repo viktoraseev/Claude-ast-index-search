@@ -775,17 +775,23 @@ fn write_bounded_json_file<T: Serialize>(
         path.display()
     );
 
+    // Publication intents retain a known hard-link witness until acknowledged.
+    // Recovery can then distinguish an installed but failed marker from a
+    // durable decision even if invalidating that marker also fails.
+    let publication_pending = publication_marker_pending_path(path);
     let mut pending = None;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     for sequence in 0..100_u32 {
-        let candidate = pending_dir.join(format!(
-            ".owner-manifest.{}.{}.tmp",
-            std::process::id(),
-            nonce + u128::from(sequence)
-        ));
+        let candidate = publication_pending.clone().unwrap_or_else(|| {
+            pending_dir.join(format!(
+                ".owner-manifest.{}.{}.tmp",
+                std::process::id(),
+                nonce + u128::from(sequence)
+            ))
+        });
         match OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -795,7 +801,12 @@ fn write_bounded_json_file<T: Serialize>(
                 pending = Some((candidate, file));
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && publication_pending.is_none() =>
+            {
+                continue
+            }
             Err(error) => return Err(error.into()),
         }
     }
@@ -853,6 +864,12 @@ fn write_bounded_json_file<T: Serialize>(
     } else {
         let mut installed = false;
         let install_result = (|| -> Result<()> {
+            if publication_pending.is_some() {
+                // Persist the witness before a failed installed-marker sync
+                // could leave a visible commit across process/storage restart.
+                test_publication_marker_fault(path, "pending-directory-sync")?;
+                sync_cache_directory(pending_dir)?;
+            }
             test_publication_marker_fault(path, "install")?;
             std::fs::hard_link(&pending_path, path).with_context(|| {
                 format!("failed to install cache owner intent {}", path.display())
@@ -873,7 +890,9 @@ fn write_bounded_json_file<T: Serialize>(
             // mistake a failed write for a committed generation. A pre-existing
             // or concurrently replaced marker is never ours to delete.
             let cleanup = (|| -> Result<()> {
-                if installed {
+                if publication_pending.is_some() {
+                    invalidate_pending_publication_marker(path, &pending_path)?;
+                } else if installed {
                     let pending_metadata = std::fs::symlink_metadata(&pending_path)?;
                     let installed_metadata = std::fs::symlink_metadata(path)?;
                     anyhow::ensure!(
@@ -882,12 +901,16 @@ fn write_bounded_json_file<T: Serialize>(
                         "failed marker was replaced at {}",
                         path.display()
                     );
+                    test_publication_marker_fault(path, "invalidate-remove")?;
                     remove_regular_file_if_present(path)?;
+                    test_publication_marker_fault(path, "invalidate-sync")?;
                     sync_cache_directory(path.parent().context("marker has no parent")?)?;
                 }
                 Ok(())
             })();
-            let _ = std::fs::remove_file(&pending_path);
+            if publication_pending.is_none() {
+                let _ = std::fs::remove_file(&pending_path);
+            }
             return match cleanup {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(FailedMarkerCleanup(format!(
@@ -2680,6 +2703,8 @@ const CACHE_ACTIVITY_FILES: &[&str] = &[
     "index.db.swap-pending",
     "index.db.publish-state-v1",
     "index.db.publish-commit-v1",
+    "index.db.publish-state-v1.pending",
+    "index.db.publish-commit-v1.pending",
     "index.db.update-state-v1.json",
     CACHE_ACTIVITY_MARKER_NAME,
 ];
@@ -2851,6 +2876,8 @@ fn cache_has_unresolved_publication(cache_dir: &Path) -> bool {
     [
         "index.db.publish-state-v1",
         "index.db.publish-commit-v1",
+        "index.db.publish-state-v1.pending",
+        "index.db.publish-commit-v1.pending",
         "index.db.swap",
         "index.db.swap-wal",
         "index.db.swap-shm",
@@ -3181,6 +3208,14 @@ fn publication_commit_path(db_path: &Path) -> PathBuf {
     sqlite_sidecar_path(db_path, PUBLICATION_COMMIT_SUFFIX)
 }
 
+fn publication_marker_pending_path(path: &Path) -> Option<PathBuf> {
+    let name = path.to_string_lossy();
+    [PUBLICATION_STATE_SUFFIX, PUBLICATION_COMMIT_SUFFIX]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+        .then(|| sqlite_sidecar_path(path, ".pending"))
+}
+
 fn publication_pending_swap_path(db_path: &Path) -> PathBuf {
     sqlite_sidecar_path(db_path, ".swap-pending")
 }
@@ -3189,6 +3224,8 @@ fn publication_has_interrupted_state(db_path: &Path) -> Result<bool> {
     for path in [
         publication_state_path(db_path),
         publication_commit_path(db_path),
+        publication_marker_pending_path(&publication_state_path(db_path)).unwrap(),
+        publication_marker_pending_path(&publication_commit_path(db_path)).unwrap(),
     ] {
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
@@ -3339,6 +3376,64 @@ fn write_publication_marker<T: Serialize>(path: &Path, value: &T) -> Result<()> 
         .parent()
         .context("index publication marker has no parent directory")?;
     write_bounded_json_file(path, parent, value, false)
+}
+
+/// Check a retained witness before deleting an unacknowledged publication link.
+fn validate_pending_publication_marker(path: &Path, pending: &Path) -> Result<()> {
+    let pending_metadata = std::fs::symlink_metadata(pending)?;
+    anyhow::ensure!(
+        pending_metadata.file_type().is_file()
+            && pending_metadata.len() <= MAX_CACHE_OWNER_MANIFEST_BYTES,
+        "pending publication marker is not a bounded regular file: {}",
+        pending.display()
+    );
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_file() && same_file_identity(&pending_metadata, &metadata),
+            "unacknowledged publication marker was replaced at {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn invalidate_pending_publication_marker(path: &Path, pending: &Path) -> Result<()> {
+    validate_pending_publication_marker(path, pending)?;
+    test_publication_marker_fault(path, "invalidate-remove")?;
+    remove_regular_file_if_present(path)?;
+    test_publication_marker_fault(path, "invalidate-sync")?;
+    let parent = path.parent().context("marker has no parent")?;
+    sync_cache_directory(parent)?;
+    // Keep the witness until absence of the failed decision is durable. A
+    // failed sync must remain retryable in another process without promotion.
+    remove_regular_file_if_present(pending)?;
+    sync_cache_directory(parent)
+}
+
+fn recover_pending_publication_markers(db_path: &Path) -> Result<()> {
+    let markers = [
+        publication_state_path(db_path),
+        publication_commit_path(db_path),
+    ];
+    let mut retained = Vec::new();
+    for marker in markers {
+        let pending = publication_marker_pending_path(&marker).unwrap();
+        match std::fs::symlink_metadata(&pending) {
+            Ok(_) => {
+                validate_pending_publication_marker(&marker, &pending)?;
+                retained.push((marker, pending));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    // Validate both paths before mutating either; unfamiliar links fail closed.
+    for (marker, pending) in retained {
+        invalidate_pending_publication_marker(&marker, &pending)?;
+    }
+    Ok(())
 }
 
 fn remove_publication_marker(path: &Path) -> Result<()> {
@@ -3805,6 +3900,7 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
     ensure_safe_live_db_artifacts(db_path)?;
     ensure_safe_swap_db_artifacts(db_path)?;
     ensure_regular_or_missing(&publication_pending_swap_path(db_path))?;
+    recover_pending_publication_markers(db_path)?;
     let state_path = publication_state_path(db_path);
     let commit_path = publication_commit_path(db_path);
     let state: Option<PublicationState> = read_bounded_json_file(&state_path)?;
@@ -3855,6 +3951,11 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
     }
 
     let committed_operation = commit.as_ref().map(|marker| marker.operation);
+    if committed_operation.is_some() {
+        // In particular, sync removal of an acknowledged marker's witness
+        // before deleting its rollback snapshot or preparing state.
+        sync_cache_directory(db_path.parent().context("index database has no parent")?)?;
+    }
     match committed_operation {
         Some(PublicationOperation::Install) => {
             anyhow::ensure!(
@@ -12358,6 +12459,88 @@ mod tests {
         assert_eq!(publication_fixture_value(&db_path), "new");
         assert!(!db_path.with_extension("db.swap").exists());
         assert!(!publication_commit_path(&db_path).exists());
+    }
+
+    #[test]
+    fn unacknowledged_commit_witness_recovers_previous_generation() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&base).unwrap();
+        for prior in [false, true] {
+            let temp = tempfile::TempDir::new_in(&base).unwrap();
+            let db_path = temp.path().join("index.db");
+            if prior {
+                create_publication_fixture(&db_path, "old");
+            }
+            let artifacts = checkpoint_and_consolidate_live_db(&db_path).unwrap();
+            let state = write_preparing_marker(&db_path, PublicationOperation::Install, artifacts);
+            if prior {
+                snapshot_live_main(&db_path, &swap_artifact_path(&db_path, "")).unwrap();
+            }
+            let staged = temp.path().join("candidate.db");
+            create_publication_fixture(&staged, "new");
+            std::fs::rename(&staged, &db_path).unwrap();
+            let commit_path = publication_commit_path(&db_path);
+            write_publication_marker(
+                &commit_path,
+                &PublicationCommit {
+                    version: PUBLICATION_STATE_VERSION,
+                    token: state.token,
+                    operation: PublicationOperation::Install,
+                },
+            )
+            .unwrap();
+            // A failed marker invalidation leaves the writer's hard link.
+            let pending = publication_marker_pending_path(&commit_path).unwrap();
+            std::fs::hard_link(&commit_path, &pending).unwrap();
+            assert!(publication_has_interrupted_state(&db_path).unwrap());
+            assert!(cache_has_unresolved_publication(temp.path()));
+            recover_interrupted_publication_at_path(&db_path).unwrap();
+            if prior {
+                assert_eq!(publication_fixture_value(&db_path), "old");
+            } else {
+                assert!(!db_path.exists());
+            }
+            assert!(!pending.exists());
+            assert!(!commit_path.exists());
+            assert!(!publication_state_path(&db_path).exists());
+            assert!(!swap_artifact_path(&db_path, "").exists());
+        }
+    }
+
+    #[test]
+    fn pending_marker_without_installed_link_is_recoverable_but_foreign_links_are_not() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::TempDir::new_in(&base).unwrap();
+        let db_path = temp.path().join("index.db");
+        create_publication_fixture(&db_path, "old");
+        let commit_path = publication_commit_path(&db_path);
+        let pending = publication_marker_pending_path(&commit_path).unwrap();
+        std::fs::write(&pending, b"partial write").unwrap();
+        assert!(publication_has_interrupted_state(&db_path).unwrap());
+        assert!(cache_has_unresolved_publication(temp.path()));
+        recover_interrupted_publication_at_path(&db_path).unwrap();
+        assert_eq!(publication_fixture_value(&db_path), "old");
+        assert!(!pending.exists());
+
+        std::fs::write(&commit_path, b"foreign marker").unwrap();
+        std::fs::write(&pending, b"separate file").unwrap();
+        let error = recover_interrupted_publication_at_path(&db_path).unwrap_err();
+        assert!(format!("{error:#}").contains("was replaced"));
+        assert_eq!(std::fs::read(&commit_path).unwrap(), b"foreign marker");
+        assert_eq!(std::fs::read(&pending).unwrap(), b"separate file");
+        assert_eq!(publication_fixture_value(&db_path), "old");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&pending).unwrap();
+            std::os::unix::fs::symlink(&commit_path, &pending).unwrap();
+            assert!(recover_interrupted_publication_at_path(&db_path).is_err());
+            assert!(std::fs::symlink_metadata(&pending)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(std::fs::read(&commit_path).unwrap(), b"foreign marker");
+        }
     }
 
     #[test]
