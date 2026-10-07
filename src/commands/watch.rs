@@ -1,7 +1,8 @@
 //! Watch mode — automatically update index on file changes
 
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -142,7 +143,13 @@ fn event_needs_update(root: &Path, path: &Path) -> bool {
     if path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(indexer::is_module_file)
+        .is_some_and(|name| {
+            indexer::is_module_file(name)
+                || matches!(
+                    name,
+                    ".ast-index.yaml" | ".ast-index.yml" | ".gitignore" | ".arcignore" | ".ignore"
+                )
+        })
     {
         return true;
     }
@@ -150,6 +157,45 @@ fn event_needs_update(root: &Path, path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .is_some_and(parsers::is_supported_extension)
         && !minified::skip_by_name(path)
+}
+
+/// Check registration and availability without walking source trees while idle.
+fn watch_roots(root: &Path) -> Result<BTreeMap<PathBuf, bool>> {
+    let conn = db::open_existing_db_leased(root)?
+        .ok_or_else(|| anyhow::anyhow!("Index was cleared; run 'ast-index rebuild' first."))?;
+    let mut paths = db::get_extra_roots(&conn)?;
+    paths.push(root.to_string_lossy().into_owned());
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let path = PathBuf::from(path);
+            let available = path.is_dir();
+            (path, available)
+        })
+        .collect())
+}
+
+/// Register each available owner once, including owners restored after removal.
+fn sync_watch_roots(
+    debouncer: &mut notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
+    previous: &BTreeMap<PathBuf, bool>,
+    current: &BTreeMap<PathBuf, bool>,
+) -> Result<()> {
+    for (path, available) in previous {
+        if *available && current.get(path) != Some(&true) {
+            match debouncer.watcher().unwatch(path) {
+                Ok(()) => {}
+                Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    for (path, available) in current {
+        if *available && previous.get(path) != Some(&true) {
+            debouncer.watcher().watch(path, RecursiveMode::Recursive)?;
+        }
+    }
+    Ok(())
 }
 
 /// Print a stable watcher status. Callers that only need the exit status use
@@ -201,7 +247,8 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 
     let injected = test_watch_events(root)?;
     let mut debouncer = new_debouncer(Duration::from_millis(500), tx.clone())?;
-    debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
+    let mut roots = watch_roots(root)?;
+    sync_watch_roots(&mut debouncer, &BTreeMap::new(), &roots)?;
     if json {
         println!(
             "{}",
@@ -216,7 +263,7 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
     }
     std::io::stdout().flush()?;
 
-    let _debouncer = if let Some(events) = injected {
+    let mut debouncer = if let Some(events) = injected {
         for event in events {
             tx.send(event)?;
         }
@@ -227,15 +274,32 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
     };
     drop(tx);
 
+    let mut reconciliation_pending = false;
     loop {
-        match rx.recv() {
+        let notification = rx.recv_timeout(Duration::from_millis(500));
+        // Registrations live in the index, which can be outside all watched
+        // trees. Poll only that small list and directory availability; source
+        // traversal still happens only for an event or an actual scope change.
+        if let Some(ref mut provider) = debouncer {
+            match watch_roots(root) {
+                Ok(current) => {
+                    if current != roots {
+                        sync_watch_roots(provider, &roots, &current)?;
+                        roots = current;
+                        reconciliation_pending = true;
+                    }
+                }
+                Err(error) => eprintln!("Update error: {}", error),
+            }
+        }
+        match notification {
             Ok(Ok(events)) => {
                 let changed: Vec<_> = events
                     .iter()
-                    .filter(|e| event_needs_update(root, &e.path))
+                    .filter(|e| roots.keys().any(|owner| event_needs_update(owner, &e.path)))
                     .collect();
 
-                if changed.is_empty() {
+                if changed.is_empty() && !reconciliation_pending {
                     continue;
                 }
 
@@ -248,6 +312,7 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 
                 match update_index(root) {
                     Ok((updated, deleted)) => {
+                        reconciliation_pending = false;
                         if json {
                             println!(
                                 "{}",
@@ -277,6 +342,7 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
                         }
                     }
                     Err(e) => {
+                        reconciliation_pending = true;
                         eprintln!("{}", format!("Update error: {}", e).red());
                     }
                 }
@@ -286,9 +352,42 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
                 // delivery. Release the watcher lock and let callers retry.
                 return Err(anyhow::anyhow!("Watch error: {}", err));
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if reconciliation_pending {
+                    reconciliation_pending = !report_scope_update(root, json)?;
+                }
+            }
             Err(e) => {
                 return Err(anyhow::anyhow!("Channel error: {}", e));
             }
+        }
+        // Config can attach another owner during the update itself. Register
+        // it before waiting for the next notification, closing the startup gap.
+        if let Some(ref mut provider) = debouncer {
+            if let Ok(current) = watch_roots(root) {
+                sync_watch_roots(provider, &roots, &current)?;
+                roots = current;
+            }
+        }
+    }
+}
+
+fn report_scope_update(root: &Path, json: bool) -> Result<bool> {
+    match update_index(root) {
+        Ok((updated, deleted)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"command": "watch", "status": "updated",
+                    "updated": updated, "deleted": deleted})
+                );
+                std::io::stdout().flush()?;
+            }
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!("Update error: {}", error);
+            Ok(false)
         }
     }
 }
@@ -307,6 +406,23 @@ fn update_index(root: &Path) -> Result<(usize, usize)> {
 
     // Honour .ast-index.yaml so watch stays scoped to the same paths as rebuild/update.
     let config = indexer::load_config(root).unwrap_or_default();
+    // Config attachment follows rebuild semantics: it adds registrations;
+    // explicit subtree/remove-root commands own registration removal.
+    let mut registered: std::collections::HashSet<_> =
+        db::get_extra_roots(&conn)?.into_iter().collect();
+    for raw in config.roots.as_deref().unwrap_or_default() {
+        let path = Path::new(raw);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let canonical = db::normalize_root_for_storage(&path);
+        if registered.insert(canonical.clone()) {
+            let name = db::allocate_subtree_name(&conn, &db::default_subtree_name(&canonical))?;
+            db::insert_subtree(&conn, &name, &canonical, raw)?;
+        }
+    }
     let config_include = config.include.as_deref();
     let exclude_matcher: Option<ignore::gitignore::Gitignore> = config
         .exclude

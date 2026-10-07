@@ -2567,16 +2567,24 @@ pub fn update_directory_incremental(
     // Build files are collected regardless of extension: `build.gradle.kts`,
     // `pom.xml`, `ya.make` are not parsed as sources but define the module graph.
     let mut module_files: Vec<PathBuf> = Vec::new();
+    let no_ignore = load_config(root)
+        .and_then(|config| config.no_ignore)
+        .unwrap_or(db::get_metadata_value(conn, "no_ignore")?.as_deref() == Some("1"));
 
     for (walk_dir, anchor) in &walk_specs {
         let anchor_key = db::normalize_root_for_storage(anchor);
-        let is_git = has_git_repo(walk_dir) || has_git_repo(anchor);
-        let arc_root = find_arc_root(walk_dir).or_else(|| find_arc_root(anchor));
+        let is_git = !no_ignore && (has_git_repo(walk_dir) || has_git_repo(anchor));
+        let arc_root = if no_ignore {
+            None
+        } else {
+            find_arc_root(walk_dir).or_else(|| find_arc_root(anchor))
+        };
         let mut builder = WalkBuilder::new(walk_dir);
         let exclude_matcher_owned = exclude_matcher.cloned();
         builder
             .hidden(true)
             .git_ignore(is_git)
+            .git_exclude(is_git)
             .filter_entry(move |entry| {
                 if is_excluded_dir(entry) {
                     return false;
