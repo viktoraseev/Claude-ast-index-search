@@ -2239,16 +2239,29 @@ struct JavaDependencyType {
 }
 
 /// Check inherited aliases without borrowing another root's classpath metadata.
+#[derive(Clone, Copy)]
 struct JavaDependencyLookup<'a> {
     conn: &'a Connection,
     root: &'a Path,
     resolver: &'a super::PathResolver,
     package: &'a str,
     contexts: &'a [String],
+    local_types: &'a std::collections::BTreeMap<
+        String,
+        crate::parsers::treesitter::java::DependencyImportDeclaration,
+    >,
+    local_bindings: &'a [(String, String, std::ops::Range<usize>)],
+    resolving_parent: bool,
 }
 
 impl JavaDependencyLookup<'_> {
     fn raw(&self, name: &str) -> Result<Option<JavaDependencyType>> {
+        if let Some(declaration) = self.local_types.get(name) {
+            return Ok(Some(JavaDependencyType {
+                identity: name.to_owned(),
+                declaration: declaration.clone(),
+            }));
+        }
         Ok(
             java_dependency_declaration(self.conn, self.root, self.resolver, name, self.package)?
                 .map(|declaration| JavaDependencyType {
@@ -2302,13 +2315,19 @@ impl JavaDependencyLookup<'_> {
                 found.declaration.member_accessible |= self.protected_access(owner)?;
             }
         }
-        if !found.declaration.protected_names.is_empty() && self.protected_access(name)? {
+        if !self.resolving_parent
+            && !found.declaration.protected_names.is_empty()
+            && self.protected_access(name)?
+        {
             found
                 .declaration
                 .static_names
                 .extend(found.declaration.protected_names.iter().cloned());
         }
-        if !found.declaration.protected_instance_names.is_empty() && self.protected_access(name)? {
+        if !self.resolving_parent
+            && !found.declaration.protected_instance_names.is_empty()
+            && self.protected_access(name)?
+        {
             found
                 .declaration
                 .instance_names
@@ -2317,13 +2336,21 @@ impl JavaDependencyLookup<'_> {
         Ok(Some(found))
     }
 
-    fn lexical_type(&self, name: &str) -> Result<Option<JavaDependencyType>> {
+    fn lexical_type(&self, name: &str) -> Result<(bool, Option<JavaDependencyType>)> {
+        let first = name.split('.').next().unwrap_or(name);
         for context in self.contexts {
-            if let Some(found) = self.type_name(&format!("{context}.{name}"), true)? {
-                return Ok(Some(found));
+            if let Some(owner) = self.direct(context)? {
+                // A lexical declaration or ambiguous inherited name reserves
+                // this namespace even when access/member lookup fails.
+                if !self
+                    .inherited_type(&owner, first, &mut HashSet::new())?
+                    .is_empty()
+                {
+                    return Ok((true, self.type_name(&format!("{context}.{name}"), true)?));
+                }
             }
         }
-        Ok(None)
+        Ok((false, None))
     }
 
     fn lexical_member(
@@ -2355,9 +2382,61 @@ impl JavaDependencyLookup<'_> {
 
     fn parents(&self, owner: &JavaDependencyType) -> Result<Vec<JavaDependencyType>> {
         let mut result = Vec::new();
+        // Binding a superclass must not ask for protected member augmentation:
+        // that augmentation itself needs this inheritance relationship. The
+        // current class's body is also outside its own superclass header.
+        let contexts: Vec<_> = self
+            .contexts
+            .iter()
+            .filter(|context| {
+                *context != &owner.identity && !context.starts_with(&format!("{}.", owner.identity))
+            })
+            .cloned()
+            .collect();
+        let binding = JavaDependencyLookup {
+            contexts: &contexts,
+            resolving_parent: true,
+            ..*self
+        };
         for name in &owner.declaration.parents {
             let first = name.split('.').next().unwrap_or(name);
             let suffix = &name[first.len()..];
+            // A local superclass is bound where this owner is declared, not
+            // by a canonical import name or a file-wide spelling match.
+            let position = owner
+                .identity
+                .rsplit_once('@')
+                .and_then(|(_, site)| site.split('.').next()?.parse::<usize>().ok());
+            let local = position.and_then(|position| {
+                self.local_bindings
+                    .iter()
+                    .filter(|(simple, _, scope)| simple == first && scope.contains(&position))
+                    .min_by_key(|(_, _, scope)| scope.end - scope.start)
+            });
+            if let Some((_, identity, _)) = local {
+                if let Some(parent) = binding.type_name(&format!("{identity}{suffix}"), true)? {
+                    result.push(parent);
+                }
+                continue;
+            }
+            if position.is_some() {
+                let mut prefix = owner.identity.as_str();
+                let mut lexical = None;
+                while let Some((outer, _)) = prefix.rsplit_once('.') {
+                    if outer == owner.declaration.package {
+                        break;
+                    }
+                    if let Some(parent) = binding.type_name(&format!("{outer}.{name}"), true)? {
+                        lexical = Some(parent);
+                        break;
+                    }
+                    prefix = outer;
+                }
+                if let Some(parent) = lexical {
+                    result.push(parent);
+                    continue;
+                }
+            }
             let explicit = owner.declaration.imports.iter().find(|(import, _)| {
                 !import.ends_with(".*") && import.rsplit('.').next() == Some(first)
             });
@@ -2383,16 +2462,43 @@ impl JavaDependencyLookup<'_> {
             }
             let mut found = None;
             for candidate in candidates {
-                if let Some(parent) = self.raw(&candidate)? {
+                let mut parent = self.raw(&candidate)?;
+                if parent.is_none()
+                    && (candidate == *name
+                        || explicit.is_some_and(|(_, is_static)| *is_static || !suffix.is_empty()))
+                {
+                    parent = binding.type_name(&candidate, true)?;
+                }
+                if let Some(mut parent) = parent {
+                    if owner.identity.contains('@') && !parent.declaration.accessible {
+                        let Some(accessible) = binding.direct(&parent.identity)? else {
+                            break;
+                        };
+                        if !accessible.declaration.accessible {
+                            break;
+                        }
+                        parent = accessible;
+                    }
+                    if explicit.is_some_and(|(_, is_static)| *is_static)
+                        && suffix.is_empty()
+                        && !parent.declaration.static_member
+                    {
+                        break;
+                    }
                     found = Some(parent);
                     break;
                 }
             }
             if found.is_none() && explicit.is_none() {
                 let mut matches = std::collections::BTreeMap::new();
-                for (import, _) in &owner.declaration.imports {
+                for (import, is_static) in &owner.declaration.imports {
                     if let Some(prefix) = import.strip_suffix(".*") {
-                        if let Some(parent) = self.raw(&format!("{prefix}.{name}"))? {
+                        if let Some(parent) =
+                            binding.type_name(&format!("{prefix}.{name}"), *is_static)?
+                        {
+                            if *is_static && !parent.declaration.static_member {
+                                continue;
+                            }
                             matches.insert(parent.identity.clone(), parent);
                         }
                     }
@@ -2608,6 +2714,9 @@ fn count_symbols_used_in_module(
             resolver: &resolver,
             package: &syntax.package,
             contexts: &[],
+            local_types: &syntax.local_types,
+            local_bindings: &syntax.local_bindings,
+            resolving_parent: false,
         };
         let mut identities = std::collections::BTreeSet::new();
         let mut explicit = HashMap::new();
@@ -2705,8 +2814,11 @@ fn count_symbols_used_in_module(
                 }
             }
             if !invalid_static_types.contains(first) {
-                if let Some(found) = lookup.lexical_type(name)? {
-                    record_type(found)?;
+                let (bound, found) = lookup.lexical_type(name)?;
+                if bound {
+                    if let Some(found) = found {
+                        record_type(found)?;
+                    }
                     continue;
                 }
             }
@@ -2785,6 +2897,33 @@ fn count_symbols_used_in_module(
             }
             if matches.len() == 1 {
                 identities.extend(matches);
+            }
+        }
+        // A local qualifier can name an inherited external superclass type.
+        // Its spelling is shadowed in the source type-use pass, but the bound
+        // parent still contributes its declaring dependency (e.g. Base.Nested).
+        for (identity, declaration) in &syntax.local_types {
+            let mut contexts = Vec::new();
+            let mut prefix = identity.as_str();
+            while let Some((outer, _)) = prefix.rsplit_once('.') {
+                if outer == syntax.package {
+                    break;
+                }
+                contexts.push(outer.to_owned());
+                prefix = outer;
+            }
+            let lookup = JavaDependencyLookup {
+                contexts: &contexts,
+                ..lookup
+            };
+            let owner = JavaDependencyType {
+                identity: identity.clone(),
+                declaration: declaration.clone(),
+            };
+            for parent in lookup.parents(&owner)? {
+                if !parent.identity.contains('@') && parent.declaration.accessible {
+                    identities.insert(parent.identity);
+                }
             }
         }
         for identity in identities {

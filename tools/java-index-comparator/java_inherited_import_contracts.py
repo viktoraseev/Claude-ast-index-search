@@ -14,7 +14,8 @@ REASON = ('independent source/state and javac: inherited Java member type/static
           'canonical import guards, hiding/diamonds, accessibility and attached classpath '
           'declaring ownership, occurrence-scoped protected subclass types/static members and '
           'enclosing-subclass/sibling/import guards, inherited lexical instance fields/methods '
-          'and interface defaults with static-context boundaries in default/strict JSON/text; not MCP equivalence')
+          'and interface defaults, occurrence-owned local subclass inheritance and lexical superclass '
+          'binding/hiding with static-context boundaries in default/strict JSON/text; not MCP equivalence')
 
 
 def plan_imports(state, root):
@@ -51,6 +52,14 @@ def plan_imports(state, root):
                     'external/platform and classpath-order resolution remain pending; not MCP equivalence')
             state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
                           "AND instr(reason,?)=0", (note, parent, note))
+            note = ('; separate executed local subclass ownership fixture covers occurrence-owned fields/methods, '
+                    'protected/static/deep member types, nested/lambda captures, lexical superclass chains, '
+                    'same-line/block/method/declaration-point binding and inherited precedence over imports '
+                    'and outer owners with attached declaring provenance, JSON/text/refresh/option controls; '
+                    'value-qualified receivers, overload signatures, external/platform and classpath-order '
+                    'resolution remain pending; not MCP equivalence')
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,?)=0", (note, parent, note))
 
 
 def exercise(binary, base):
@@ -75,7 +84,7 @@ def exercise(binary, base):
     sources = {
         'base/Parent.java': '''package shared; public class Parent {
             public static class Nested { public static class Deep {} }
-            public class Instance {} protected static class Guarded { public static class Deep {} }
+            public class Instance { public int INST=1; } protected static class Guarded { public static class Deep {} }
             private static class Hidden {} static class PackageOnly {}
             public static int VALUE=1; public static int read(){return 1;}
             protected static int SECRET=1; protected static int secret(){return 1;} public int instance(){return 1;}
@@ -102,8 +111,49 @@ def exercise(binary, base):
         'base/CrossParent.java': 'package shared; public class CrossParent { static class CrossType {} static int CROSS=1; int PACKAGE=1; int packageCall(){return 1;} }',
         'lib/Bridge.java': 'package other; public class Bridge extends shared.CrossParent {}',
         'lib/Return.java': 'package shared; public class Return extends other.Bridge {}',
+        'lib/LocalBase.java': '''package shared; public class LocalBase {
+            public static class Nested { public static class Deep {} }
+            protected static class Guarded {}
+            public static int VALUE=2; public static int read(){return 2;}
+            protected static int SECRET=2; protected static int secret(){return 2;}
+            public int OPEN=2; protected int HUSH=2; protected int hush(){return 2;}
+        }''',
     }
     cases = [
+        ('local-public-instance', 'class Use { void use(){ class Local extends shared.Child { int run(){return OPEN+instance();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('local-protected-instance', 'class Use { void use(){ class Local extends shared.Child { int run(){return HUSH+hush();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('local-static-parent-members', 'class Use { void use(){ class Local extends shared.Child { int run(){return SECRET+secret();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('local-protected-type', 'class Use { void use(){ class Local extends shared.Child { Guarded field; } } }', True, {'base': ['Guarded'], 'lib': ['Child']}),
+        ('local-protected-deep-type', 'class Use { void use(){ class Local extends shared.Child { Guarded.Deep field; } } }', True, {'base': ['Deep'], 'lib': ['Child']}),
+        ('local-static-enclosing', 'class Use { static void use(){ class Local extends shared.Child { int run(){return HUSH+hush();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('local-nested-capture', 'class Use { void use(){ class Local extends shared.Child { class Inner { int run(){return HUSH+hush();} Guarded field; } } } }', True, {'base': ['Guarded', 'Parent'], 'lib': ['Child']}),
+        ('local-lambda-capture', 'class Use { void use(){ class Local extends shared.Child { java.util.function.IntSupplier run(){return () -> HUSH+hush();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('local-import-type-hiding', 'import shared.Parent.*; class Use { void use(){ class Local extends shared.LocalBase { Nested.Deep field; } } }', True, {'lib': ['Deep', 'LocalBase']}),
+        ('local-import-static-hiding', 'import static shared.Parent.*; class Use { void use(){ class Local extends shared.LocalBase { int run(){return VALUE+read();} } } }', True, {'lib': ['LocalBase']}),
+        ('local-outer-type-hiding', 'class Use extends shared.Child { void use(){ class Local extends shared.LocalBase { Nested.Deep field; } } }', True, {'lib': ['Child', 'Deep', 'LocalBase']}),
+        ('local-outer-instance-hiding', 'class Use extends shared.Child { void use(){ class Local extends shared.LocalBase { int run(){return HUSH+hush();} } } }', True, {'lib': ['Child', 'LocalBase']}),
+        ('local-same-name-siblings', 'class Use { void use(){ { class Local extends shared.Child { int run(){return HUSH+hush();} } } { class Local extends shared.LocalBase { int run(){return HUSH+hush();} } } } }', True, {'base': ['Parent'], 'lib': ['Child', 'LocalBase']}),
+        ('local-static-context-guard', 'class Use { void use(){ class Local extends shared.Child { static int run(){return OPEN+instance();} } } }', False, {'lib': ['Child']}),
+        ('local-sibling-guard', 'class Use { void use(){ class Local extends shared.Child {} } int sibling(){return HUSH+hush();} }', False, {'lib': ['Child']}),
+        ('local-private-guard', 'class Use { void use(){ class Local extends shared.Child { int run(){return PRIVATE+privateCall();} } } }', False, {'lib': ['Child']}),
+        ('local-own-member-hiding', 'class Use { void use(){ class Local extends shared.Child { int HUSH=2; protected int hush(){return 2;} int run(){return HUSH+hush();} } } }', True, {'lib': ['Child']}),
+        ('local-superclass-chain', 'class Use { void use(){ class Base extends shared.Child {} class Local extends Base { int run(){return HUSH+hush();} Guarded.Deep field; } } }', True, {'base': ['Deep', 'Parent'], 'lib': ['Child']}),
+        ('local-superclass-import-hiding', 'import shared.*; class Use { void use(){ class Child extends LocalBase {} class Local extends Child { int run(){return HUSH+hush();} Nested.Deep field; } } }', True, {'lib': ['Deep', 'LocalBase']}),
+        ('local-header-outer-parent', 'class Use extends shared.Child { void use(){ class Local extends Nested { Deep field; } } }', True, {'base': ['Deep', 'Nested'], 'lib': ['Child']}),
+        ('local-qualified-parent-alias', 'class Use { void use(){ class Local extends shared.Child.Nested { Deep field; } } }', True, {'base': ['Deep', 'Nested']}),
+        ('local-imported-parent-alias', 'import shared.Child; class Use { void use(){ class Local extends Child.Nested { Deep field; } } }', True, {'base': ['Deep', 'Nested'], 'lib': ['Child']}),
+        ('local-static-parent-alias', 'import static shared.Child.Nested; class Use { void use(){ class Local extends Nested { Deep field; } } }', True, {'base': ['Deep', 'Nested']}),
+        ('local-wildcard-parent-alias', 'import static shared.Child.*; class Use { void use(){ class Local extends Nested { Deep field; } } }', True, {'base': ['Deep', 'Nested']}),
+        ('local-lexical-parent-alias', 'class Use { void use(){ class Base extends shared.Child {} class Local extends Base.Nested { Deep field; } } }', True, {'base': ['Deep', 'Nested'], 'lib': ['Child']}),
+        ('local-canonical-instance-parent', 'import shared.Parent.Instance; class Use { void use(){ class Local extends Instance { Local(shared.Parent p){p.super();} int run(){return INST;} } } }', True, {'base': ['Instance', 'Parent']}),
+        ('local-invalid-static-instance-parent', 'import static shared.Child.Instance; class Use { void use(){ class Local extends Instance { Local(shared.Parent p){p.super();} int run(){return INST;} } } }', False, {'base': ['Parent']}),
+        ('local-method-boundaries', 'class Use { void first(){ class Local extends shared.Child { int run(){return HUSH+hush();} } } void second(){ class Local extends shared.LocalBase { int run(){return HUSH+hush();} } } }', True, {'base': ['Parent'], 'lib': ['Child', 'LocalBase']}),
+        ('local-superclass-later-declaration', 'import shared.*; class Use { void use(){ class Local extends Child { int run(){return HUSH+hush();} } class Child extends LocalBase {} } }', True, {'base': ['Parent'], 'lib': ['Child', 'LocalBase']}),
+        ('local-default-diamond', 'class Use { void use(){ class Local extends shared.Diamond { int run(){return defaultCall();} Token field; } } }', True, {'base': ['Port', 'Token'], 'lib': ['Diamond']}),
+        # Private types are not inherited: javac binds the on-demand import.
+        ('local-private-type-hiding', 'import shared.Parent.*; class Use { void use(){ class Local extends shared.Hider { Nested field; } } }', True, {'base': ['Nested'], 'lib': ['Hider']}),
+        ('local-ambiguous-type-hiding', 'import shared.Port.*; class Use { void use(){ class Local extends shared.Ambiguous { Token field; } } }', False, {'lib': ['Ambiguous']}),
+        ('local-self-parent-guard', 'import shared.*; class Use { void use(){ class Child extends Child { int run(){return HUSH+hush();} } } }', False, {}),
         ('instance-public-method', 'class Use extends shared.Child { int use(){return instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('instance-public-field', 'class Use extends shared.Child { int use(){return OPEN;} }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('instance-value-type-collision', 'import shared.*; class Use extends shared.Child { String use(){return VALUEOBJ.toString();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
@@ -199,6 +249,19 @@ def exercise(binary, base):
         package = 'shared' if label.startswith('same-package-') else 'consumer'
         write('attached', label + '/Use.java', f'package {package}; ' + source)
         write('attached', label + '/build.gradle', 'dependencies { implementation(project(":lib")); implementation(project(":base")) }')
+    for owner in ('project', 'attached'):
+        state = connect(directory / (owner + '-inventory.sqlite'))
+        try:
+            state.executescript('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);' + mobile_contracts.SCHEMA)
+            mobile_contracts.inventory(state, directory / owner)
+            counts = dict(state.execute('SELECT extension,count(*) FROM file_inventory GROUP BY extension'))
+            extra = len(cases) if owner == 'attached' else 0
+            want = {'.java': len(sources) + extra, '.gradle': 2 + extra, '.txt': 1}
+            if counts != want:
+                raise ToolError('inherited import full inventory incomplete')
+            record('inventory:' + owner, want, counts)
+        finally:
+            state.close()
     javac = shutil.which('javac')
     if not javac:
         raise ToolError('inherited import checks require javac')
@@ -219,19 +282,6 @@ def exercise(binary, base):
     classes = directory / 'library-classes'
     for label, _, valid, _ in cases:
         record('javac:' + label, valid, compile(label, [directory / 'attached' / label / 'Use.java'], classes))
-    for owner in ('project', 'attached'):
-        state = connect(directory / (owner + '-inventory.sqlite'))
-        try:
-            state.executescript('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);' + mobile_contracts.SCHEMA)
-            mobile_contracts.inventory(state, directory / owner)
-            counts = dict(state.execute('SELECT extension,count(*) FROM file_inventory GROUP BY extension'))
-            extra = len(cases) if owner == 'attached' else 0
-            want = {'.java': len(sources) + extra, '.gradle': 2 + extra, '.txt': 1}
-            if counts != want:
-                raise ToolError('inherited import full inventory incomplete')
-            record('inventory:' + owner, want, counts)
-        finally:
-            state.close()
     (runner.root / '.git').mkdir()
     runner.command('rebuild', '--force', '--max-files', '0')
     runner.json('subtree', 'add', 'attached', '../attached')
@@ -269,6 +319,16 @@ def exercise(binary, base):
         record('instance-option:' + ','.join(flags),
                [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Child'])],
                [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+        document = runner.json('unused-deps', 'attached::local-outer-instance-hiding', '--verbose', *flags)
+        record('local-option:' + ','.join(flags),
+               [('attached::base', 'unused', []), ('attached::lib', 'direct', ['Child', 'LocalBase'])],
+               [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+    document = runner.json('unused-deps', 'attached::local-protected-instance')
+    record('local-nonverbose', [('attached::base', 'direct', 1, False),
+                               ('attached::lib', 'direct', 1, False)],
+           [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
+    _, text = runner.command('unused-deps', 'attached::local-protected-instance')
+    record('local-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
     document = runner.json('unused-deps', 'attached::instance-protected')
     record('instance-nonverbose', [('attached::base', 'direct', 1, False),
                                   ('attached::lib', 'direct', 1, False)],
@@ -297,7 +357,10 @@ def exercise(binary, base):
                             ('protected-deep-type', ['Deep']),
                             ('instance-protected', ['Parent']),
                             ('instance-default-diamond', ['Port']),
-                            ('instance-static-nested-guard', [])]:
+                            ('instance-static-nested-guard', []),
+                            ('local-protected-instance', ['Parent']),
+                            ('local-import-type-hiding', []),
+                            ('local-self-parent-guard', [])]:
             record('protected-refresh:' + args[0] + ':' + label, want,
                    runner.json('unused-deps', 'attached::' + label, '--verbose')['items'][0]['examples']['direct'])
     feature = next(iter(FEATURES))

@@ -275,9 +275,13 @@ pub(crate) struct DependencySyntax {
     pub instance_contexts:
         std::collections::BTreeMap<(String, bool, Vec<String>), std::collections::BTreeSet<String>>,
     pub qualified_members: std::collections::BTreeSet<(String, String, bool, Vec<String>)>,
+    /// Source-local owners cannot be looked up by an importable database FQN.
+    pub local_types: std::collections::BTreeMap<String, DependencyImportDeclaration>,
+    pub local_bindings: Vec<(String, String, std::ops::Range<usize>)>,
 }
 
 /// Import metadata retains hiding barriers even for inaccessible members.
+#[derive(Clone)]
 pub(crate) struct DependencyImportDeclaration {
     pub accessible: bool,
     pub member_accessible: bool,
@@ -297,11 +301,59 @@ pub(crate) struct DependencyImportDeclaration {
     pub interface: bool,
 }
 
+/// Keep local declarations distinct even when names and source lines collide.
+fn dependency_type_identity(node: Node<'_>, content: &str, package: &str) -> String {
+    let mut names = Vec::new();
+    let mut current = Some(node);
+    while let Some(owner) = current {
+        if matches!(
+            owner.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            if let Some(name) = owner.child_by_field_name("name") {
+                let mut value = node_text(content, &name).to_owned();
+                if owner
+                    .parent()
+                    .is_some_and(|parent| matches!(parent.kind(), "block" | "switch_block"))
+                {
+                    value.push_str(&format!("@{}", owner.start_byte()));
+                }
+                names.push(value);
+            }
+        }
+        current = owner.parent();
+    }
+    names.reverse();
+    if package.is_empty() {
+        names.join(".")
+    } else {
+        format!("{package}.{}", names.join("."))
+    }
+}
+
 pub(crate) fn dependency_import_declaration(
     content: &str,
     qualified: &str,
     accessing_package: &str,
 ) -> Result<Option<DependencyImportDeclaration>> {
+    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
+    Ok(
+        dependency_declarations(&tree, content, accessing_package, Some(qualified))?
+            .remove(qualified),
+    )
+}
+
+/// Extract either one importable declaration or all occurrence-owned local types.
+fn dependency_declarations(
+    tree: &tree_sitter::Tree,
+    content: &str,
+    accessing_package: &str,
+    qualified: Option<&str>,
+) -> Result<std::collections::BTreeMap<String, DependencyImportDeclaration>> {
     let imports = import_declarations(content)?;
     fn is_type(node: Node<'_>) -> bool {
         matches!(
@@ -341,7 +393,6 @@ pub(crate) fn dependency_import_declaration(
                 .iter()
                 .any(|keyword| modifier(node, content, keyword))
     }
-    let tree = parse_tree(content, &JAVA_LANGUAGE)?;
     let mut package = String::new();
     let mut cursor = tree.root_node().walk();
     for node in tree.root_node().named_children(&mut cursor) {
@@ -359,20 +410,16 @@ pub(crate) fn dependency_import_declaration(
             package = parts.join(".");
         }
     }
-    let mut result = None;
+    let mut result = std::collections::BTreeMap::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
         if !is_type(node) {
             return super::WalkControl::Continue;
         }
-        let mut names = Vec::new();
         let mut current = Some(node);
         let mut allowed = true;
         let mut barriers = Vec::new();
         while let Some(ancestor) = current {
             if is_type(ancestor) {
-                if let Some(name) = ancestor.child_by_field_name("name") {
-                    names.push(node_text(content, &name));
-                }
                 let accessible = accessible(ancestor, content, package == accessing_package);
                 allowed &= accessible;
                 if !accessible {
@@ -387,19 +434,21 @@ pub(crate) fn dependency_import_declaration(
                     | "enum_body_declarations"
                     | "annotation_type_body"
             ) {
-                // Local and anonymous types cannot be imported by canonical name.
-                return super::WalkControl::Continue;
+                // Only source-owned lookup can enter a local declaration.
+                if qualified.is_some() {
+                    return super::WalkControl::Continue;
+                }
             }
             current = ancestor.parent();
         }
-        names.reverse();
-        let name = if package.is_empty() {
-            names.join(".")
-        } else {
-            format!("{package}.{}", names.join("."))
-        };
-        if name != qualified {
+        let name = dependency_type_identity(node, content, &package);
+        if qualified.map_or(!name.contains('@'), |qualified| name != qualified) {
             return super::WalkControl::Continue;
+        }
+        // Every lexical enclosing owner is already available at this source site.
+        if qualified.is_none() {
+            allowed = true;
+            barriers.clear();
         }
         let static_member = node
             .parent()
@@ -505,49 +554,56 @@ pub(crate) fn dependency_import_declaration(
                 super::WalkControl::Continue
             });
         }
-        result = Some(DependencyImportDeclaration {
-            accessible: allowed,
-            member_accessible: accessible(node, content, package == accessing_package),
-            protected_member: modifier(node, content, "protected"),
-            access_barriers: barriers
-                .into_iter()
-                .map(|(barrier, protected)| {
-                    let mut enclosing = Vec::new();
-                    let mut parent = barrier.parent();
-                    while let Some(ancestor) = parent {
-                        if is_type(ancestor) {
-                            if let Some(name) = ancestor.child_by_field_name("name") {
-                                enclosing.push(node_text(content, &name));
+        result.insert(
+            name,
+            DependencyImportDeclaration {
+                accessible: allowed,
+                member_accessible: accessible(node, content, package == accessing_package),
+                protected_member: modifier(node, content, "protected"),
+                access_barriers: barriers
+                    .into_iter()
+                    .map(|(barrier, protected)| {
+                        let mut enclosing = Vec::new();
+                        let mut parent = barrier.parent();
+                        while let Some(ancestor) = parent {
+                            if is_type(ancestor) {
+                                if let Some(name) = ancestor.child_by_field_name("name") {
+                                    enclosing.push(node_text(content, &name));
+                                }
                             }
+                            parent = ancestor.parent();
                         }
-                        parent = ancestor.parent();
-                    }
-                    enclosing.reverse();
-                    let owner = if package.is_empty() {
-                        enclosing.join(".")
-                    } else {
-                        format!("{package}.{}", enclosing.join("."))
-                    };
-                    (owner, protected)
-                })
-                .collect(),
-            protected_names,
-            instance_names,
-            protected_instance_names,
-            package_member: package_member(node, content),
-            static_member,
-            static_names,
-            declared_names,
-            package_names,
-            parents,
-            package: package.clone(),
-            imports: imports.clone(),
-            interface: matches!(
-                node.kind(),
-                "interface_declaration" | "annotation_type_declaration"
-            ),
-        });
-        super::WalkControl::SkipChildren
+                        enclosing.reverse();
+                        let owner = if package.is_empty() {
+                            enclosing.join(".")
+                        } else {
+                            format!("{package}.{}", enclosing.join("."))
+                        };
+                        (owner, protected)
+                    })
+                    .collect(),
+                protected_names,
+                instance_names,
+                protected_instance_names,
+                package_member: package_member(node, content),
+                static_member,
+                static_names,
+                declared_names,
+                package_names,
+                parents,
+                package: package.clone(),
+                imports: imports.clone(),
+                interface: matches!(
+                    node.kind(),
+                    "interface_declaration" | "annotation_type_declaration"
+                ),
+            },
+        );
+        if qualified.is_some() {
+            super::WalkControl::SkipChildren
+        } else {
+            super::WalkControl::Continue
+        }
     });
     Ok(result)
 }
@@ -876,9 +932,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
         visible(&type_shadows) || (expression && visible(&value_shadows))
     };
     fn contexts(node: Node<'_>, content: &str, package: &str) -> Vec<String> {
-        let position = node.start_byte();
-        let mut names = Vec::new();
-        let mut visible = Vec::new();
+        let mut result = Vec::new();
         let mut parent = node.parent();
         while let Some(owner) = parent {
             if matches!(
@@ -888,34 +942,15 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                     | "enum_declaration"
                     | "record_declaration"
                     | "annotation_type_declaration"
-            ) {
-                if let Some(name) = owner.child_by_field_name("name") {
-                    names.push(node_text(content, &name));
-                    visible.push(
-                        owner
-                            .child_by_field_name("body")
-                            .is_some_and(|body| body.byte_range().contains(&position)),
-                    );
-                }
+            ) && owner
+                .child_by_field_name("body")
+                .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
+            {
+                result.push(dependency_type_identity(owner, content, package));
             }
             parent = owner.parent();
         }
-        (0..names.len())
-            .filter(|i| visible[*i])
-            .map(|i| {
-                let suffix = names[i..]
-                    .iter()
-                    .rev()
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(".");
-                if package.is_empty() {
-                    suffix
-                } else {
-                    format!("{package}.{suffix}")
-                }
-            })
-            .collect()
+        result
     }
     fn record_member(
         result: &mut DependencySyntax,
@@ -1152,6 +1187,29 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     result
         .expression_types
         .retain(|name| !actual_types.contains(name));
+    result.local_types = dependency_declarations(&tree, content, &result.package, None)?;
+    super::walk_tree_preorder(&tree.root_node(), |node| {
+        if let Some(parent) = node.parent() {
+            if matches!(
+                node.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) && matches!(parent.kind(), "block" | "switch_block")
+            {
+                if let Some(name) = node.child_by_field_name("name") {
+                    result.local_bindings.push((
+                        node_text(content, &name).to_owned(),
+                        dependency_type_identity(node, content, &result.package),
+                        node.start_byte()..parent.end_byte(),
+                    ));
+                }
+            }
+        }
+        super::WalkControl::Continue
+    });
     Ok(result)
 }
 
@@ -2372,10 +2430,14 @@ class Peer { Guarded field; int value=SECRET+secret(); }
         assert!(syntax
             .type_uses
             .contains(&("base.Parent".into(), false, vec![])));
+        let local = format!(
+            "fixture.Child.Local@{}",
+            source.find("class Local").unwrap()
+        );
         for owners in [
             vec!["fixture.Child"],
             vec!["fixture.Child.Inner", "fixture.Child"],
-            vec!["fixture.Child.Local", "fixture.Child"],
+            vec![local.as_str(), "fixture.Child"],
             vec!["fixture.Peer"],
         ] {
             assert!(syntax.type_uses.contains(&(
@@ -2415,8 +2477,7 @@ class Peer { Guarded field; int value=SECRET+secret(); }
 
     #[test]
     fn dependency_instance_contexts_preserve_static_and_enclosing_boundaries() {
-        let syntax = dependency_syntax(
-            r#"package fixture;
+        let source = r#"package fixture;
 class Use extends base.Parent {
     int read() { return OPEN; }
     static int blocked() { return OPEN; }
@@ -2425,9 +2486,9 @@ class Use extends base.Parent {
     static void local() { class Local { int read() { return LOCAL; } } }
     java.util.function.IntSupplier lambda() { return () -> LAMBDA; }
 }
-"#,
-        )
-        .unwrap();
+"#;
+        let syntax = dependency_syntax(source).unwrap();
+        let local = format!("fixture.Use.Local@{}", source.find("class Local").unwrap());
         let instances = |name: &str, owners: &[&str]| {
             syntax
                 .instance_contexts
@@ -2453,8 +2514,8 @@ class Use extends base.Parent {
             ["fixture.Use.Nested"]
         );
         assert_eq!(
-            instances("LOCAL", &["fixture.Use.Local", "fixture.Use"]),
-            ["fixture.Use.Local"]
+            instances("LOCAL", &[local.as_str(), "fixture.Use"]),
+            [local.as_str()]
         );
         assert_eq!(instances("LAMBDA", &["fixture.Use"]), ["fixture.Use"]);
         let declaration = dependency_import_declaration(
