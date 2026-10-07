@@ -97,6 +97,7 @@ import operation_error_contracts
 import scan_error_contracts
 import root_error_contracts
 import publication_error_contracts
+import publication_recovery_contracts
 import freshness_error_contracts
 import watch_vcs_error_contracts
 import graph_root_contracts
@@ -592,6 +593,7 @@ class Fixture:
         self._operation_error_results = None
         self._scan_error_results = None
         self._root_error_results = None
+        self._publication_recovery_results = None
         self._publication_error_results = None
         self._freshness_error_results = None
         self._watch_vcs_error_results = None
@@ -2097,6 +2099,16 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def publication_recovery_check(self, check: sqlite3.Row):
+        if self._publication_recovery_results is None:
+            self._publication_recovery_results = publication_recovery_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (dict(section[check['feature']]) for section in self._publication_recovery_results)
+        actual['acceptance_complete'] = publication_recovery_contracts.acceptance_complete(expected, actual)
+        expected['acceptance_complete'] = True
+        return {'source': publication_recovery_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def freshness_error_check(self, check: sqlite3.Row):
         if self._freshness_error_results is None:
             self._freshness_error_results = freshness_error_contracts.exercise(self.binary, self.database.parent)
@@ -2348,6 +2360,8 @@ class Fixture:
                 handler = self.scan_error_check
             if check['feature'] in root_error_contracts.FEATURES:
                 handler = self.root_error_check
+            if check['feature'] in publication_recovery_contracts.FEATURES:
+                handler = self.publication_recovery_check
             if check['feature'] in publication_error_contracts.FEATURES:
                 handler = self.publication_error_check
             if check['feature'] in freshness_error_contracts.FEATURES:
@@ -2508,6 +2522,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(operation_error_contracts.FEATURES)
     features.update(scan_error_contracts.FEATURES)
     features.update(root_error_contracts.FEATURES)
+    features.update(publication_recovery_contracts.FEATURES)
     features.update(publication_error_contracts.FEATURES)
     features.update(freshness_error_contracts.FEATURES)
     features.update(watch_vcs_error_contracts.FEATURES)
@@ -2701,6 +2716,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     operation_error_contracts.plan_errors(state, root)
     scan_error_contracts.plan_errors(state, root)
     root_error_contracts.plan_errors(state, root)
+    publication_recovery_contracts.plan_errors(state, root)
     publication_error_contracts.plan_errors(state, root)
     freshness_error_contracts.plan_errors(state, root)
     watch_vcs_error_contracts.plan_errors(state, root)

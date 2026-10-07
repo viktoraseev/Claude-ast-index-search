@@ -801,12 +801,16 @@ fn write_bounded_json_file<T: Serialize>(
     }
     let (pending_path, mut pending_file) =
         pending.context("could not allocate cache owner manifest temporary file")?;
-    if let Err(error) = pending_file.write_all(&bytes) {
+    if let Err(error) = test_publication_marker_fault(path, "write")
+        .and_then(|()| pending_file.write_all(&bytes).map_err(Into::into))
+    {
         drop(pending_file);
         let _ = std::fs::remove_file(&pending_path);
         return Err(error).context("failed to write cache owner manifest");
     }
-    if let Err(error) = pending_file.sync_all() {
+    if let Err(error) = test_publication_marker_fault(path, "file-sync")
+        .and_then(|()| pending_file.sync_all().map_err(Into::into))
+    {
         drop(pending_file);
         let _ = std::fs::remove_file(&pending_path);
         return Err(error).context("failed to sync cache owner manifest");
@@ -847,20 +851,55 @@ fn write_bounded_json_file<T: Serialize>(
             sync_cache_directory(pending_dir)?;
         }
     } else {
-        if let Err(error) = std::fs::hard_link(&pending_path, path) {
-            let _ = std::fs::remove_file(&pending_path);
-            return Err(error).with_context(|| {
+        let mut installed = false;
+        let install_result = (|| -> Result<()> {
+            test_publication_marker_fault(path, "install")?;
+            std::fs::hard_link(&pending_path, path).with_context(|| {
                 format!("failed to install cache owner intent {}", path.display())
-            });
+            })?;
+            installed = true;
+            test_publication_marker_fault(path, "installed-sync")?;
+            sync_installed_cache_file(path)?;
+            let target_parent = path
+                .parent()
+                .context("installed cache owner intent has no parent directory")?;
+            test_publication_marker_fault(path, "directory-sync")?;
+            sync_cache_directory(target_parent)?;
+            Ok(())
+        })();
+        if let Err(error) = install_result {
+            // A linked commit marker is not acknowledged until its contents and
+            // directory are synced. Invalidate our own link before recovery can
+            // mistake a failed write for a committed generation. A pre-existing
+            // or concurrently replaced marker is never ours to delete.
+            let cleanup = (|| -> Result<()> {
+                if installed {
+                    let pending_metadata = std::fs::symlink_metadata(&pending_path)?;
+                    let installed_metadata = std::fs::symlink_metadata(path)?;
+                    anyhow::ensure!(
+                        installed_metadata.file_type().is_file()
+                            && same_file_identity(&pending_metadata, &installed_metadata),
+                        "failed marker was replaced at {}",
+                        path.display()
+                    );
+                    remove_regular_file_if_present(path)?;
+                    sync_cache_directory(path.parent().context("marker has no parent")?)?;
+                }
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(&pending_path);
+            return match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(FailedMarkerCleanup(format!(
+                    "{error:#}; failed to invalidate unacknowledged marker: {cleanup_error:#}"
+                ))
+                .into()),
+            };
         }
-        sync_installed_cache_file(path)?;
-        let target_parent = path
-            .parent()
-            .context("installed cache owner intent has no parent directory")?;
-        sync_cache_directory(target_parent)?;
-        if std::fs::remove_file(&pending_path).is_ok() {
-            sync_cache_directory(pending_dir)?;
-        }
+        // The installed marker is durable; removing its temporary hard link
+        // cannot change the committed decision. Always clean that private name.
+        remove_regular_file_if_present(&pending_path)?;
+        sync_cache_directory(pending_dir)?;
     }
     Ok(())
 }
@@ -2216,6 +2255,10 @@ pub fn acquire_rebuild_lock(project_root: &Path) -> Result<File> {
 pub fn acquire_rebuild_guard(project_root: &Path) -> Result<RebuildLock> {
     let (db_path, lease, _normalized) = resolve_db_path_and_lease(project_root)?;
     let lock_file = open_rebuild_lock_file(&db_path)?;
+    // The publication record can still own a directory whose final owner-file
+    // unlink succeeded but rmdir failed. Recover that exact generation before
+    // treating nearby staging directories as abandoned/unowned.
+    recover_interrupted_index_publication(project_root)?;
     cleanup_abandoned_index_staging(&db_path)?;
     Ok(RebuildLock {
         _lock_file: lock_file,
@@ -3234,6 +3277,63 @@ fn remove_regular_file_if_present(path: &Path) -> Result<()> {
     }
 }
 
+#[derive(Debug)]
+struct FailedMarkerCleanup(String);
+
+impl std::fmt::Display for FailedMarkerCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FailedMarkerCleanup {}
+
+/// Inject one queued I/O failure only for an explicitly overridden disposable
+/// database. The bounded control file must live beside that exact database.
+fn test_publication_fault(db_path: &Path, phase: &str) -> Result<()> {
+    let Some(control) = std::env::var_os("AST_INDEX_TEST_PUBLICATION_FAULT_FILE") else {
+        return Ok(());
+    };
+    let control = PathBuf::from(control);
+    anyhow::ensure!(
+        overridden_db_path().as_deref() == Some(db_path) && control.parent() == db_path.parent(),
+        "publication fault control must be beside the explicit database"
+    );
+    #[derive(Deserialize, Serialize)]
+    struct Faults {
+        database: PathBuf,
+        phases: Vec<String>,
+        #[serde(default)]
+        reached: Vec<String>,
+    }
+    let Some(mut faults): Option<Faults> = read_bounded_json_file(&control)? else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        faults.database == db_path && faults.phases.len() + faults.reached.len() <= 32,
+        "invalid publication fault control"
+    );
+    if faults.phases.first().map(String::as_str) != Some(phase) {
+        return Ok(());
+    }
+    faults.reached.push(faults.phases.remove(0));
+    std::fs::write(&control, serde_json::to_vec(&faults)?)?;
+    anyhow::bail!("injected publication I/O failure: {phase}")
+}
+
+fn test_publication_marker_fault(path: &Path, phase: &str) -> Result<()> {
+    let name = path.to_string_lossy();
+    for (suffix, prefix) in [
+        (PUBLICATION_STATE_SUFFIX, "state"),
+        (PUBLICATION_COMMIT_SUFFIX, "commit"),
+    ] {
+        if let Some(database) = name.strip_suffix(suffix) {
+            return test_publication_fault(Path::new(database), &format!("{prefix}-{phase}"));
+        }
+    }
+    Ok(())
+}
+
 fn write_publication_marker<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
@@ -3243,6 +3343,7 @@ fn write_publication_marker<T: Serialize>(path: &Path, value: &T) -> Result<()> 
 
 fn remove_publication_marker(path: &Path) -> Result<()> {
     remove_regular_file_if_present(path)?;
+    test_publication_marker_fault(path, "remove-sync")?;
     let parent = path
         .parent()
         .context("index publication marker has no parent directory")?;
@@ -3438,15 +3539,21 @@ fn cleanup_owned_staging_directory(directory: &Path, live_db: &Path) -> Result<(
         "index.db-shm",
         "index.db",
     ] {
+        if name == "index.db" && directory.join(name).exists() {
+            test_publication_fault(live_db, "staging-db-remove")?;
+        }
         remove_regular_file_if_present(&directory.join(name))?;
     }
+    test_publication_fault(live_db, "staging-owner-remove")?;
     remove_regular_file_if_present(&owner_path)?;
+    test_publication_fault(live_db, "staging-directory-remove")?;
     std::fs::remove_dir(directory).with_context(|| {
         format!(
             "failed to remove abandoned staging directory {}",
             directory.display()
         )
     })?;
+    test_publication_fault(live_db, "staging-directory-sync")?;
     sync_cache_directory(
         directory
             .parent()
@@ -3555,7 +3662,22 @@ fn cleanup_recorded_publication_staging(
                 directory.display()
             );
             if abandoned_staging_purpose(name).is_some() {
-                cleanup_owned_staging_directory(&directory, db_path)
+                match std::fs::symlink_metadata(staging_owner_path(&directory)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Only the durable publication record authorizes this
+                        // exact empty directory. Missing ownership never allows
+                        // deletion of remaining DBs or other source artifacts.
+                        anyhow::ensure!(
+                            std::fs::read_dir(&directory)?.next().is_none(),
+                            "recorded staging directory has unowned contents: {}",
+                            directory.display()
+                        );
+                        std::fs::remove_dir(&directory)?;
+                        sync_cache_directory(parent)
+                    }
+                    Err(error) => Err(error.into()),
+                    Ok(_) => cleanup_owned_staging_directory(&directory, db_path),
+                }
             } else {
                 cleanup_restore_staging(&directory.join("index.db"))?;
                 std::fs::remove_dir(&directory).with_context(|| {
@@ -3757,7 +3879,9 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
             if state.artifacts[0] {
                 let swap = swap_artifact_path(db_path, "");
                 if swap.exists() {
+                    test_publication_fault(db_path, "rollback-remove")?;
                     remove_regular_file_if_present(db_path)?;
+                    test_publication_fault(db_path, "rollback-rename")?;
                     std::fs::rename(&swap, db_path).with_context(|| {
                         format!(
                             "failed to restore interrupted index from {}",
@@ -3772,6 +3896,7 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
                     );
                 }
             } else {
+                test_publication_fault(db_path, "rollback-remove")?;
                 remove_regular_file_if_present(db_path)?;
             }
             for suffix in ["-wal", "-shm", "-journal"] {
@@ -3790,11 +3915,15 @@ fn recover_interrupted_publication_at_path(db_path: &Path) -> Result<()> {
         .parent()
         .context("index database has no parent directory")?;
     remove_regular_file_if_present(&publication_pending_swap_path(db_path))?;
+    test_publication_fault(db_path, "recovery-directory-sync")?;
     sync_cache_directory(parent)?;
+    test_publication_fault(db_path, "recovery-staging")?;
     cleanup_recorded_publication_staging(db_path, state.as_ref())?;
     // State is removed first. A crash between removals leaves a standalone
     // commit marker, which unambiguously keeps the already-durable new state.
+    test_publication_fault(db_path, "recovery-state-remove")?;
     remove_publication_marker(&state_path)?;
+    test_publication_fault(db_path, "recovery-commit-remove")?;
     remove_publication_marker(&commit_path)?;
     Ok(())
 }
@@ -3817,6 +3946,7 @@ fn cleanup_recorded_committed_swaps(
                 "committed publication contains an unrecorded swap artifact: {}",
                 swap.display()
             );
+            test_publication_fault(db_path, "recovery-swap-remove")?;
             remove_regular_file_if_present(&swap)?;
         }
     }
@@ -3884,6 +4014,11 @@ where
     })();
 
     if let Err(error) = publish_result {
+        if error.downcast_ref::<FailedMarkerCleanup>().is_some() {
+            // Leave the old snapshot and durable decision markers for an
+            // explicit retry; never promote an unacknowledged marker here.
+            return Err(error);
+        }
         return match recover_interrupted_publication_at_path(db_path) {
             Ok(()) => Err(error),
             Err(recovery_error) => Err(anyhow::anyhow!(
@@ -3995,6 +4130,9 @@ impl IndexPublicationGuard {
             write_publication_marker(&publication_commit_path(&self.db_path), &commit)
         })();
         if let Err(error) = clear_result {
+            if error.downcast_ref::<FailedMarkerCleanup>().is_some() {
+                return Err(error);
+            }
             return match recover_interrupted_publication_at_path(&self.db_path) {
                 Ok(()) => Err(error),
                 Err(recovery_error) => Err(anyhow::anyhow!(
@@ -12267,6 +12405,33 @@ mod tests {
         assert!(format!("{error:#}").contains("untracked index swap"));
         assert_eq!(publication_fixture_value(&db_path), "live");
         assert_eq!(publication_fixture_value(&swap), "unknown");
+    }
+
+    #[test]
+    fn recorded_staging_cleanup_retries_after_owner_unlink() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::TempDir::new_in(base).unwrap();
+        let db_path = temp.path().join("index.db");
+        let staged_dir = temp.path().join(".restore-123-0");
+        std::fs::create_dir(&staged_dir).unwrap();
+        let mut state = write_preparing_marker(&db_path, PublicationOperation::Install, [false; 4]);
+        state.staging_dir = Some(".restore-123-0".to_owned());
+        // Simulate an interrupted directory removal after the owner and DB
+        // were deleted. A recorded empty directory is still safe to remove.
+        cleanup_recorded_publication_staging(&db_path, Some(&state)).unwrap();
+        assert!(!staged_dir.exists());
+
+        std::fs::create_dir(&staged_dir).unwrap();
+        std::fs::write(staged_dir.join("Unknown.java"), b"class Unknown {} ").unwrap();
+        assert!(cleanup_recorded_publication_staging(&db_path, Some(&state)).is_err());
+        assert!(staged_dir.join("Unknown.java").exists());
+        // Unrecorded empty directories still require an owner; the recovery
+        // record does not authorize a broad cleanup of nearby directories.
+        let other = temp.path().join(".restore-123-1");
+        std::fs::create_dir(&other).unwrap();
+        assert!(cleanup_owned_staging_directory(&other, &db_path).is_err());
+        assert!(other.exists());
     }
 
     #[test]
