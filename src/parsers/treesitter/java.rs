@@ -724,6 +724,28 @@ pub(crate) fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(N
     scopes
 }
 
+pub(crate) fn dependency_contexts(node: Node<'_>, content: &str, package: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut parent = node.parent();
+    while let Some(owner) = parent {
+        if matches!(
+            owner.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) && owner
+            .child_by_field_name("body")
+            .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
+        {
+            result.push(dependency_type_identity(owner, content, package));
+        }
+        parent = owner.parent();
+    }
+    result
+}
+
 pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     fn spelling(node: tree_sitter::Node<'_>, content: &str) -> String {
         let mut parts = Vec::new();
@@ -931,27 +953,6 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
         };
         visible(&type_shadows) || (expression && visible(&value_shadows))
     };
-    fn contexts(node: Node<'_>, content: &str, package: &str) -> Vec<String> {
-        let mut result = Vec::new();
-        let mut parent = node.parent();
-        while let Some(owner) = parent {
-            if matches!(
-                owner.kind(),
-                "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "annotation_type_declaration"
-            ) && owner
-                .child_by_field_name("body")
-                .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
-            {
-                result.push(dependency_type_identity(owner, content, package));
-            }
-            parent = owner.parent();
-        }
-        result
-    }
     fn record_member(
         result: &mut DependencySyntax,
         name: String,
@@ -959,7 +960,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
         node: Node<'_>,
         content: &str,
     ) {
-        let owners = contexts(node, content, &result.package);
+        let owners = dependency_contexts(node, content, &result.package);
         let key = (name, method, owners.clone());
         let allowed = result.instance_contexts.entry(key.clone()).or_default();
         let mut parent = Some(node);
@@ -1050,7 +1051,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                             result.type_uses.insert((
                                 name.clone(),
                                 false,
-                                contexts(node, content, &result.package),
+                                dependency_contexts(node, content, &result.package),
                             ));
                             result.types.insert(name);
                         }
@@ -1065,7 +1066,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         result.type_uses.insert((
                             spelling.clone(),
                             false,
-                            contexts(node, content, &result.package),
+                            dependency_contexts(node, content, &result.package),
                         ));
                         result.types.insert(spelling);
                     }
@@ -1095,7 +1096,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         let name = spelling(object, content);
                         if !shadowed(&name, object, true) {
                             result.expression_types.insert(name.clone());
-                            let owners = contexts(node, content, &result.package);
+                            let owners = dependency_contexts(node, content, &result.package);
                             if let Some(member) =
                                 node.child_by_field_name(if node.kind() == "field_access" {
                                     "field"

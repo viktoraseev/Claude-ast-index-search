@@ -2287,6 +2287,194 @@ fn collector_projection(
     JavaReceiver::Unknown
 }
 
+/// Nominal value members reuse graph variable scopes and exact declaration sites.
+/// Chained/inferred generic and overload signatures require separate evidence.
+pub(crate) struct DependencyValueMember {
+    pub path: String,
+    pub position: usize,
+    pub contexts: Vec<String>,
+    pub use_contexts: Vec<String>,
+    pub name: String,
+    pub method: bool,
+}
+
+pub(crate) fn dependency_value_members(
+    source: &str,
+    package: &str,
+) -> Result<Vec<DependencyValueMember>> {
+    use crate::parsers::treesitter::java::dependency_contexts;
+    fn is_static(node: Node<'_>, source: &str) -> bool {
+        let mut cursor = node.walk();
+        let found = node.named_children(&mut cursor).any(|child| {
+            child.kind() == "modifiers"
+                && text(child, source)
+                    .split_whitespace()
+                    .any(|word| word == "static")
+        });
+        found
+    }
+    fn available(call: Node<'_>, ty: Node<'_>, source: &str) -> bool {
+        let mut declaration = Some(ty);
+        while let Some(node) = declaration {
+            if node.kind() == "field_declaration" {
+                if !node
+                    .child_by_field_name("type")
+                    .is_some_and(|field_type| field_type.byte_range().contains(&ty.start_byte()))
+                    || is_static(node, source)
+                {
+                    return true;
+                }
+                let body = node.parent().map(|body| body.id());
+                let mut context = Some(call);
+                while let Some(node) = context {
+                    if Some(node.id()) == body {
+                        return true;
+                    }
+                    if node.kind() == "static_initializer"
+                        || matches!(node.kind(), "method_declaration" | "field_declaration")
+                            && is_static(node, source)
+                    {
+                        return false;
+                    }
+                    context = node.parent();
+                }
+                return false;
+            }
+            declaration = node.parent();
+        }
+        true
+    }
+    let tree = parse_tree(source, &LANGUAGE)?;
+    let declarations = callable_declarations(tree.root_node(), source);
+    let scopes = variable_scopes(tree.root_node(), source, &declarations);
+    let mut result = Vec::new();
+    walk_tree_preorder(&tree.root_node(), |node| {
+        let (object, member, method) = match node.kind() {
+            "method_invocation" => (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("name"),
+                true,
+            ),
+            "field_access" => (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("field"),
+                false,
+            ),
+            "method_reference" => (node.named_child(0), node.named_child(1), true),
+            _ => return WalkControl::Continue,
+        };
+        let (Some(object), Some(member)) = (object, member) else {
+            return WalkControl::Continue;
+        };
+        let owner = callable(node).unwrap_or(node);
+        let receiver = expression_receiver(object, owner, source, &scopes, 0);
+        let site = expression_receiver_site(object, source, &scopes, &declarations);
+        let nominal = match &receiver {
+            JavaReceiver::Declared { receiver, site } => match receiver.as_ref() {
+                JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => {
+                    Some((path.clone(), site.position))
+                }
+                _ => None,
+            },
+            JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => {
+                site.as_ref().map(|site| (path.clone(), site.position))
+            }
+            _ => None,
+        };
+        if let Some((path, position)) = nominal {
+            // Bind at the actual type node, not a later use in a nested callable.
+            if let Some(ty) = tree
+                .root_node()
+                .descendant_for_byte_range(position, position + 1)
+            {
+                if !available(node, ty, source) {
+                    return WalkControl::Continue;
+                }
+                result.push(DependencyValueMember {
+                    path: path.replace("::", "."),
+                    position,
+                    contexts: dependency_contexts(ty, source, package),
+                    use_contexts: dependency_contexts(node, source, package),
+                    name: text(member, source).to_owned(),
+                    method,
+                });
+            }
+        }
+        WalkControl::Continue
+    });
+    Ok(result)
+}
+
+#[cfg(test)]
+mod dependency_value_tests {
+    #[test]
+    fn static_fields_and_local_instances_keep_their_own_type_sites() {
+        let source = r#"class Probe {
+            static shared.Child value;
+            static int use() { return value.instance(); }
+            static int local() {
+                class Local {
+                    shared.Child value;
+                    int read() { return value.instance(); }
+                }
+                return 0;
+            }
+            static int parameter(shared.Child value) { return value.instance(); }
+        }"#;
+        let members = super::dependency_value_members(source, "").unwrap();
+        assert_eq!(members.len(), 3);
+        for member in &members {
+            assert_eq!(member.path, "shared.Child");
+            assert_eq!(member.name, "instance");
+        }
+        assert!(members[1].contexts[0].starts_with("Probe.Local@"));
+        assert_eq!(members[1].contexts, members[1].use_contexts);
+        assert_ne!(members[0].position, members[1].position);
+        assert_ne!(members[0].position, members[2].position);
+    }
+
+    #[test]
+    fn nominal_sites_do_not_borrow_shadowed_or_static_bindings() {
+        let source = r#"class Probe {
+            shared.Child value;
+            int use(shared.Child value) { return value.instance(); }
+            int field() { return this.value.OPEN; }
+            static int invalid() { return value.instance(); }
+            java.util.function.ToIntFunction<Object> invalidLambda() {
+                return value -> value.instance();
+            }
+            java.util.function.IntSupplier reference(shared.Child value) {
+                return value::instance;
+            }
+        }"#;
+        let members = super::dependency_value_members(source, "").unwrap();
+        assert_eq!(
+            members.len(),
+            3,
+            "{:?}",
+            members
+                .iter()
+                .map(|member| (member.name.as_str(), member.position))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["instance", "OPEN", "instance"]
+        );
+        for member in &members {
+            assert_eq!(member.path, "shared.Child");
+            assert!(source[member.position..].starts_with("shared.Child"));
+            assert_eq!(member.contexts, ["Probe"]);
+            assert_eq!(member.use_contexts, ["Probe"]);
+        }
+        assert_ne!(members[0].position, members[1].position);
+        assert_ne!(members[0].position, members[2].position);
+    }
+}
+
 impl JavaSource {
     pub fn parse(source: &str) -> Result<Self> {
         let tree = parse_tree(source, &LANGUAGE)?;

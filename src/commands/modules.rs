@@ -2630,6 +2630,110 @@ impl JavaDependencyLookup<'_> {
             None
         })
     }
+
+    /// Bind a receiver type at its declaration site within the selected classpath.
+    fn value_type(
+        &self,
+        name: &str,
+        position: usize,
+        imports: &[(String, bool)],
+    ) -> Result<Option<JavaDependencyType>> {
+        let first = name.split('.').next().unwrap_or(name);
+        let suffix = &name[first.len()..];
+        if let Some((_, identity, _)) = self
+            .local_bindings
+            .iter()
+            .filter(|(simple, _, range)| simple == first && range.contains(&position))
+            .min_by_key(|(_, _, range)| range.end - range.start)
+        {
+            return self.type_name(&format!("{identity}{suffix}"), true);
+        }
+        let (bound, found) = self.lexical_type(name)?;
+        if bound {
+            return Ok(found);
+        }
+        for context in self.contexts {
+            if let Some(found) = self.type_name(&format!("{context}.{name}"), true)? {
+                return Ok(Some(found));
+            }
+        }
+        if let Some((import, is_static)) = imports
+            .iter()
+            .find(|(import, _)| !import.ends_with(".*") && import.rsplit('.').next() == Some(first))
+        {
+            let found = self.type_name(
+                &format!("{import}{suffix}"),
+                *is_static || !suffix.is_empty(),
+            )?;
+            return Ok(found.filter(|found| {
+                !is_static || !suffix.is_empty() || found.declaration.static_member
+            }));
+        }
+        let local = if self.package.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{}.{name}", self.package)
+        };
+        if let Some(found) = self.type_name(&local, true)? {
+            return Ok(Some(found));
+        }
+        if name.contains('.') {
+            if let Some(found) = self.type_name(name, true)? {
+                return Ok(Some(found));
+            }
+        }
+        let mut matches = std::collections::BTreeMap::new();
+        for (import, is_static) in imports {
+            if let Some(prefix) = import.strip_suffix(".*") {
+                if let Some(found) = self.type_name(&format!("{prefix}.{name}"), *is_static)? {
+                    if !is_static || found.declaration.static_member {
+                        matches.insert(found.identity.clone(), found);
+                    }
+                }
+            }
+        }
+        Ok(if matches.len() == 1 {
+            matches.into_values().next()
+        } else {
+            None
+        })
+    }
+
+    fn value_member(
+        &self,
+        owner: &JavaDependencyType,
+        member: &(String, bool),
+    ) -> Result<Option<String>> {
+        let mut matches = self.member_origins(owner, member, false, true, &mut HashSet::new())?;
+        if matches.len() != 1 {
+            return Ok(None);
+        }
+        let identity = matches.pop_first().unwrap();
+        if let Some(declaration) = self.raw(&identity)? {
+            // Cross-package protected instance access additionally constrains
+            // the qualifier to the accessing subclass (JLS 6.6.2.1).
+            if declaration.declaration.package != self.package
+                && declaration
+                    .declaration
+                    .protected_instance_names
+                    .contains(member)
+            {
+                let mut allowed = false;
+                for context in self.contexts {
+                    if self.subclass(context, &identity, &mut HashSet::new())?
+                        && self.subclass(&owner.identity, context, &mut HashSet::new())?
+                    {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if !allowed {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(identity))
+    }
 }
 
 /// Check dependency identities using Java syntax and other languages' indexed refs.
@@ -2897,6 +3001,15 @@ fn count_symbols_used_in_module(
             }
             if matches.len() == 1 {
                 identities.extend(matches);
+            }
+        }
+        for member in super::graph::dependency_value_members(&content, &syntax.package)? {
+            let binding = JavaDependencyLookup { contexts: &member.contexts, ..lookup };
+            if let Some(owner) = binding.value_type(&member.path, member.position, &syntax.imports)? {
+                let accessing = JavaDependencyLookup { contexts: &member.use_contexts, ..lookup };
+                if let Some(identity) = accessing.value_member(&owner, &(member.name, member.method))? {
+                    identities.insert(identity);
+                }
             }
         }
         // A local qualifier can name an inherited external superclass type.

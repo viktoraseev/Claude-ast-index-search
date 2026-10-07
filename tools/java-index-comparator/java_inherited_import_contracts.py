@@ -15,7 +15,8 @@ REASON = ('independent source/state and javac: inherited Java member type/static
           'declaring ownership, occurrence-scoped protected subclass types/static members and '
           'enclosing-subclass/sibling/import guards, inherited lexical instance fields/methods '
           'and interface defaults, occurrence-owned local subclass inheritance and lexical superclass '
-          'binding/hiding with static-context boundaries in default/strict JSON/text; not MCP equivalence')
+          'binding/hiding with static-context boundaries, nominal value-qualified receiver declaration sites, '
+          'inherited member ownership and protected qualifier guards in default/strict JSON/text; not MCP equivalence')
 
 
 def plan_imports(state, root):
@@ -50,6 +51,14 @@ def plan_imports(state, root):
                     'fields and methods, interface defaults/diamonds, enclosing captures and static-context guards; '
                     'value-qualified receivers, local subclass superclass hiding, overload signature lookup, '
                     'external/platform and classpath-order resolution remain pending; not MCP equivalence')
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,?)=0", (note, parent, note))
+            note = ('; separate executed nominal value member ownership fixture covers parameters/locals/fields, '
+                    'new/cast/var, captures/references, declaration-site and same-line binding, local hiding, '
+                    'public/interface/hidden declaring owners and private/package/protected qualifier guards '
+                    'with attached classpath provenance and JSON/text/strict/refresh/option controls; '
+                    'field/return chains, generic projections/inference, overload signatures and classpath-order '
+                    'ambiguity remain pending; independent source/javac/CLI, not MCP equivalence')
             state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
                           "AND instr(reason,?)=0", (note, parent, note))
             note = ('; separate executed local subclass ownership fixture covers occurrence-owned fields/methods, '
@@ -120,6 +129,28 @@ def exercise(binary, base):
         }''',
     }
     cases = [
+        ('value-parameter', 'class Use { int run(shared.Child x){return x.OPEN+x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-local', 'class Use { int run(){shared.Child x=null; return x.OPEN+x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-field', 'class Use { shared.Child x; int run(){return this.x.OPEN+this.x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-new-cast', 'class Use { int run(Object x){return new shared.Child().OPEN+((shared.Child)x).instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-inferred', 'class Use { int run(){var x=new shared.Child(); return x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-capture', 'class Use { void run(shared.Child x){class Local {int read(){return x.OPEN+x.instance();}}} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-lambda', 'class Use { java.util.function.IntSupplier run(shared.Child x){return () -> x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-reference', 'class Use { java.util.function.IntSupplier run(shared.Child x){return x::instance;} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-local-type', 'class Use { int run(){class Local extends shared.Child {} Local x=null; return x.OPEN+x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-later-shadow', 'import shared.Child; class Use { int run(Child x){class Child extends shared.LocalBase {} return x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child', 'LocalBase']}),
+        ('value-sibling-sites', 'class Use { int a(shared.Child x){return x.instance();} int b(shared.LocalBase x){return x.OPEN;} }', True, {'base': ['Parent'], 'lib': ['Child', 'LocalBase']}),
+        ('value-hidden-owner', 'class Use { int run(shared.HiddenChild x){return x.EXPORTED;} }', True, {'base': ['HiddenBase'], 'lib': ['HiddenChild']}),
+        ('value-default-diamond', 'class Use { int run(shared.Diamond x){return x.defaultCall();} }', True, {'base': ['Port'], 'lib': ['Diamond']}),
+        ('value-private-guard', 'class Use { int run(shared.Child x){return x.PRIVATE+x.privateCall();} }', False, {'lib': ['Child']}),
+        ('value-protected-guard', 'class Use extends shared.Child { int run(shared.Child x){return x.HUSH+x.hush();} }', False, {'lib': ['Child']}),
+        ('value-protected-subclass', 'class Use extends shared.Child { int run(Use x){return x.HUSH+x.hush();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('value-protected-static', 'class Use extends shared.Child { int run(shared.Child x){return x.SECRET+x.secret();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('same-package-value', 'class Use { int run(Child x){return x.PACKAGE+x.packageCall();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('same-package-value-crossing', 'class Use { int run(Return x){return x.PACKAGE+x.packageCall();} }', False, {'lib': ['Return']}),
+        ('value-package-guard', 'class Use { int run(shared.Child x){return x.PACKAGE+x.packageCall();} }', False, {'lib': ['Child']}),
+        ('value-missing-member', 'class Use { int run(shared.Child x){return x.missing();} }', False, {'lib': ['Child']}),
+        ('value-own-hiding', 'class Use { int run(){class Local extends shared.Child {public int OPEN=2; public int instance(){return 2;}} Local x=null; return x.OPEN+x.instance();} }', True, {'lib': ['Child']}),
         ('local-public-instance', 'class Use { void use(){ class Local extends shared.Child { int run(){return OPEN+instance();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('local-protected-instance', 'class Use { void use(){ class Local extends shared.Child { int run(){return HUSH+hush();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('local-static-parent-members', 'class Use { void use(){ class Local extends shared.Child { int run(){return SECRET+secret();} } } }', True, {'base': ['Parent'], 'lib': ['Child']}),
@@ -308,6 +339,10 @@ def exercise(binary, base):
                 record(key + ':text', True, f'Total: {2-count} unused, 0 exported, {count} used of 2 dependencies' in text)
     for flags in (['--no-transitive'], ['--no-xml'], ['--no-resources'],
                   ['--no-transitive', '--no-xml', '--no-resources']):
+        document = runner.json('unused-deps', 'attached::value-parameter', '--verbose', *flags)
+        record('value-option:' + ','.join(flags),
+               [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Child'])],
+               [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
         document = runner.json('unused-deps', 'attached::static-field', '--verbose', *flags)
         transitive = '--no-transitive' not in flags
         record('option:' + ','.join(flags), [('attached::base', 'direct', ['Parent']),
@@ -329,6 +364,12 @@ def exercise(binary, base):
            [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
     _, text = runner.command('unused-deps', 'attached::local-protected-instance')
     record('local-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
+    document = runner.json('unused-deps', 'attached::value-parameter')
+    record('value-nonverbose', [('attached::base', 'direct', 1, False),
+                               ('attached::lib', 'direct', 1, False)],
+           [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
+    _, text = runner.command('unused-deps', 'attached::value-parameter')
+    record('value-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
     document = runner.json('unused-deps', 'attached::instance-protected')
     record('instance-nonverbose', [('attached::base', 'direct', 1, False),
                                   ('attached::lib', 'direct', 1, False)],
@@ -359,6 +400,10 @@ def exercise(binary, base):
                             ('instance-default-diamond', ['Port']),
                             ('instance-static-nested-guard', []),
                             ('local-protected-instance', ['Parent']),
+                            ('value-parameter', ['Parent']),
+                            ('value-reference', ['Parent']),
+                            ('value-protected-guard', []),
+                            ('value-protected-subclass', ['Parent']),
                             ('local-import-type-hiding', []),
                             ('local-self-parent-guard', [])]:
             record('protected-refresh:' + args[0] + ':' + label, want,
