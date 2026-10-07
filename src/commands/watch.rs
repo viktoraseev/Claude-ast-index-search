@@ -56,6 +56,102 @@ fn is_watch_running(root: &Path) -> Result<bool> {
     }
 }
 
+/// Feed bounded notifications to the real watch loop for a disposable index.
+/// This never overrides the normal provider without an explicit adjacent DB.
+fn test_watch_events(
+    root: &Path,
+) -> Result<Option<Vec<notify_debouncer_mini::DebounceEventResult>>> {
+    use std::io::Read;
+    use std::path::{Component, PathBuf};
+    let Some(control) = std::env::var_os("AST_INDEX_TEST_WATCH_EVENTS_FILE") else {
+        return Ok(None);
+    };
+    let database = std::env::var_os("AST_INDEX_DB_PATH")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("watch event control requires an explicit database"))?;
+    let control = PathBuf::from(control);
+    let parent = database
+        .parent()
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| anyhow::anyhow!("watch event database must be absolute"))?;
+    anyhow::ensure!(
+        control.parent() == Some(parent) && root.starts_with(parent) && root != parent,
+        "watch event control and disposable root must be beside the explicit database"
+    );
+    let mut bytes = Vec::new();
+    std::fs::File::open(&control)?
+        .take(65537)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 65536, "watch event control exceeds budget");
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Events {
+        database: PathBuf,
+        root: PathBuf,
+        mode: String,
+        paths: Vec<PathBuf>,
+    }
+    let input: Events = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        input.database == database && input.root == root && input.paths.len() <= 128,
+        "watch event control identity or path budget is invalid"
+    );
+    anyhow::ensure!(
+        input.paths.iter().all(|p| p
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))),
+        "watch event path escaped root"
+    );
+    let events = match input.mode.as_str() {
+        "disconnect" => Vec::new(),
+        "backend-error" => vec![Err(notify::Error::generic(
+            "fixture notification backend failed",
+        ))],
+        "events" => vec![Ok(input
+            .paths
+            .into_iter()
+            .map(|path| notify_debouncer_mini::DebouncedEvent {
+                path: root.join(path),
+                kind: notify_debouncer_mini::DebouncedEventKind::Any,
+            })
+            .collect())],
+        _ => anyhow::bail!("invalid watch event control mode"),
+    };
+    Ok(Some(events))
+}
+
+/// Check whether a notification can change the indexed source/module state.
+/// Mini-debouncer notifications do not retain rename or removed-path kinds,
+/// so a missing path may be a whole removed directory, even with a suffix.
+fn event_needs_update(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    if relative.components().any(|component| {
+        if matches!(component, std::path::Component::ParentDir) {
+            return true;
+        }
+        let name = component.as_os_str().to_str().unwrap_or("");
+        indexer::EXCLUDED_DIRS.contains(&name) || name == ".git"
+    }) {
+        return false;
+    }
+    if path.is_dir() || !path.exists() {
+        return true;
+    }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(indexer::is_module_file)
+    {
+        return true;
+    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(parsers::is_supported_extension)
+        && !minified::skip_by_name(path)
+}
+
 /// Print a stable watcher status. Callers that only need the exit status use
 /// `--quiet`; the CLI exits successfully only while this project is watched.
 pub fn cmd_watch_status(root: &Path, quiet: bool, format: &str) -> Result<bool> {
@@ -103,7 +199,8 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
 
     let (tx, rx) = mpsc::channel();
 
-    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+    let injected = test_watch_events(root)?;
+    let mut debouncer = new_debouncer(Duration::from_millis(500), tx.clone())?;
     debouncer.watcher().watch(root, RecursiveMode::Recursive)?;
     if json {
         println!(
@@ -119,40 +216,23 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
     }
     std::io::stdout().flush()?;
 
+    let _debouncer = if let Some(events) = injected {
+        for event in events {
+            tx.send(event)?;
+        }
+        drop(debouncer);
+        None
+    } else {
+        Some(debouncer)
+    };
+    drop(tx);
+
     loop {
         match rx.recv() {
             Ok(Ok(events)) => {
                 let changed: Vec<_> = events
                     .iter()
-                    .filter(|e| {
-                        let path = &e.path;
-                        // Only process supported source files
-                        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            if !parsers::is_supported_extension(ext) {
-                                return false;
-                            }
-                        } else {
-                            return false;
-                        }
-                        if minified::skip_by_name(path) {
-                            return false;
-                        }
-                        // Skip excluded directories
-                        !path.components().any(|c| {
-                            let s = c.as_os_str().to_str().unwrap_or("");
-                            matches!(
-                                s,
-                                "build"
-                                    | "node_modules"
-                                    | ".gradle"
-                                    | ".git"
-                                    | "target"
-                                    | ".idea"
-                                    | "__pycache__"
-                                    | ".dart_tool"
-                            )
-                        })
-                    })
+                    .filter(|e| event_needs_update(root, &e.path))
                     .collect();
 
                 if changed.is_empty() {
@@ -202,16 +282,15 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
                 }
             }
             Ok(Err(err)) => {
-                eprintln!("{}", format!("Watch error: {}", err).red());
+                // A failed provider can no longer promise notification
+                // delivery. Release the watcher lock and let callers retry.
+                return Err(anyhow::anyhow!("Watch error: {}", err));
             }
             Err(e) => {
-                eprintln!("{}", format!("Channel error: {}", e).red());
-                break;
+                return Err(anyhow::anyhow!("Channel error: {}", e));
             }
         }
     }
-
-    Ok(())
 }
 
 fn update_index(root: &Path) -> Result<(usize, usize)> {
@@ -251,4 +330,39 @@ fn update_index(root: &Path) -> Result<(usize, usize)> {
     )?;
     let _ = changed; // suppress unused
     Ok((updated, deleted))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn java_watch_events_include_directory_tombstones_and_module_descriptors() {
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let fixture = tempfile::tempdir_in(artifacts).unwrap();
+        let root = fixture.path().join("build");
+        std::fs::create_dir_all(root.join("src.dotted")).unwrap();
+        let java = root.join("src.dotted/Probe.java");
+        std::fs::write(&java, "class Probe {}\n").unwrap();
+        assert!(event_needs_update(&root, &java));
+        assert!(event_needs_update(&root, &root.join("src.dotted")));
+        std::fs::remove_file(&java).unwrap();
+        std::fs::remove_dir(root.join("src.dotted")).unwrap();
+        assert!(event_needs_update(&root, &root.join("src.dotted")));
+        for name in ["build.gradle", "build.gradle.kts", "pom.xml", "ya.make"] {
+            let path = root.join(name);
+            std::fs::write(&path, "fixture descriptor").unwrap();
+            assert!(event_needs_update(&root, &path), "{name}");
+        }
+        std::fs::write(root.join("notes.txt"), "unrelated").unwrap();
+        assert!(!event_needs_update(&root, &root.join("notes.txt")));
+        assert!(!event_needs_update(&root, &root.join("target/Probe.java")));
+        assert!(!event_needs_update(&root, &root.join(".git/Probe.java")));
+        assert!(!event_needs_update(&root, &root.join("../outside.java")));
+        assert!(!event_needs_update(
+            &root,
+            &fixture.path().join("outside.java")
+        ));
+    }
 }

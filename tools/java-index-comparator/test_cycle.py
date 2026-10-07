@@ -63,6 +63,17 @@ class CycleTests(unittest.TestCase):
                             "every existing case ID"):
             self.assertTrue(requirement in prompt, "missing concrete coverage-closure requirement")
 
+    def test_pending_parent_does_not_invent_unbounded_compiler_requirements(self):
+        prompt = cycle.agent_prompt({"evidence": "evidence.sqlite", "counts": {"pass": 100},
+                                     "unimplemented_features": 7}, Path("project"))
+        for requirement in ("advertised command/API contract or a captured target",
+                            "concrete input, expected result and stopping condition",
+                            "invent compiler-equivalence or new external/JDK binary-loader",
+                            "Preserve every recorded case and unsupported",
+                            "required API expansion for user direction",
+                            "not as a silent exclusion, invented pass or automatic scope expansion"):
+            self.assertIn(requirement, prompt)
+
     def test_mixed_framework_contracts_do_not_expand_java_scope(self):
         for counts in ({"pass": 100}, {"fail": 1}):
             with self.subTest(counts=counts):

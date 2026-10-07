@@ -1418,7 +1418,7 @@ fn parse_file_keyed(
 /// Directories to always exclude from indexing (regardless of .gitignore).
 /// Keep this list to generated caches/build outputs only; ordinary dependency
 /// or source directories can be excluded via .gitignore or .ast-index.yaml.
-const EXCLUDED_DIRS: &[&str] = &[
+pub(crate) const EXCLUDED_DIRS: &[&str] = &[
     "node_modules",
     "__pycache__",
     ".build",
@@ -1561,7 +1561,7 @@ pub fn build_files_fingerprint(module_files: &[PathBuf]) -> String {
 }
 
 /// Module-related file names to collect during directory walk
-fn is_module_file(name: &str) -> bool {
+pub(crate) fn is_module_file(name: &str) -> bool {
     name == "build.gradle"
         || name == "build.gradle.kts"
         || swift_manifest_kind(name).is_some()

@@ -100,6 +100,7 @@ import publication_error_contracts
 import publication_recovery_contracts
 import freshness_error_contracts
 import watch_vcs_error_contracts
+import watch_event_contracts
 import graph_root_contracts
 import graph_directory_contracts
 import graph_ambiguity_contracts
@@ -597,6 +598,7 @@ class Fixture:
         self._publication_error_results = None
         self._freshness_error_results = None
         self._watch_vcs_error_results = None
+        self._watch_event_results = None
         self._graph_root_results = None
         self._graph_directory_results = None
         self._graph_ambiguity_results = None
@@ -2119,6 +2121,16 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def watch_event_check(self, check: sqlite3.Row):
+        if self._watch_event_results is None:
+            self._watch_event_results = watch_event_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (dict(section[check['feature']]) for section in self._watch_event_results)
+        actual['acceptance_complete'] = watch_event_contracts.acceptance_complete(expected, actual)
+        expected['acceptance_complete'] = True
+        return {'source': watch_event_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def watch_vcs_error_check(self, check: sqlite3.Row):
         if self._watch_vcs_error_results is None:
             self._watch_vcs_error_results = {}
@@ -2368,6 +2380,8 @@ class Fixture:
                 handler = self.freshness_error_check
             if check['feature'] in watch_vcs_error_contracts.FEATURES:
                 handler = self.watch_vcs_error_check
+            if check['feature'] in watch_event_contracts.FEATURES:
+                handler = self.watch_event_check
             if check['feature'] in management_format_contracts.FEATURES:
                 handler = self.management_format_check
             if check['feature'] in graph_root_contracts.FEATURES:
@@ -2526,6 +2540,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(publication_error_contracts.FEATURES)
     features.update(freshness_error_contracts.FEATURES)
     features.update(watch_vcs_error_contracts.FEATURES)
+    features.update(watch_event_contracts.FEATURES)
     features.update(graph_root_contracts.FEATURES)
     features.update(graph_directory_contracts.FEATURES)
     features.update(graph_ambiguity_contracts.FEATURES)
@@ -2720,6 +2735,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     publication_error_contracts.plan_errors(state, root)
     freshness_error_contracts.plan_errors(state, root)
     watch_vcs_error_contracts.plan_errors(state, root)
+    watch_event_contracts.plan_events(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

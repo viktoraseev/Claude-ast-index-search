@@ -143,6 +143,12 @@ commands/options and entity mappings, documented source/CLI contracts and target
 MCP evidence. Keep this checklist privately with the round evidence; connect
 each missing item to a production code path and executable test or oracle check.
 Vague labels such as 'compiler-wide' are not a substitute for executable criteria.
+Ground each criterion in an advertised command/API contract or a captured target
+MCP case, with a concrete input, expected result and stopping condition. Do not
+invent compiler-equivalence or new external/JDK binary-loader requirements from
+an open-ended coverage reason. Preserve every recorded case and unsupported
+obligation; expose any genuinely required API expansion for user direction,
+not as a silent exclusion, invented pass or automatic scope expansion.
 The checklist must preserve the full Java API scope; narrowing it to currently
 passing fixtures is forbidden. Finish the chosen family's listed gaps together,
 and report the concrete remaining items if it cannot yet be closed.
