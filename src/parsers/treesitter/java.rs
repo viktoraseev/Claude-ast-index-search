@@ -271,6 +271,9 @@ pub(crate) struct DependencySyntax {
     pub expression_types: std::collections::BTreeSet<String>,
     pub type_uses: std::collections::BTreeSet<(String, bool, Vec<String>)>,
     pub member_uses: std::collections::BTreeSet<(String, bool, Vec<String>)>,
+    /// Lexical instances available at at least one occurrence of this use.
+    pub instance_contexts:
+        std::collections::BTreeMap<(String, bool, Vec<String>), std::collections::BTreeSet<String>>,
     pub qualified_members: std::collections::BTreeSet<(String, String, bool, Vec<String>)>,
 }
 
@@ -281,6 +284,8 @@ pub(crate) struct DependencyImportDeclaration {
     pub protected_member: bool,
     pub access_barriers: Vec<(String, bool)>,
     pub protected_names: std::collections::HashSet<(String, bool)>,
+    pub instance_names: std::collections::HashSet<(String, bool)>,
+    pub protected_instance_names: std::collections::HashSet<(String, bool)>,
     pub package_member: bool,
     pub static_member: bool,
     pub static_names: std::collections::HashSet<(String, bool)>,
@@ -409,6 +414,8 @@ pub(crate) fn dependency_import_declaration(
                         | "record_declaration"
                 ));
         let mut protected_names = std::collections::HashSet::new();
+        let mut instance_names = std::collections::HashSet::new();
+        let mut protected_instance_names = std::collections::HashSet::new();
         let mut static_names = std::collections::HashSet::new();
         let mut declared_names = std::collections::HashSet::new();
         let mut package_names = std::collections::HashSet::new();
@@ -431,24 +438,33 @@ pub(crate) fn dependency_import_declaration(
                 ) {
                     return super::WalkControl::SkipChildren;
                 }
-                let allowed = accessible(member, content, package == accessing_package)
-                    && (modifier(member, content, "static")
-                        || interface_member(member) && member.kind() != "method_declaration");
+                let is_static = modifier(member, content, "static")
+                    || interface_member(member) && member.kind() != "method_declaration";
+                let allowed = accessible(member, content, package == accessing_package);
+                let mut record = |key: (String, bool)| {
+                    declared_names.insert(key.clone());
+                    if package_member(member, content) {
+                        package_names.insert(key.clone());
+                    }
+                    if modifier(member, content, "protected") {
+                        if is_static {
+                            protected_names.insert(key.clone());
+                        } else {
+                            protected_instance_names.insert(key.clone());
+                        }
+                    }
+                    if allowed {
+                        if is_static {
+                            static_names.insert(key);
+                        } else {
+                            instance_names.insert(key);
+                        }
+                    }
+                };
                 if member.kind() == "method_declaration" {
                     if let Some(name) = member.child_by_field_name("name") {
                         let key = (node_text(content, &name).to_owned(), true);
-                        declared_names.insert(key.clone());
-                        if package_member(member, content) {
-                            package_names.insert(key.clone());
-                        }
-                        if modifier(member, content, "protected")
-                            && modifier(member, content, "static")
-                        {
-                            protected_names.insert(key.clone());
-                        }
-                        if allowed {
-                            static_names.insert(key);
-                        }
+                        record(key);
                     }
                 } else {
                     let mut cursor = member.walk();
@@ -458,18 +474,7 @@ pub(crate) fn dependency_import_declaration(
                     {
                         if let Some(name) = variable.child_by_field_name("name") {
                             let key = (node_text(content, &name).to_owned(), false);
-                            declared_names.insert(key.clone());
-                            if package_member(member, content) {
-                                package_names.insert(key.clone());
-                            }
-                            if modifier(member, content, "protected")
-                                && modifier(member, content, "static")
-                            {
-                                protected_names.insert(key.clone());
-                            }
-                            if allowed {
-                                static_names.insert(key);
-                            }
+                            record(key);
                         }
                     }
                 }
@@ -527,6 +532,8 @@ pub(crate) fn dependency_import_declaration(
                 })
                 .collect(),
             protected_names,
+            instance_names,
+            protected_instance_names,
             package_member: package_member(node, content),
             static_member,
             static_names,
@@ -910,6 +917,68 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
             })
             .collect()
     }
+    fn record_member(
+        result: &mut DependencySyntax,
+        name: String,
+        method: bool,
+        node: Node<'_>,
+        content: &str,
+    ) {
+        let owners = contexts(node, content, &result.package);
+        let key = (name, method, owners.clone());
+        let allowed = result.instance_contexts.entry(key.clone()).or_default();
+        let mut parent = Some(node);
+        let mut instance = true;
+        let mut owner_index = 0;
+        while let Some(scope) = parent {
+            let is_static = {
+                let mut cursor = scope.walk();
+                let found = scope
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "modifiers")
+                    .is_some_and(|modifiers| {
+                        let mut cursor = modifiers.walk();
+                        let found = modifiers
+                            .children(&mut cursor)
+                            .any(|child| child.kind() == "static");
+                        found
+                    });
+                found
+            };
+            if scope.kind() == "static_initializer"
+                || is_static && matches!(scope.kind(), "method_declaration" | "field_declaration")
+            {
+                instance = false;
+            }
+            if matches!(
+                scope.kind(),
+                "class_declaration"
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "record_declaration"
+                    | "annotation_type_declaration"
+            ) {
+                if scope
+                    .child_by_field_name("body")
+                    .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
+                {
+                    if instance {
+                        if let Some(owner) = owners.get(owner_index) {
+                            allowed.insert(owner.clone());
+                        }
+                    }
+                    owner_index += 1;
+                }
+                // Static nested types retain their own instance, but cannot
+                // borrow an enclosing one. Lambdas preserve the current this.
+                if is_static || scope.kind() != "class_declaration" {
+                    instance = false;
+                }
+            }
+            parent = scope.parent();
+        }
+        result.member_uses.insert(key);
+    }
     let mut result = DependencySyntax::default();
     let mut actual_types = std::collections::BTreeSet::new();
     super::walk_tree_preorder(&tree.root_node(), |node| {
@@ -979,11 +1048,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                                 .any(|range| range.contains(&name.start_byte()))
                         }) {
                             result.static_names.insert((text.to_owned(), true));
-                            result.member_uses.insert((
-                                text.to_owned(),
-                                true,
-                                contexts(node, content, &result.package),
-                            ));
+                            record_member(&mut result, text.to_owned(), true, node, content);
                         }
                     }
                 }
@@ -1013,11 +1078,13 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                             result
                                 .type_uses
                                 .insert((name.clone(), true, owners.clone()));
-                            result.member_uses.insert((
+                            record_member(
+                                &mut result,
                                 name.split('.').next().unwrap_or(&name).to_owned(),
                                 false,
-                                owners,
-                            ));
+                                node,
+                                content,
+                            );
                             result.static_names.insert((
                                 name.split('.').next().unwrap_or(&name).to_owned(),
                                 false,
@@ -1054,11 +1121,7 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
                         let name = node_text(content, &node);
                         if !shadowed(name, node, true) {
                             result.static_names.insert((name.to_owned(), false));
-                            result.member_uses.insert((
-                                name.to_owned(),
-                                false,
-                                contexts(node, content, &result.package),
-                            ));
+                            record_member(&mut result, name.to_owned(), false, node, content);
                         }
                     }
                 }
@@ -2348,6 +2411,66 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             .protected_names
             .contains(&("SECRET".into(), false)));
         assert!(!declaration.static_names.contains(&("SECRET".into(), false)));
+    }
+
+    #[test]
+    fn dependency_instance_contexts_preserve_static_and_enclosing_boundaries() {
+        let syntax = dependency_syntax(
+            r#"package fixture;
+class Use extends base.Parent {
+    int read() { return OPEN; }
+    static int blocked() { return OPEN; }
+    class Inner { int read() { return INNER + OUTER; } }
+    static class Nested extends base.Parent { int read() { return NESTED; } }
+    static void local() { class Local { int read() { return LOCAL; } } }
+    java.util.function.IntSupplier lambda() { return () -> LAMBDA; }
+}
+"#,
+        )
+        .unwrap();
+        let instances = |name: &str, owners: &[&str]| {
+            syntax
+                .instance_contexts
+                .get(&(
+                    name.to_owned(),
+                    false,
+                    owners.iter().map(|name| (*name).to_owned()).collect(),
+                ))
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        };
+        // Dependency ownership counts a valid use even if another occurrence
+        // of the same name in the same class is in a static method.
+        assert_eq!(instances("OPEN", &["fixture.Use"]), ["fixture.Use"]);
+        assert_eq!(
+            instances("INNER", &["fixture.Use.Inner", "fixture.Use"]),
+            ["fixture.Use", "fixture.Use.Inner"]
+        );
+        assert_eq!(
+            instances("NESTED", &["fixture.Use.Nested", "fixture.Use"]),
+            ["fixture.Use.Nested"]
+        );
+        assert_eq!(
+            instances("LOCAL", &["fixture.Use.Local", "fixture.Use"]),
+            ["fixture.Use.Local"]
+        );
+        assert_eq!(instances("LAMBDA", &["fixture.Use"]), ["fixture.Use"]);
+        let declaration = dependency_import_declaration(
+            "package base; public class Parent { public int OPEN; protected int HUSH; public int instance(){return 1;} public static int STATIC; }",
+            "base.Parent", "fixture").unwrap().unwrap();
+        assert!(declaration.instance_names.contains(&("OPEN".into(), false)));
+        assert!(declaration
+            .instance_names
+            .contains(&("instance".into(), true)));
+        assert!(declaration
+            .protected_instance_names
+            .contains(&("HUSH".into(), false)));
+        assert_eq!(
+            declaration.static_names,
+            std::collections::HashSet::from([("STATIC".into(), false)])
+        );
     }
 
     #[test]

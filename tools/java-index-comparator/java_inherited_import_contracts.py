@@ -13,7 +13,8 @@ FEATURES = {'unused-deps:java-inherited-imports'}
 REASON = ('independent source/state and javac: inherited Java member type/static imports, '
           'canonical import guards, hiding/diamonds, accessibility and attached classpath '
           'declaring ownership, occurrence-scoped protected subclass types/static members and '
-          'enclosing-subclass/sibling/import guards in default/strict JSON/text; not MCP equivalence')
+          'enclosing-subclass/sibling/import guards, inherited lexical instance fields/methods '
+          'and interface defaults with static-context boundaries in default/strict JSON/text; not MCP equivalence')
 
 
 def plan_imports(state, root):
@@ -43,6 +44,13 @@ def plan_imports(state, root):
                            'with attached declaring ownership and JSON/text/refresh controls; '
                            'value receiver dispatch, instance members, local subclass superclass hiding, external/platform lookup '
                            'and classpath-order ambiguity remain pending; not MCP equivalence', parent))
+        for parent in ('unused-deps:semantic-resolution', 'global:scope-command-matrix'):
+            note = ('; separate executed lexical instance ownership fixture covers inherited public/protected/package '
+                    'fields and methods, interface defaults/diamonds, enclosing captures and static-context guards; '
+                    'value-qualified receivers, local subclass superclass hiding, overload signature lookup, '
+                    'external/platform and classpath-order resolution remain pending; not MCP equivalence')
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,?)=0", (note, parent, note))
 
 
 def exercise(binary, base):
@@ -71,13 +79,17 @@ def exercise(binary, base):
             private static class Hidden {} static class PackageOnly {}
             public static int VALUE=1; public static int read(){return 1;}
             protected static int SECRET=1; protected static int secret(){return 1;} public int instance(){return 1;}
+            public int OPEN=1; protected int HUSH=1; protected int hush(){return 1;}
+            public Object VALUEOBJ=new Object();
+            int PACKAGE=1; int packageCall(){return 1;} private int PRIVATE=1; private int privateCall(){return 1;}
         }''',
         'base/Port.java': '''package shared; public interface Port {
-            class Token {} int FLAG=1; static int own(){return 1;}
+            class Token {} int FLAG=1; static int own(){return 1;} default int defaultCall(){return 1;}
         }''',
         'base/Other.java': 'package shared; public interface Other { class Token {} int FLAG=2; }',
         'base/HiddenBase.java': 'package shared; class HiddenBase { public static class Exported {} public static int EXPORTED=1; }',
         'lib/Child.java': 'package shared; public class Child extends Parent {}',
+        'lib/VALUEOBJ.java': 'package shared; public class VALUEOBJ {}',
         'lib/HiddenChild.java': 'package shared; public class HiddenChild extends HiddenBase {}',
         'lib/Left.java': 'package shared; public interface Left extends Port {}',
         'lib/Right.java': 'package shared; public interface Right extends Port {}',
@@ -87,11 +99,35 @@ def exercise(binary, base):
         'lib/PrivateToken.java': 'package shared; public class PrivateToken { private static class Token {} }',
         'lib/AccessibleToken.java': 'package shared; public class AccessibleToken extends PrivateToken implements Port {}',
         'lib/PrivateField.java': 'package shared; public class PrivateField extends Parent { private static int VALUE=2; }',
-        'base/CrossParent.java': 'package shared; public class CrossParent { static class CrossType {} static int CROSS=1; }',
+        'base/CrossParent.java': 'package shared; public class CrossParent { static class CrossType {} static int CROSS=1; int PACKAGE=1; int packageCall(){return 1;} }',
         'lib/Bridge.java': 'package other; public class Bridge extends shared.CrossParent {}',
         'lib/Return.java': 'package shared; public class Return extends other.Bridge {}',
     }
     cases = [
+        ('instance-public-method', 'class Use extends shared.Child { int use(){return instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-public-field', 'class Use extends shared.Child { int use(){return OPEN;} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-value-type-collision', 'import shared.*; class Use extends shared.Child { String use(){return VALUEOBJ.toString();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-protected', 'class Use extends shared.Child { int use(){return HUSH+hush();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-inner', 'class Use extends shared.Child { class Inner { int use(){return HUSH+hush();} } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-local-capture', 'class Use extends shared.Child { void use(){class Local { int use(){return HUSH+hush();} }} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-lambda', 'class Use extends shared.Child { java.util.function.IntSupplier use(){return () -> HUSH+hush();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-anonymous-capture', 'class Use extends shared.Child { java.util.function.IntSupplier use(){return new java.util.function.IntSupplier(){public int getAsInt(){return HUSH+hush();}};} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-initializers', 'class Use extends shared.Child { int value=HUSH+hush(); { value=OPEN+instance(); } Use(){value=HUSH+hush();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-static-method-guard', 'class Use extends shared.Child { static int use(){return OPEN+instance();} }', False, {'lib': ['Child']}),
+        ('instance-static-field-guard', 'class Use extends shared.Child { static int value=OPEN+instance(); }', False, {'lib': ['Child']}),
+        ('instance-static-block-guard', 'class Use extends shared.Child { static { int value=OPEN+instance(); } }', False, {'lib': ['Child']}),
+        ('instance-static-lambda-guard', 'class Use extends shared.Child { static java.util.function.IntSupplier use(){return () -> OPEN+instance();} }', False, {'lib': ['Child']}),
+        ('instance-static-nested-guard', 'class Use extends shared.Child { static class Inner { int use(){return OPEN+instance();} } }', False, {'lib': ['Child']}),
+        ('instance-static-local-guard', 'class Use extends shared.Child { static void use(){class Local { int use(){return OPEN+instance();} }} }', False, {'lib': ['Child']}),
+        ('instance-inner-static-guard', 'class Use extends shared.Child { class Inner { static int use(){return OPEN+instance();} } }', False, {'lib': ['Child']}),
+        ('instance-static-subclass', 'class Use { static class Inner extends shared.Child { int use(){return OPEN+instance();} } }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('instance-private-guard', 'class Use extends shared.Child { int use(){return PRIVATE+privateCall();} }', False, {'lib': ['Child']}),
+        ('instance-package-guard', 'class Use extends shared.Child { int use(){return PACKAGE+packageCall();} }', False, {'lib': ['Child']}),
+        ('same-package-instance', 'class Use extends Child { int use(){return PACKAGE+packageCall();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('same-package-instance-crossing', 'class Use extends Return { int use(){return PACKAGE+packageCall();} }', False, {'lib': ['Return']}),
+        ('instance-import-guard', 'import static shared.Parent.instance; class Use { int use(){return instance();} }', False, {}),
+        ('instance-shadow', 'class Use extends shared.Child { int HUSH=2; protected int hush(){return 2;} int use(){return HUSH+hush();} }', True, {'lib': ['Child']}),
+        ('instance-default-diamond', 'class Use extends shared.Diamond { int use(){return defaultCall();} }', True, {'base': ['Port'], 'lib': ['Diamond']}),
         ('protected-lexical-type', 'class Use extends shared.Child { Guarded x; }', True, {'base': ['Guarded'], 'lib': ['Child']}),
         ('protected-qualified-type', 'class Use extends shared.Child { shared.Parent.Guarded x; }', True, {'base': ['Guarded'], 'lib': ['Child']}),
         ('protected-alias-type', 'class Use extends shared.Child { shared.Child.Guarded x; }', True, {'base': ['Guarded'], 'lib': ['Child']}),
@@ -229,6 +265,18 @@ def exercise(binary, base):
                [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
     for flags in (['--no-transitive'], ['--no-xml'], ['--no-resources'],
                   ['--no-transitive', '--no-xml', '--no-resources']):
+        document = runner.json('unused-deps', 'attached::instance-protected', '--verbose', *flags)
+        record('instance-option:' + ','.join(flags),
+               [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Child'])],
+               [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+    document = runner.json('unused-deps', 'attached::instance-protected')
+    record('instance-nonverbose', [('attached::base', 'direct', 1, False),
+                                  ('attached::lib', 'direct', 1, False)],
+           [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
+    _, text = runner.command('unused-deps', 'attached::instance-protected')
+    record('instance-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
+    for flags in (['--no-transitive'], ['--no-xml'], ['--no-resources'],
+                  ['--no-transitive', '--no-xml', '--no-resources']):
         document = runner.json('unused-deps', 'attached::protected-qualified-field', '--verbose', *flags)
         record('protected-option:' + ','.join(flags),
                [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Child'])],
@@ -246,7 +294,10 @@ def exercise(binary, base):
         record('refresh:' + args[0], ['Exported'], runner.json('unused-deps', 'attached::hidden-owner-type', '--verbose')['items'][0]['examples']['direct'])
         for label, want in [('protected-lexical-type', ['Guarded']),
                             ('protected-qualified-field', ['Parent']),
-                            ('protected-deep-type', ['Deep'])]:
+                            ('protected-deep-type', ['Deep']),
+                            ('instance-protected', ['Parent']),
+                            ('instance-default-diamond', ['Port']),
+                            ('instance-static-nested-guard', [])]:
             record('protected-refresh:' + args[0] + ':' + label, want,
                    runner.json('unused-deps', 'attached::' + label, '--verbose')['items'][0]['examples']['direct'])
     feature = next(iter(FEATURES))

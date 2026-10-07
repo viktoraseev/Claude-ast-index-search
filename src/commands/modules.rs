@@ -2308,6 +2308,12 @@ impl JavaDependencyLookup<'_> {
                 .static_names
                 .extend(found.declaration.protected_names.iter().cloned());
         }
+        if !found.declaration.protected_instance_names.is_empty() && self.protected_access(name)? {
+            found
+                .declaration
+                .instance_names
+                .extend(found.declaration.protected_instance_names.iter().cloned());
+        }
         Ok(Some(found))
     }
 
@@ -2320,12 +2326,22 @@ impl JavaDependencyLookup<'_> {
         Ok(None)
     }
 
-    fn lexical_member(&self, member: &(String, bool)) -> Result<Option<String>> {
+    fn lexical_member(
+        &self,
+        member: &(String, bool),
+        instances: Option<&std::collections::BTreeSet<String>>,
+    ) -> Result<Option<String>> {
         for context in self.contexts {
             if let Some(owner) = self.direct(context)? {
                 // A declaration in this lexical owner blocks outer/import lookup,
                 // even when the inherited candidate is inaccessible or ambiguous.
-                let matches = self.member_origins(&owner, member, false, &mut HashSet::new())?;
+                let matches = self.member_origins(
+                    &owner,
+                    member,
+                    false,
+                    instances.is_some_and(|owners| owners.contains(context)),
+                    &mut HashSet::new(),
+                )?;
                 if !matches.is_empty() {
                     return Ok((matches.len() == 1).then(|| matches.into_iter().next().unwrap()));
                 }
@@ -2461,6 +2477,7 @@ impl JavaDependencyLookup<'_> {
         owner: &JavaDependencyType,
         member: &(String, bool),
         inherited: bool,
+        allow_instance: bool,
         visiting: &mut HashSet<String>,
     ) -> Result<std::collections::BTreeSet<String>> {
         let mut matches = std::collections::BTreeSet::new();
@@ -2470,14 +2487,17 @@ impl JavaDependencyLookup<'_> {
         let refreshed = self.direct(&owner.identity)?;
         let owner = refreshed.as_ref().unwrap_or(owner);
         if owner.declaration.declared_names.contains(member) {
-            if owner.declaration.static_names.contains(member)
-                && !(inherited && member.1 && owner.declaration.interface)
+            if (owner.declaration.static_names.contains(member)
+                && !(inherited && member.1 && owner.declaration.interface))
+                || allow_instance && owner.declaration.instance_names.contains(member)
             {
                 matches.insert(owner.identity.clone());
             }
         } else {
             for parent in self.parents(owner)? {
-                for identity in self.member_origins(&parent, member, true, visiting)? {
+                for identity in
+                    self.member_origins(&parent, member, true, allow_instance, visiting)?
+                {
                     if let Some(found) = self.direct(&identity)? {
                         if found.declaration.package_names.contains(member)
                             && found.declaration.package != owner.declaration.package
@@ -2497,7 +2517,7 @@ impl JavaDependencyLookup<'_> {
         let Some(owner) = self.type_name(owner, true)? else {
             return Ok(None);
         };
-        let mut matches = self.member_origins(&owner, member, false, &mut HashSet::new())?;
+        let mut matches = self.member_origins(&owner, member, false, false, &mut HashSet::new())?;
         Ok(if matches.len() == 1 {
             matches.pop_first()
         } else {
@@ -2659,8 +2679,17 @@ fn count_symbols_used_in_module(
                 });
             if *expression {
                 let member = (first.to_owned(), false);
-                let mut value_import =
-                    explicit_static.contains(&member) || lookup.lexical_member(&member)?.is_some();
+                let mut value_import = explicit_static.contains(&member)
+                    || lookup
+                        .lexical_member(
+                            &member,
+                            syntax.instance_contexts.get(&(
+                                first.to_owned(),
+                                false,
+                                contexts.clone(),
+                            )),
+                        )?
+                        .is_some();
                 if !value_import {
                     for (owner, is_static) in &wildcards {
                         if *is_static && lookup.static_member(owner, &member)?.is_some() {
@@ -2734,7 +2763,12 @@ fn count_symbols_used_in_module(
             if invalid_static_types.contains(name) {
                 continue;
             }
-            if let Some(identity) = lookup.lexical_member(member)? {
+            if let Some(identity) = lookup.lexical_member(
+                member,
+                syntax
+                    .instance_contexts
+                    .get(&(name.clone(), *method, contexts.clone())),
+            )? {
                 identities.insert(identity);
                 continue;
             }

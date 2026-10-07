@@ -69,6 +69,24 @@ class InheritedImportContracts(unittest.TestCase):
         with self.assertRaisesRegex(ToolError, 'inside repository'):
             contracts.exercise(self.binary, Path('/private/tmp'))
 
+    def test_planning_preserves_existing_case_ids_completed_rows_and_parent_gaps(self):
+        root = self.directory / 'read-only-target'
+        root.mkdir()
+        (root / 'Sentinel.java').write_text('class Sentinel {}\n')
+        state = connect(self.directory / 'planning.sqlite')
+        self.addCleanup(state.close)
+        state.executescript(SCHEMA)
+        plan(state, [{'path': 'Sentinel.java'}], '  class  Classes\n  file  Files', root=root, java_only=True)
+        feature = next(iter(contracts.FEATURES))
+        with state:
+            state.execute("UPDATE checks SET status='complete',verdict='pass',expected_json='{}',actual_json='{}' WHERE feature=?", (feature,))
+        before = [tuple(row) for row in state.execute('SELECT * FROM checks WHERE feature=?', (feature,))]
+        parents = [tuple(row) for row in state.execute("SELECT * FROM coverage WHERE feature IN ('unused-deps:semantic-resolution','global:scope-command-matrix') ORDER BY feature")]
+        contracts.plan_imports(state, root)
+        contracts.plan_imports(state, root)
+        self.assertEqual(before, [tuple(row) for row in state.execute('SELECT * FROM checks WHERE feature=?', (feature,))])
+        self.assertEqual(parents, [tuple(row) for row in state.execute("SELECT * FROM coverage WHERE feature IN ('unused-deps:semantic-resolution','global:scope-command-matrix') ORDER BY feature")])
+
 
 if __name__ == '__main__':
     unittest.main()
