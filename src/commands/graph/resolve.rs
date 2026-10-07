@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::Connection;
@@ -697,27 +697,36 @@ impl Builder {
         let file_rows = db::load_graph_files(conn)?;
         let parsed: Vec<Option<ParsedSource>> = file_rows
             .par_iter()
-            .map(|row| {
+            .map(|row| -> Result<Option<ParsedSource>> {
                 let family = language_family(&row.path);
                 if (!matches!(family, "js" | "rust") && !row.path.ends_with(".java"))
                     || db::is_third_party_path(&row.path)
                 {
-                    return None;
+                    return Ok(None);
                 }
-                let content =
-                    std::fs::read_to_string(absolute_file_path(root, &row.root_path, &row.path))
-                        .ok()?;
                 if row.path.ends_with(".java") {
-                    return JavaSource::parse(&content).ok().map(ParsedSource::Java);
+                    let path = absolute_file_path(root, &row.root_path, &row.path);
+                    let content = std::fs::read_to_string(&path).with_context(|| {
+                        format!("Failed to read Java graph source {}", path.display())
+                    })?;
+                    let java = JavaSource::parse(&content).with_context(|| {
+                        format!("Failed to parse Java graph source {}", path.display())
+                    })?;
+                    return Ok(Some(ParsedSource::Java(java)));
                 }
+                let Ok(content) =
+                    std::fs::read_to_string(absolute_file_path(root, &row.root_path, &row.path))
+                else {
+                    return Ok(None);
+                };
                 if family == "rust" {
-                    return parse_uses(&content).map(ParsedSource::Rust);
+                    return Ok(parse_uses(&content).map(ParsedSource::Rust));
                 }
                 let mut imports = Vec::new();
                 let module = parse_module_imports(&row.path, &content, &mut imports);
-                Some(ParsedSource::Js(module, imports))
+                Ok(Some(ParsedSource::Js(module, imports)))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let mut files = Vec::with_capacity(file_rows.len());
         let mut file_index = HashMap::with_capacity(file_rows.len());
         let mut rust = RustIndex::default();

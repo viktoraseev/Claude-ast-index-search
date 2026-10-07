@@ -2602,32 +2602,51 @@ pub fn update_directory_incremental(
         // so the ids they get) differs from the former serial walk order.
         let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
         let (module_tx, module_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let walk_error = Arc::new(Mutex::new(None));
         builder
             .threads(effective_num_threads())
             .build_parallel()
             .run(|| {
                 let tx = tx.clone();
                 let module_tx = module_tx.clone();
+                let walk_error = walk_error.clone();
                 Box::new(move |entry| {
-                    if let Ok(entry) = entry {
-                        if entry.file_type().is_some_and(|t| t.is_file())
-                            && entry.file_name().to_str().is_some_and(is_module_file)
-                        {
-                            let _ = module_tx.send(entry.path().to_path_buf());
+                    match entry {
+                        Ok(entry) => {
+                            if entry.file_type().is_some_and(|t| t.is_file())
+                                && entry.file_name().to_str().is_some_and(is_module_file)
+                            {
+                                let _ = module_tx.send(entry.path().to_path_buf());
+                            }
+                            let is_supported = entry
+                                .path()
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .map(parsers::is_supported_extension)
+                                .unwrap_or(false);
+                            if is_supported
+                                && entry
+                                    .file_type()
+                                    .is_some_and(|t| t.is_file() || t.is_symlink())
+                            {
+                                let _ = tx.send(entry.into_path());
+                            }
                         }
-                        let is_supported = entry
-                            .path()
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(parsers::is_supported_extension)
-                            .unwrap_or(false);
-                        if is_supported {
-                            let _ = tx.send(entry.into_path());
+                        Err(error) => {
+                            *walk_error.lock().unwrap() = Some(error);
+                            return ignore::WalkState::Quit;
                         }
                     }
                     ignore::WalkState::Continue
                 })
             });
+        if let Some(error) = walk_error.lock().unwrap().take() {
+            return Err(anyhow::anyhow!(
+                "Failed to walk incremental source root {}: {}",
+                walk_dir.display(),
+                error
+            ));
+        }
         drop(tx);
         drop(module_tx);
         let mut walked: Vec<PathBuf> = rx.into_iter().collect();
@@ -2715,9 +2734,12 @@ pub fn update_directory_incremental(
         );
     }
 
+    let fingerprint = build_files_fingerprint(&module_files);
+    let stored_fingerprint = db::get_build_files_fingerprint(conn)?;
+    let module_fingerprint_changed = stored_fingerprint.as_ref() != Some(&fingerprint);
     let was_dirty = db::has_index_update_dirty(conn)?;
     let has_planned_mutations = !files_to_parse.is_empty() || !deleted_paths.is_empty();
-    if has_planned_mutations {
+    if has_planned_mutations || module_fingerprint_changed {
         db::mark_index_update_dirty(conn)?;
     }
 
@@ -2756,11 +2778,23 @@ pub fn update_directory_incremental(
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build thread pool: {}", e))?;
 
-        let parsed_files: Vec<ParsedFile> = pool.install(|| {
+        let parsed_files: Vec<Option<ParsedFile>> = pool.install(|| {
             files_to_parse
                 .par_iter()
-                .filter_map(|pending| {
+                .map(|pending| -> Result<Option<ParsedFile>> {
                     let result = match pending {
+                        PendingUpdateFile::Regular {
+                            root,
+                            root_key,
+                            path,
+                        } if path.extension().is_some_and(|ext| ext == "java") => {
+                            parse_file_keyed(root, root_key, path).map_err(|error| {
+                                anyhow::anyhow!(
+                                    "Failed to index Java source {}: {error:#}",
+                                    path.display()
+                                )
+                            })?
+                        }
                         PendingUpdateFile::Regular {
                             root,
                             root_key,
@@ -2776,10 +2810,11 @@ pub fn update_directory_incremental(
                     if progress && c % 500 == 0 {
                         eprintln!("Parsed {} / {} changed files...", c, total_files);
                     }
-                    result
+                    Ok(result)
                 })
-                .collect()
-        });
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let parsed_files: Vec<ParsedFile> = parsed_files.into_iter().flatten().collect();
 
         let count = parsed_files.len();
         let mut dummy_total = 0;
@@ -2795,17 +2830,13 @@ pub fn update_directory_incremental(
     };
 
     let all_planned_files_written = updated_count == files_to_parse.len();
-    if all_planned_files_written && (has_planned_mutations || was_dirty) {
-        db::complete_index_update(conn)?;
-    }
     if minified::enabled() != minified_filter_recorded {
         record_minified_filter(conn)?;
     }
 
     // The module graph is derived from build files, not from parsed symbols,
     // so an added, removed or edited build file needs a separate refresh.
-    let fingerprint = build_files_fingerprint(&module_files);
-    match db::get_build_files_fingerprint(conn)? {
+    match stored_fingerprint {
         Some(stored) if stored != fingerprint => {
             refresh_module_graph(conn, root, &module_files, false)?;
             db::set_build_files_fingerprint(conn, &fingerprint)?;
@@ -2813,6 +2844,14 @@ pub fn update_directory_incremental(
         // First update after a rebuild: the graph was just derived from these files.
         None => db::set_build_files_fingerprint(conn, &fingerprint)?,
         Some(_) => {}
+    }
+
+    // File writes alone are not a completed update: derived module state and
+    // its fingerprint must also succeed before clearing the durable marker.
+    if all_planned_files_written
+        && (has_planned_mutations || module_fingerprint_changed || was_dirty)
+    {
+        db::complete_index_update(conn)?;
     }
 
     Ok((updated_count, files_to_parse.len(), deleted_paths.len()))
