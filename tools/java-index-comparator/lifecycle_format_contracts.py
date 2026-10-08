@@ -17,6 +17,15 @@ REASON = ('internal CLI/DB plus independent source/state: disposable Java lifecy
           'responses, published counts, declaration changes, empty/missing states and watch events; '
           'not MCP equivalence or management installation/root mutation formats')
 
+# Immutable assertion IDs from the original acceptance population, in authored
+# command order. These are public regression identities, not private log
+# ordinals: asynchronous watch probes may consume any number of log entries.
+ANSI_ASSERTION_IDS = (
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    22, 24, 26, 28, 29, 31, 33, 34, 35, 39, 40, 41, 42, 43,
+    51, 52, 53, 55, 56, 58, 59, 61,
+)
+
 
 def plan_formats(state, root):
     if root is None:
@@ -71,6 +80,7 @@ def exercise(binary, base):
     database = directory / 'index.sqlite'
     runner.environment.update(AST_INDEX_ROOT=str(runner.root), AST_INDEX_DB_PATH=str(database))
     expected, actual = {}, {}
+    ansi_ids = iter(ANSI_ASSERTION_IDS)
 
     def record(key, want, got):
         expected[key], actual[key] = want, got
@@ -83,7 +93,11 @@ def exercise(binary, base):
 
     def command(format, *args, acceptable=(0, 1)):
         code, output = runner.command('--format', format, *args, acceptable=acceptable)
-        record('ansi:' + str(runner.sequence), False, '\x1b' in output)
+        try:
+            identity = next(ansi_ids)
+        except StopIteration:
+            raise ToolError('new lifecycle command needs a retained ANSI assertion ID') from None
+        record('ansi:' + str(identity), False, '\x1b' in output)
         return code, output
 
     def counts(files, modules=0):
@@ -258,4 +272,6 @@ def exercise(binary, base):
         rows = runner.json('class', 'Mini')['items']
         record('sub-projects:source:' + format, [('child/Mini.java', 'Mini', 1)],
                [(row['path'], row['name'], row['line']) for row in rows])
+    if next(ansi_ids, None) is not None:
+        raise ToolError('lifecycle fixture omitted a retained ANSI assertion')
     return {FEATURE: expected}, {FEATURE: actual}

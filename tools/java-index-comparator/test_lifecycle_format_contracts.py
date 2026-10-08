@@ -7,7 +7,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from audit import Fixture, SCHEMA, plan, required_features
-from common import ToolError, canonical_json, connect
+from common import ToolError, canonical_json, connect, stable_id
+from format_acceptance_spec import criteria
 import lifecycle_format_contracts as contracts
 
 
@@ -32,6 +33,25 @@ class LifecycleFormatTests(unittest.TestCase):
                       if canonical_json(expected[contracts.FEATURE][key]) !=
                       canonical_json(actual[contracts.FEATURE].get(key))]
         self.assertEqual(mismatches, [])
+
+    def test_retained_production_assertion_ids_ignore_watch_poll_scheduling(self):
+        criterion = next(item for item in criteria() if item['feature'] == contracts.FEATURE)
+        original_json = contracts.Runner.json
+
+        def scheduled_json(runner, *args, **kwargs):
+            value = original_json(runner, *args, **kwargs)
+            # Private command-log ordinals may advance during asynchronous
+            # probes. They must not alter retained public assertion identities.
+            if args[0] == 'watch-status' or args[:2] == ('class', 'Watched'):
+                runner.sequence += 7
+            return value
+
+        with patch.object(contracts.Runner, 'json', scheduled_json):
+            expected, actual = contracts.exercise(self.binary, self.directory)
+        samples = expected[contracts.FEATURE]
+        self.assertEqual(len(samples), criterion['samples_count'])
+        self.assertEqual(stable_id(sorted(samples)), criterion['sample_keys_sha256'])
+        self.assertEqual(actual[contracts.FEATURE], samples)
 
     def readiness_probe(self, first=b'', later=None, exited=False, budget=1024):
         """Schedule lock acquisition before observable stdout, without wall-clock races."""
