@@ -2956,7 +2956,21 @@ impl JavaDependencyLookup<'_> {
         Ok(Some(result))
     }
 
-    fn invocation_conversion(&self, argument: &str, formal: &str) -> Result<bool> {
+    fn boxed_type(primitive: &str) -> Option<&'static str> {
+        match primitive {
+            "boolean" => Some("java.lang.Boolean"),
+            "byte" => Some("java.lang.Byte"),
+            "short" => Some("java.lang.Short"),
+            "char" => Some("java.lang.Character"),
+            "int" => Some("java.lang.Integer"),
+            "long" => Some("java.lang.Long"),
+            "float" => Some("java.lang.Float"),
+            "double" => Some("java.lang.Double"),
+            _ => None,
+        }
+    }
+
+    fn invocation_conversion(&self, argument: &str, formal: &str, loose: bool) -> Result<bool> {
         if argument == formal {
             return Ok(true);
         }
@@ -2969,7 +2983,24 @@ impl JavaDependencyLookup<'_> {
         if argument == "null" {
             return Ok(!primitive(formal));
         }
-        if primitive(argument) || primitive(formal) {
+        match (argument.strip_suffix("[]"), formal.strip_suffix("[]")) {
+            (Some(argument), Some(formal)) => {
+                if primitive(argument) || primitive(formal) {
+                    return Ok(argument == formal);
+                }
+                // Array covariance uses reference widening, never element boxing.
+                return self.invocation_conversion(argument, formal, false);
+            }
+            (Some(_), None) => {
+                return Ok(matches!(
+                    formal,
+                    "java.lang.Object" | "java.lang.Cloneable" | "java.io.Serializable"
+                ));
+            }
+            (None, Some(_)) => return Ok(false),
+            (None, None) => {}
+        }
+        if primitive(argument) && primitive(formal) {
             return Ok(matches!(
                 (argument, formal),
                 ("byte", "short" | "int" | "long" | "float" | "double")
@@ -2979,11 +3010,25 @@ impl JavaDependencyLookup<'_> {
                     | ("float", "double")
             ));
         }
+        if primitive(argument) || primitive(formal) {
+            if !loose {
+                return Ok(false);
+            }
+            if let Some(boxed) = Self::boxed_type(argument) {
+                return self.invocation_conversion(boxed, formal, false);
+            }
+            let unboxed = [
+                "boolean", "byte", "short", "char", "int", "long", "float", "double",
+            ]
+            .into_iter()
+            .find(|ty| Self::boxed_type(ty) == Some(argument));
+            return match unboxed {
+                Some(unboxed) => self.invocation_conversion(unboxed, formal, false),
+                None => Ok(false),
+            };
+        }
         if formal == "java.lang.Object" {
             return Ok(true);
-        }
-        if argument.ends_with("[]") || formal.ends_with("[]") {
-            return Ok(false);
         }
         self.subclass(argument, formal, &mut HashSet::new())
     }
@@ -3001,62 +3046,69 @@ impl JavaDependencyLookup<'_> {
         )>,
     > {
         let mut applicable = Vec::new();
-        let mut uncertain = false;
-        for (owner, signature) in
-            self.method_candidates(&value.owner, name, false, &mut HashSet::new())?
-        {
-            if signature.arity != Some(arguments.len()) || !value.instance && !signature.is_static {
-                continue;
-            }
-            let allowed = if signature.private {
-                self.private_access(&owner.identity, &owner.declaration.package)
-            } else if signature.public || owner.declaration.package == self.package {
-                true
-            } else if signature.protected {
-                let mut allowed = false;
-                for context in self.contexts {
-                    if self.subclass(context, &owner.identity, &mut HashSet::new())?
-                        && (signature.is_static
-                            || self.subclass(
-                                &value.owner.identity,
-                                context,
-                                &mut HashSet::new(),
-                            )?)
-                    {
-                        allowed = true;
-                    }
+        let candidates = self.method_candidates(&value.owner, name, false, &mut HashSet::new())?;
+        // JLS invocation phases: strict widening must win before any boxing.
+        for loose in [false, true] {
+            let mut uncertain = false;
+            for (owner, signature) in &candidates {
+                if signature.arity != Some(arguments.len())
+                    || !value.instance && !signature.is_static
+                {
+                    continue;
                 }
-                allowed
-            } else {
-                false
-            };
-            if !allowed {
-                continue;
-            }
-            let Some(parameters) = self.method_parameters(&owner, &signature)? else {
-                uncertain = true;
-                continue;
-            };
-            let mut compatible = true;
-            let mut unknown = false;
-            for (argument, formal) in arguments.iter().zip(&parameters) {
-                match self.invocation_argument(argument, imports)? {
-                    Some(argument) => {
-                        compatible &= self.invocation_conversion(&argument, formal)?
+                let allowed = if signature.private {
+                    self.private_access(&owner.identity, &owner.declaration.package)
+                } else if signature.public || owner.declaration.package == self.package {
+                    true
+                } else if signature.protected {
+                    let mut allowed = false;
+                    for context in self.contexts {
+                        if self.subclass(context, &owner.identity, &mut HashSet::new())?
+                            && (signature.is_static
+                                || self.subclass(
+                                    &value.owner.identity,
+                                    context,
+                                    &mut HashSet::new(),
+                                )?)
+                        {
+                            allowed = true;
+                        }
                     }
-                    None => unknown = true,
-                }
-            }
-            if compatible {
-                if unknown {
-                    uncertain = true;
+                    allowed
                 } else {
-                    applicable.push((owner, signature, parameters));
+                    false
+                };
+                if !allowed {
+                    continue;
+                }
+                let Some(parameters) = self.method_parameters(owner, signature)? else {
+                    uncertain = true;
+                    continue;
+                };
+                let mut compatible = true;
+                let mut unknown = false;
+                for (argument, formal) in arguments.iter().zip(&parameters) {
+                    match self.invocation_argument(argument, imports)? {
+                        Some(argument) => {
+                            compatible &= self.invocation_conversion(&argument, formal, loose)?
+                        }
+                        None => unknown = true,
+                    }
+                }
+                if compatible {
+                    if unknown {
+                        uncertain = true;
+                    } else {
+                        applicable.push((owner.clone(), signature.clone(), parameters));
+                    }
                 }
             }
-        }
-        if uncertain {
-            return Ok(None);
+            if uncertain {
+                return Ok(None);
+            }
+            if !applicable.is_empty() {
+                break;
+            }
         }
         let mut best = Vec::new();
         for (index, (owner, _, parameters)) in applicable.iter().enumerate() {
@@ -3067,7 +3119,7 @@ impl JavaDependencyLookup<'_> {
                 }
                 let mut more_specific = true;
                 for (other, current) in other_parameters.iter().zip(parameters) {
-                    more_specific &= self.invocation_conversion(other, current)?;
+                    more_specific &= self.invocation_conversion(other, current, false)?;
                 }
                 if more_specific
                     && (other_parameters != parameters
@@ -3451,9 +3503,7 @@ impl JavaDependencyLookup<'_> {
                                 else {
                                     return Ok(None);
                                 };
-                                if !self.invocation_conversion(&argument, "int")?
-                                    && argument != "java.lang.Integer"
-                                {
+                                if !self.invocation_conversion(&argument, "int", true)? {
                                     return Ok(None);
                                 }
                                 0

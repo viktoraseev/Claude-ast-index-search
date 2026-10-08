@@ -32,6 +32,12 @@ class CompletionTests(unittest.TestCase):
             self.check()
 
     def setUp(self):
+        # This suite's synthetic rows isolate the original final-gate rules.
+        # Parent proof validation (including the real final-gate integration)
+        # is exercised separately in test_parent_acceptance.py.
+        acceptance = patch('parent_acceptance.readiness', return_value={})
+        acceptance.start()
+        self.addCleanup(acceptance.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name).resolve()

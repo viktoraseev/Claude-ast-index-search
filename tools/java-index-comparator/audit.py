@@ -108,6 +108,7 @@ import graph_root_contracts
 import graph_directory_contracts
 import graph_ambiguity_contracts
 import call_hierarchy_contracts
+import parent_acceptance
 
 
 SCHEMA = """
@@ -137,7 +138,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA + graph_mcp_contracts.SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA + graph_mcp_contracts.SCHEMA + parent_acceptance.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -168,6 +169,10 @@ def next_check(state: sqlite3.Connection):
         ORDER BY (feature='outline' OR feature GLOB 'outline:*'),feature,subject LIMIT 1""", parameters).fetchone()
     if check is None:
         return None
+    if check['feature'] == parent_acceptance.FEATURE:
+        child = parent_acceptance.pending_children(state)
+        if child is not None:
+            return child
     if check['feature'] == 'outline' or check['feature'].startswith('outline:'):
         if state.execute(f"SELECT 1 FROM coverage WHERE status='pending' AND {scope} LIMIT 1", parameters).fetchone():
             return None
@@ -2311,6 +2316,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def parent_acceptance_check(self, check: sqlite3.Row):
+        try:
+            return parent_acceptance.exercise(self)
+        except parent_acceptance.AcceptancePending as error:
+            with self.state:
+                self.state.execute("UPDATE coverage SET status='pending' WHERE feature=?", (check['feature'],))
+            raise Unsupported(str(error)) from error
+
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
         with self.metrics.checkpoint('checkpoint.start'):
@@ -2470,6 +2483,8 @@ class Fixture:
                 handler = self.java_resource_check
             if check['feature'] == 'api':
                 handler = self.api_check
+            if check['feature'] == parent_acceptance.FEATURE:
+                handler = self.parent_acceptance_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
             if check['feature'] in annotation_contracts.EXTENSIONS:
@@ -2502,6 +2517,10 @@ class Fixture:
                     (verdict, canonical_json(expected), canonical_json(actual),
                      canonical_json({"missing": missing, "unexpected": unexpected}), now_ms(), check["id"]),
                 )
+                if check['feature'] == parent_acceptance.FEATURE:
+                    self.state.execute('UPDATE coverage SET status=?,reason=? WHERE feature=?',
+                                       ('implemented' if verdict == 'pass' else 'pending',
+                                        parent_acceptance.REASON, check['feature']))
         except (ToolError, OSError, subprocess.TimeoutExpired) as error:
             verdict = "unsupported" if isinstance(error, Unsupported) else "error"
             with self.metrics.checkpoint('checkpoint.finish'):
@@ -2789,6 +2808,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     watch_event_contracts.plan_events(state, root)
     watch_scope_contracts.plan_scope(state, root)
     cache_collision_contracts.plan_cache(state, root)
+    parent_acceptance.plan(state, java_only=java_only and root is not None)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

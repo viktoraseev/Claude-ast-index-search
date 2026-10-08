@@ -54,7 +54,8 @@ class DependencyResultTests(unittest.TestCase):
     def test_known_remaining_overload_and_external_projection_are_positive_obligations(self):
         # Neither failure may disappear by being converted to an invalid-Java
         # guard or by replacing the external List signature with authored Box.
-        for name in ('inherited-overload', 'jdk-list-projection'):
+        for name in ('inherited-overload', 'jdk-list-projection',
+                     'boxed-result', 'unboxed-result', 'array-covariant-result'):
             self.assertIs(contracts.CASES[name][3], True)
         self.assertIn('java.util.List<shared.Child>', contracts.CASES['jdk-list-projection'][0])
         self.assertIn('get(0).instance()', contracts.CASES['jdk-list-projection'][2])
