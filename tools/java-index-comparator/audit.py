@@ -41,6 +41,7 @@ import annotation_contracts
 import text_snapshot
 import lifecycle_contracts
 import root_contracts
+import cache_collision_contracts
 import module_contracts
 import install_contracts
 import profile_contracts
@@ -1748,6 +1749,16 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def cache_collision_check(self, check: sqlite3.Row):
+        if getattr(self, '_cache_collision_results', None) is None:
+            self._cache_collision_results = cache_collision_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (dict(section[check['feature']]) for section in self._cache_collision_results)
+        expected['acceptance_complete'] = True
+        actual['acceptance_complete'] = cache_collision_contracts.acceptance_complete(expected, actual)
+        return {'source': cache_collision_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def install_check(self, check: sqlite3.Row):
         if self._install_error is not None:
             raise self._install_error
@@ -2391,6 +2402,8 @@ class Fixture:
                 handler = self.scan_error_check
             if check['feature'] in root_error_contracts.FEATURES:
                 handler = self.root_error_check
+            if check['feature'] in cache_collision_contracts.FEATURES:
+                handler = self.cache_collision_check
             if check['feature'] in publication_recovery_contracts.FEATURES:
                 handler = self.publication_recovery_check
             if check['feature'] in publication_error_contracts.FEATURES:
@@ -2564,6 +2577,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(watch_vcs_error_contracts.FEATURES)
     features.update(watch_event_contracts.FEATURES)
     features.update(watch_scope_contracts.FEATURES)
+    features.update(cache_collision_contracts.FEATURES)
     features.update(graph_root_contracts.FEATURES)
     features.update(graph_directory_contracts.FEATURES)
     features.update(graph_ambiguity_contracts.FEATURES)
@@ -2760,6 +2774,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     watch_vcs_error_contracts.plan_errors(state, root)
     watch_event_contracts.plan_events(state, root)
     watch_scope_contracts.plan_scope(state, root)
+    cache_collision_contracts.plan_cache(state, root)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

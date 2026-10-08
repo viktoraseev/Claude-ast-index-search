@@ -459,7 +459,15 @@ def run(arguments: argparse.Namespace) -> int:
                             queue_committed_regressions(state, row, json.loads(row['summary_json']),
                                                         additional, row['commit_head'])
                             continue
-                        logged(["cargo", "test", "--release", "--workspace"], repository, directory, "committed-tests")
+                        try:
+                            logged(["cargo", "test", "--release", "--workspace"], repository, directory, "committed-tests")
+                        except CommandFailed as error:
+                            queue_committed_regressions(
+                                state, row, json.loads(row['summary_json']),
+                                {'verified': False, 'stage': error.stage, 'returncode': error.returncode},
+                                row['commit_head'],
+                            )
+                            continue
                         logged(["git", "push", "origin", branch], repository, directory, "push")
                         set_phase(state, round_id, "done")
                         completed += 1

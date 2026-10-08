@@ -132,7 +132,13 @@ fn overridden_db_path() -> Option<PathBuf> {
 }
 
 fn project_cache_key(project_root: &Path) -> Result<String> {
-    resolve_root_identities(project_root).map(|(normalized, _raw)| simple_hash(&normalized))
+    let path = get_db_path(project_root)?;
+    path.parent()
+        .and_then(|directory| directory.file_name())
+        .and_then(|key| key.to_str())
+        .filter(|key| is_cache_key(key))
+        .map(str::to_owned)
+        .context("managed database path has no valid cache key")
 }
 
 fn leases_dir(base: &Path) -> PathBuf {
@@ -508,9 +514,10 @@ impl CacheOwnerManifest {
     fn is_self_consistent(&self, cache_key: &str) -> bool {
         self.version == CACHE_OWNER_MANIFEST_VERSION
             && self.is_bounded()
+            && is_cache_key(cache_key)
             && self
                 .identities()
-                .any(|identity| simple_hash(identity) == cache_key)
+                .any(|identity| simple_hash(identity) == cache_key_hash(cache_key))
     }
 
     fn merged_for_target(&self, desired: &Self) -> Result<Self> {
@@ -1757,6 +1764,120 @@ fn install_or_recover_target_cache_owner(
     install_cache_owner_manifest(cache_dir, cache_key, desired, true)
 }
 
+const MAX_CACHE_COLLISION_SLOTS: u16 = 1024;
+
+enum CacheBucketIdentity {
+    Available,
+    Requested,
+    Foreign,
+}
+
+/// Classify a real cache bucket by its verified root identity.
+/// Unknown, corrupt and linked artifacts cannot authorize collision fallback.
+fn cache_bucket_identity(
+    cache_base: &Path,
+    cache_key: &str,
+    requested: &CacheOwnerManifest,
+) -> Result<CacheBucketIdentity> {
+    let directory = cache_base.join(cache_key);
+    match std::fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CacheBucketIdentity::Available)
+        }
+        Err(error) => return Err(error.into()),
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "cache target is not a real directory: {}",
+            directory.display()
+        ),
+    }
+    let db_path = directory.join("index.db");
+    ensure_safe_live_db_artifacts(&db_path)?;
+    ensure_safe_swap_db_artifacts(&db_path)?;
+    // Leave overlapping stale manifests to the existing metadata-validated
+    // migration recovery. They must not be mistaken for foreign collisions.
+    if read_cache_owner_manifest(&directory)?.is_some_and(|owner| owner.overlaps(requested)) {
+        return Ok(CacheBucketIdentity::Requested);
+    }
+    if let Some(owner) = effective_cache_owner(cache_base, &directory, cache_key)? {
+        anyhow::ensure!(
+            owner.is_self_consistent(cache_key),
+            "cache owner does not match cache key"
+        );
+        return Ok(if owner.overlaps(requested) {
+            CacheBucketIdentity::Requested
+        } else {
+            CacheBucketIdentity::Foreign
+        });
+    }
+    if !db_path.exists() {
+        return Ok(CacheBucketIdentity::Available);
+    }
+    let root = read_cached_project_root(&db_path)?;
+    if requested.contains_root(&root) {
+        return Ok(CacheBucketIdentity::Requested);
+    }
+    anyhow::ensure!(
+        simple_hash(&root) == cache_key_hash(cache_key),
+        "legacy cache project_root does not match cache key"
+    );
+    Ok(CacheBucketIdentity::Foreign)
+}
+
+/// Select a collision bucket under the layout lock. Ownership, rather than
+/// any finite hash, determines identity; legacy buckets keep their old names.
+fn select_project_cache_key(cache_base: &Path, requested: &CacheOwnerManifest) -> Result<String> {
+    let hash = simple_hash(&requested.normalized_root);
+    let mut available = match cache_bucket_identity(cache_base, &hash, requested)? {
+        CacheBucketIdentity::Requested => return Ok(hash),
+        CacheBucketIdentity::Available => Some(0),
+        CacheBucketIdentity::Foreign => None,
+    };
+    // Reuse an owned slot before allocating a vacancy, even when GC removed
+    // an earlier bucket. Otherwise active leases would block rediscovery and
+    // an unleased surviving index would unnecessarily move to a new path.
+    let prefix = format!("{hash}-");
+    let mut occupied = Vec::new();
+    for entry in std::fs::read_dir(cache_base)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if let Some(name) = name.to_str().filter(|name| is_cache_key(name)) {
+            if let Some(slot) = name
+                .strip_prefix(&prefix)
+                .and_then(|slot| slot.parse::<u16>().ok())
+            {
+                occupied.push(slot);
+            }
+        }
+    }
+    occupied.sort_unstable();
+    let mut next = 1;
+    for slot in occupied {
+        if slot > next {
+            available.get_or_insert(next);
+        }
+        let key = format!("{hash}-{slot}");
+        match cache_bucket_identity(cache_base, &key, requested)? {
+            CacheBucketIdentity::Requested => return Ok(key),
+            CacheBucketIdentity::Available => {
+                available.get_or_insert(slot);
+            }
+            CacheBucketIdentity::Foreign => {}
+        }
+        next = slot + 1;
+    }
+    let slot = available.unwrap_or(next);
+    anyhow::ensure!(
+        slot < MAX_CACHE_COLLISION_SLOTS,
+        "cache collision bucket limit exceeded"
+    );
+    Ok(if slot == 0 {
+        hash
+    } else {
+        format!("{hash}-{slot}")
+    })
+}
+
 /// Resolve the normal cache path while holding the layout lock, then acquire
 /// the per-project lease before releasing that lock. This closes the race in
 /// which GC could otherwise rename the directory between path resolution and
@@ -1774,7 +1895,7 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
     let _layout_lock = acquire_layout_lock(&cache_dir)?;
     let legacy_raw = project_root.to_string_lossy();
     let requested_owner = CacheOwnerManifest::new(&normalized, &raw_identity);
-    let project_hash = simple_hash(&normalized);
+    let project_hash = select_project_cache_key(&cache_dir, &requested_owner)?;
     let db_dir = cache_dir.join(&project_hash);
     let desired_owner =
         merge_cache_owner_intents(&cache_dir, &db_dir, &project_hash, &requested_owner)?;
@@ -1805,6 +1926,10 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
         && raw_hash != project_hash
         && raw_dir_is_real
         && raw_db_is_regular
+        && !matches!(
+            cache_bucket_identity(&cache_dir, &raw_hash, &requested_owner)?,
+            CacheBucketIdentity::Foreign
+        )
     {
         let _source_lock =
             try_acquire_exclusive_project_lock(&cache_dir, &raw_hash)?.ok_or_else(|| {
@@ -2123,8 +2248,8 @@ fn migrate_legacy_project_in(
     let (normalized, raw_identity) = resolve_root_identities(project_root)?;
     let requested_owner = CacheOwnerManifest::new(&normalized, &raw_identity);
     let legacy_project_hash = simple_hash(legacy_raw.as_ref());
-    let normalized_project_hash = simple_hash(&normalized);
     let _layout_lock = acquire_layout_lock(&new_cache_dir)?;
+    let normalized_project_hash = select_project_cache_key(new_cache_dir, &requested_owner)?;
     let old_db_dir = old_cache_dir.join(&legacy_project_hash);
     let new_db_dir = new_cache_dir.join(&normalized_project_hash);
     let desired_owner = merge_cache_owner_intents(
@@ -2152,7 +2277,22 @@ fn migrate_legacy_project_in(
                 && std::fs::symlink_metadata(&old_db)
                     .map(|metadata| metadata.file_type().is_file())
                     .unwrap_or(false);
-            if old_source_is_valid {
+            // Historical buckets can collide too. Only a verified foreign
+            // owner (or matching legacy metadata) authorizes skipping them;
+            // undecodable legacy DBs retain the existing migration path.
+            let foreign_source = if old_source_is_valid {
+                ensure_safe_live_db_artifacts(&old_db)?;
+                match effective_cache_owner(old_cache_dir, &old_db_dir, &legacy_project_hash)? {
+                    Some(owner) => !owner.overlaps(&requested_owner),
+                    None => read_cached_project_root(&old_db).is_ok_and(|root| {
+                        !requested_owner.contains_root(&root)
+                            && simple_hash(&root) == legacy_project_hash
+                    }),
+                }
+            } else {
+                false
+            };
+            if old_source_is_valid && !foreign_source {
                 ensure_safe_live_db_artifacts(&old_db)?;
                 let source_owner = validate_cache_owner_for_migration(
                     old_cache_dir,
@@ -2787,10 +2927,22 @@ fn touch_cache_activity_marker(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn cache_key_hash(name: &str) -> &str {
+    name.split_once('-').map_or(name, |(hash, _)| hash)
+}
+
 fn is_cache_key(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 16
-        && name
+    let hash = cache_key_hash(name);
+    let valid_slot = match name.split_once('-') {
+        None => true,
+        Some((_, slot)) => slot.parse::<u16>().is_ok_and(|number| {
+            number > 0 && number < MAX_CACHE_COLLISION_SLOTS && number.to_string() == slot
+        }),
+    };
+    valid_slot
+        && !hash.is_empty()
+        && hash.len() <= 16
+        && hash
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
@@ -12884,6 +13036,101 @@ mod tests {
         let h1 = simple_hash("/Users/test/project1");
         let h2 = simple_hash("/Users/test/project2");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn collision_buckets_preserve_ownership_leases_and_gc() {
+        let artifacts = Path::new(".artifacts/tests");
+        std::fs::create_dir_all(artifacts).unwrap();
+        let temp = tempfile::TempDir::new_in(artifacts).unwrap();
+        let base = temp.path().join("cache");
+        let _layout = acquire_layout_lock(&base).unwrap();
+        let mut keys = Vec::new();
+        for name in ["AbAb", "AbBA", "BAAb", "BABA"] {
+            let root = temp.path().join(name).to_string_lossy().into_owned();
+            let owner = CacheOwnerManifest::new(&root, &root);
+            let key = select_project_cache_key(&base, &owner).unwrap();
+            assert!(!keys.contains(&key));
+            assert!(is_cache_key(&key));
+            let directory = base.join(&key);
+            ensure_real_cache_directory(&directory).unwrap();
+            persist_cache_owner_manifest(&directory, &key, &owner).unwrap();
+            std::fs::write(directory.join("index.db"), b"").unwrap();
+            assert_eq!(select_project_cache_key(&base, &owner).unwrap(), key);
+            assert!(owner.is_self_consistent(&key));
+            assert!(!owner.is_self_consistent(&format!("{key}-invalid")));
+            keys.push(key);
+        }
+        assert_eq!(keys[1], format!("{}-1", keys[0]));
+        assert_eq!(keys[3], format!("{}-3", keys[0]));
+        let pinned = acquire_shared_project_lease(&base, &keys[1]).unwrap();
+        let now =
+            std::time::SystemTime::now() + STALE_CACHE_MAX_AGE + std::time::Duration::from_secs(60);
+        drop(_layout);
+        assert_eq!(
+            gc_stale_caches_in(&base, Some(&keys[0]), STALE_CACHE_MAX_AGE, now).unwrap(),
+            2
+        );
+        assert!(base.join(&keys[1]).is_dir());
+        let survivor = read_cache_owner_manifest(&base.join(&keys[1]))
+            .unwrap()
+            .unwrap();
+        let retired = temp.path().join("retired-primary");
+        std::fs::rename(base.join(&keys[0]), &retired).unwrap();
+        assert_eq!(select_project_cache_key(&base, &survivor).unwrap(), keys[1]);
+        std::fs::rename(&retired, base.join(&keys[0])).unwrap();
+        drop(pinned);
+        assert_eq!(
+            gc_stale_caches_in(&base, Some(&keys[0]), STALE_CACHE_MAX_AGE, now).unwrap(),
+            1
+        );
+        assert!(base.join(&keys[0]).is_dir());
+    }
+
+    #[test]
+    fn java_legacy_hash_collision_preserves_foreign_index() {
+        let artifacts = Path::new(".artifacts/tests");
+        std::fs::create_dir_all(artifacts).unwrap();
+        let temp = tempfile::TempDir::new_in(artifacts).unwrap();
+        let directory = std::fs::canonicalize(temp.path()).unwrap();
+        let foreign = directory.join("Ab");
+        let requested = directory.join("BA");
+        for (root, class_name) in [(&foreign, "LegacyOwner"), (&requested, "NewOwner")] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(root.join("Use.java"), format!("class {class_name} {{}}\n"))
+                .unwrap();
+        }
+        let foreign_root = foreign.to_string_lossy();
+        let requested_root = requested.to_string_lossy();
+        let key = simple_hash(&foreign_root);
+        assert_eq!(key, simple_hash(&requested_root));
+        let old_base = directory.join("legacy-cache");
+        let new_base = directory.join("current-cache");
+        let source = old_base.join(&key);
+        std::fs::create_dir_all(&source).unwrap();
+        let database = source.join("index.db");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO metadata VALUES ('project_root', ?1)",
+            params![foreign_root.as_ref()],
+        )
+        .unwrap();
+        drop(conn);
+        persist_cache_owner_manifest(
+            &source,
+            &key,
+            &CacheOwnerManifest::new(&foreign_root, &foreign_root),
+        )
+        .unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let lease = migrate_legacy_project_in(&new_base, &old_base, &requested)
+            .expect("a proven foreign legacy collision must not block a Java root");
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        assert_eq!(read_cached_project_root(&database).unwrap(), foreign_root);
+        assert!(!new_base.join(&key).join("index.db").exists());
+        drop(lease);
     }
 
     #[test]

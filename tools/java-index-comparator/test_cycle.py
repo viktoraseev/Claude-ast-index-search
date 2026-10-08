@@ -124,6 +124,9 @@ class CycleTests(unittest.TestCase):
             with self.subTest(stage=stage):
                 self.exercise_cycle(stage)
 
+    def test_committed_test_failure_queues_repair_before_any_push(self):
+        self.exercise_cycle('committed-tests')
+
     def test_revalidated_batch_resumes_stopped_audit_then_runs_a_fresh_full_audit(self):
         self.exercise_cycle(resume=True)
 
@@ -224,7 +227,7 @@ class CycleTests(unittest.TestCase):
             self.assertIn(("git", "add", "--", "src/fix.rs"), commands)
             self.assertIn(("git", "push", "origin", "feature"), commands)
             self.assertEqual(sum(command[:4] == ("cargo", "test", "--release", "--workspace") for command in commands),
-                             4 if failed_stage == "workspace-tests" else 3)
+                             5 if failed_stage == "committed-tests" else 4 if failed_stage == "workspace-tests" else 3)
             self.assertEqual(commands.count(("test-agent",)), 2 if failed_stage else 1)
             # Production fixture tests must see the repaired binary even when
             # the coding agent ran only targeted/debug tests.
@@ -232,7 +235,15 @@ class CycleTests(unittest.TestCase):
             if failed_stage:
                 agent_positions = [index for index, command in enumerate(commands) if command == ("test-agent",)]
                 commit_position = next(index for index, command in enumerate(commands) if command[:2] == ("git", "commit"))
-                self.assertLess(agent_positions[1], commit_position)
+                if failed_stage == 'committed-tests':
+                    commits = [index for index, command in enumerate(commands) if command[:2] == ('git', 'commit')]
+                    self.assertEqual(len(commits), 2)
+                    self.assertLess(commit_position, agent_positions[1])
+                    self.assertLess(agent_positions[1], commits[1])
+                    push_position = commands.index(('git', 'push', 'origin', 'feature'))
+                    self.assertLess(commits[1], push_position)
+                else:
+                    self.assertLess(agent_positions[1], commit_position)
 
 
 if __name__ == "__main__":
