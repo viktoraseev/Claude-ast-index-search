@@ -603,13 +603,78 @@ pub(crate) struct DependencyImportDeclaration {
     pub package: String,
     pub imports: Vec<(String, bool)>,
     pub interface: bool,
-    /// Exact nominal field/return types; ambiguous overloads retain all signatures.
+    /// Field/return signatures retain source variables and explicit arguments;
+    /// ambiguous overloads retain all signatures.
     pub value_types: std::collections::HashMap<(String, bool), Vec<DependencyMemberType>>,
+    pub type_parameters: Vec<String>,
+    pub type_parameter_bounds: std::collections::HashMap<String, DependencyResultType>,
+    pub parent_types: Vec<DependencyResultType>,
+}
+
+/// Source signatures retain variables and explicit arguments without erasure.
+#[derive(Clone)]
+pub(crate) enum DependencyResultType {
+    Named(String, Vec<Option<DependencyResultType>>),
+    Parameter { owner: String, name: String },
+}
+
+pub(crate) fn dependency_result_type(
+    ty: Node<'_>,
+    content: &str,
+    package: &str,
+    depth: usize,
+) -> Option<DependencyResultType> {
+    if depth >= 16 || ty.has_error() {
+        return None;
+    }
+    if ty.kind() == "generic_type" {
+        let name = ty.named_child(0)?;
+        let arguments = ty.named_child(1)?;
+        if arguments.kind() != "type_arguments" {
+            return None;
+        }
+        let mut cursor = arguments.walk();
+        return Some(DependencyResultType::Named(
+            node_text(content, &name).to_owned(),
+            arguments
+                .named_children(&mut cursor)
+                .map(|argument| dependency_result_type(argument, content, package, depth + 1))
+                .collect(),
+        ));
+    }
+    if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+        return None;
+    }
+    let name = node_text(content, &ty);
+    let mut ancestor = ty.parent();
+    while let Some(node) = ancestor {
+        if let Some(parameters) = node.child_by_field_name("type_parameters") {
+            let mut cursor = parameters.walk();
+            if parameters.named_children(&mut cursor).any(|parameter| {
+                parameter
+                    .named_child(0)
+                    .is_some_and(|id| node_text(content, &id) == name)
+            }) {
+                // Method inference is a separate contract; a shadowing method
+                // variable must never receive the enclosing class's argument.
+                if node.kind() == "method_declaration" {
+                    return None;
+                }
+                return Some(DependencyResultType::Parameter {
+                    owner: dependency_type_identity(node, content, package),
+                    name: name.to_owned(),
+                });
+            }
+        }
+        ancestor = node.parent();
+    }
+    Some(DependencyResultType::Named(name.to_owned(), Vec::new()))
 }
 
 #[derive(Clone)]
 pub(crate) struct DependencyMemberType {
     pub path: Option<String>,
+    pub result_type: Option<DependencyResultType>,
     pub position: usize,
     pub arity: Option<usize>,
     pub contexts: Vec<String>,
@@ -661,6 +726,13 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         });
     DependencyMemberType {
         path,
+        result_type: ty
+            .filter(|_| {
+                !member
+                    .named_children(&mut member.walk())
+                    .any(|n| n.kind() == "dimensions")
+            })
+            .and_then(|ty| dependency_result_type(ty, content, package, 0)),
         position: ty.map_or(member.start_byte(), |ty| ty.start_byte()),
         arity,
         contexts: dependency_contexts(member, content, package),
@@ -910,6 +982,7 @@ fn dependency_declarations(
                                 .any(|n| n.kind() == "dimensions")
                             {
                                 value.path = None;
+                                value.result_type = None;
                             }
                             value_types.entry(key).or_default().push(value);
                         }
@@ -942,6 +1015,7 @@ fn dependency_declarations(
                     }
                     if component.kind() == "spread_parameter" {
                         value.path = None;
+                        value.result_type = None;
                     }
                     let field = (component_name.clone(), false);
                     declared_names.insert(field.clone());
@@ -965,6 +1039,7 @@ fn dependency_declarations(
             }
         }
         let mut parents = Vec::new();
+        let mut parent_types = Vec::new();
         let mut cursor = node.walk();
         for branch in node.named_children(&mut cursor).filter(|child| {
             matches!(
@@ -977,6 +1052,9 @@ fn dependency_declarations(
                     ty.kind(),
                     "type_identifier" | "scoped_type_identifier" | "generic_type"
                 ) {
+                    if let Some(signature) = dependency_result_type(ty, content, &package, 0) {
+                        parent_types.push(signature);
+                    }
                     let ty = if ty.kind() == "generic_type" {
                         ty.named_child(0).unwrap_or(ty)
                     } else {
@@ -1034,6 +1112,41 @@ fn dependency_declarations(
                     "interface_declaration" | "annotation_type_declaration"
                 ),
                 value_types,
+                type_parameters: node.child_by_field_name("type_parameters").map_or_else(
+                    Vec::new,
+                    |parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .filter_map(|parameter| parameter.named_child(0))
+                            .map(|name| node_text(content, &name).to_owned())
+                            .collect()
+                    },
+                ),
+                type_parameter_bounds: node.child_by_field_name("type_parameters").map_or_else(
+                    std::collections::HashMap::new,
+                    |parameters| {
+                        parameters
+                            .named_children(&mut parameters.walk())
+                            .filter_map(|parameter| {
+                                let name = parameter.named_child(0)?;
+                                let bound = parameter.named_child(1)?;
+                                if bound.kind() != "type_bound" || bound.named_child_count() != 1 {
+                                    return None;
+                                }
+                                Some((
+                                    node_text(content, &name).to_owned(),
+                                    dependency_result_type(
+                                        bound.named_child(0)?,
+                                        content,
+                                        &package,
+                                        0,
+                                    )?,
+                                ))
+                            })
+                            .collect()
+                    },
+                ),
+                parent_types,
             },
         );
         if qualified.is_some() {
@@ -2935,6 +3048,39 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             .protected_names
             .contains(&("SECRET".into(), false)));
         assert!(!declaration.static_names.contains(&("SECRET".into(), false)));
+    }
+
+    #[test]
+    fn dependency_results_preserve_class_arguments_and_bound_ownership() {
+        let source = r#"package fixture;
+        class Box<A,T extends shared.Child> {
+            T get() { return null; }
+            Box<String,T> nested() { return null; }
+            <T> T shadow() { return null; }
+            T[] array() { return null; }
+        }
+        class Sibling<T extends other.Child> {}"#;
+        let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
+            .unwrap()
+            .unwrap();
+        assert_eq!(declaration.type_parameters, ["A", "T"]);
+        assert!(matches!(declaration.type_parameter_bounds.get("T"),
+            Some(DependencyResultType::Named(path, arguments)) if path == "shared.Child" && arguments.is_empty()));
+        assert!(
+            matches!(&declaration.value_types[&("get".into(), true)][0].result_type,
+            Some(DependencyResultType::Parameter { owner, name }) if owner == "fixture.Box" && name == "T")
+        );
+        assert!(
+            matches!(&declaration.value_types[&("nested".into(), true)][0].result_type,
+            Some(DependencyResultType::Named(path, arguments)) if path == "Box" && arguments.len() == 2
+                && matches!(&arguments[1], Some(DependencyResultType::Parameter { owner, name })
+                    if owner == "fixture.Box" && name == "T"))
+        );
+        for name in ["shadow", "array"] {
+            assert!(declaration.value_types[&(name.into(), true)][0]
+                .result_type
+                .is_none());
+        }
     }
 
     #[test]

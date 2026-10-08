@@ -2233,9 +2233,43 @@ fn java_dependency_declaration(
     Ok(None)
 }
 
+#[derive(Clone)]
 struct JavaDependencyType {
     identity: String,
     declaration: crate::parsers::treesitter::java::DependencyImportDeclaration,
+}
+
+#[derive(Clone)]
+struct JavaDependencyValue {
+    owner: JavaDependencyType,
+    arguments: Vec<Option<JavaDependencyValue>>,
+    instance: bool,
+}
+
+impl JavaDependencyValue {
+    fn nominal(owner: JavaDependencyType, instance: bool) -> Self {
+        Self {
+            owner,
+            arguments: Vec::new(),
+            instance,
+        }
+    }
+
+    fn signature(&self) -> String {
+        format!(
+            "{}<{}>",
+            self.owner.identity,
+            self.arguments
+                .iter()
+                .map(|argument| {
+                    argument
+                        .as_ref()
+                        .map_or_else(|| "?".to_owned(), Self::signature)
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 /// Check inherited aliases without borrowing another root's classpath metadata.
@@ -2772,34 +2806,185 @@ impl JavaDependencyLookup<'_> {
         Ok(Some(identity))
     }
 
-    /// Bind nominal chains without guessing an inaccessible or overloaded result.
+    /// Instantiate only source-declared class parameters and explicit arguments.
+    fn result_value(
+        &self,
+        signature: &crate::parsers::treesitter::java::DependencyResultType,
+        position: usize,
+        imports: &[(String, bool)],
+        substitution: Option<&JavaDependencyValue>,
+        depth: usize,
+    ) -> Result<Option<JavaDependencyValue>> {
+        use crate::parsers::treesitter::java::DependencyResultType;
+        if depth >= 16 {
+            return Ok(None);
+        }
+        match signature {
+            DependencyResultType::Parameter { owner, name } => {
+                if let Some(value) = substitution
+                    .filter(|value| &value.owner.identity == owner)
+                    .and_then(|value| {
+                        value
+                            .owner
+                            .declaration
+                            .type_parameters
+                            .iter()
+                            .position(|parameter| parameter == name)
+                            .and_then(|index| value.arguments.get(index))
+                            .and_then(Clone::clone)
+                    })
+                {
+                    return Ok(Some(value));
+                }
+                let Some(declaration) = self.raw(owner)? else {
+                    return Ok(None);
+                };
+                let Some(bound) = declaration.declaration.type_parameter_bounds.get(name) else {
+                    return Ok(None);
+                };
+                let binding = JavaDependencyLookup {
+                    package: &declaration.declaration.package,
+                    ..*self
+                };
+                binding.result_value(
+                    bound,
+                    position,
+                    &declaration.declaration.imports,
+                    substitution,
+                    depth + 1,
+                )
+            }
+            DependencyResultType::Named(path, arguments) => {
+                let Some(owner) = self.value_type(path, position, imports)? else {
+                    return Ok(None);
+                };
+                if !arguments.is_empty()
+                    && arguments.len() != owner.declaration.type_parameters.len()
+                {
+                    return Ok(None);
+                }
+                let mut bound = Vec::new();
+                for argument in arguments {
+                    bound.push(match argument {
+                        Some(argument) => {
+                            self.result_value(argument, position, imports, substitution, depth + 1)?
+                        }
+                        None => None,
+                    });
+                }
+                Ok(Some(JavaDependencyValue {
+                    owner,
+                    arguments: bound,
+                    instance: true,
+                }))
+            }
+        }
+    }
+
+    /// Project receiver arguments to the actual declaring ancestor. Conflicting
+    /// diamond instantiations and source cycles remain unresolved.
+    fn declaring_value(
+        &self,
+        value: &JavaDependencyValue,
+        identity: &str,
+        visiting: &mut HashSet<String>,
+        depth: usize,
+    ) -> Result<Option<JavaDependencyValue>> {
+        if depth >= 16 || !visiting.insert(value.owner.identity.clone()) {
+            return Ok(None);
+        }
+        if value.owner.identity == identity {
+            visiting.remove(&value.owner.identity);
+            return Ok(Some(value.clone()));
+        }
+        let mut matches = std::collections::BTreeMap::new();
+        let parents = self.parents(&value.owner)?;
+        for (index, parent_name) in value.owner.declaration.parents.iter().enumerate() {
+            // parents() remains the authority for accessibility/import/local
+            // identity; syntax argument binding cannot manufacture a parent.
+            let Some(parent) = parents.iter().find(|parent| {
+                parent.identity == *parent_name
+                    || parent.identity.ends_with(&format!(".{parent_name}"))
+            }) else {
+                continue;
+            };
+            let mut projected = JavaDependencyValue::nominal(parent.clone(), true);
+            if let Some(crate::parsers::treesitter::java::DependencyResultType::Named(
+                _,
+                arguments,
+            )) = value.owner.declaration.parent_types.get(index)
+            {
+                let contexts = Vec::new();
+                let binding = JavaDependencyLookup {
+                    package: &value.owner.declaration.package,
+                    contexts: &contexts,
+                    resolving_parent: true,
+                    ..*self
+                };
+                for argument in arguments {
+                    projected.arguments.push(match argument {
+                        Some(argument) => binding.result_value(
+                            argument,
+                            usize::MAX,
+                            &value.owner.declaration.imports,
+                            Some(value),
+                            depth + 1,
+                        )?,
+                        None => None,
+                    });
+                }
+            }
+            if let Some(found) = self.declaring_value(&projected, identity, visiting, depth + 1)? {
+                matches.insert(found.signature(), found);
+            }
+        }
+        visiting.remove(&value.owner.identity);
+        Ok(if matches.len() == 1 {
+            matches.into_values().next()
+        } else {
+            None
+        })
+    }
+
+    /// Bind source result chains without guessing an inaccessible or overloaded result.
     fn value_receiver(
         &self,
         receiver: &super::graph::DependencyValueReceiver,
         imports: &[(String, bool)],
         identities: &mut std::collections::BTreeSet<String>,
         depth: usize,
-    ) -> Result<Option<(JavaDependencyType, bool)>> {
+    ) -> Result<Option<JavaDependencyValue>> {
         use super::graph::DependencyValueReceiver;
         if depth >= 16 {
             return Ok(None);
         }
         match receiver {
             DependencyValueReceiver::Nominal {
-                path,
+                signature,
                 position,
                 contexts,
                 instance,
             } => {
                 let binding = JavaDependencyLookup { contexts, ..*self };
-                Ok(binding
-                    .value_type(path, *position, imports)?
-                    .map(|owner| (owner, *instance)))
+                let mut value =
+                    binding.result_value(signature, *position, imports, None, depth + 1)?;
+                if let Some(value) = &mut value {
+                    value.instance = *instance;
+                }
+                Ok(value)
+            }
+            DependencyValueReceiver::Initializer { receiver, contexts } => {
+                JavaDependencyLookup { contexts, ..*self }.value_receiver(
+                    receiver,
+                    imports,
+                    identities,
+                    depth + 1,
+                )
             }
             DependencyValueReceiver::Lexical { instances, .. } => Ok(match self.contexts.first() {
                 Some(context) => self
                     .raw(context)?
-                    .map(|owner| (owner, instances.contains(context))),
+                    .map(|owner| JavaDependencyValue::nominal(owner, instances.contains(context))),
                 None => None,
             }),
             DependencyValueReceiver::Super => {
@@ -2816,7 +3001,10 @@ impl JavaDependencyLookup<'_> {
                 let Some(parent) = parents.next() else {
                     return Ok(None);
                 };
-                Ok(parents.next().is_none().then_some((parent, true)))
+                Ok(parents
+                    .next()
+                    .is_none()
+                    .then(|| JavaDependencyValue::nominal(parent, true)))
             }
             DependencyValueReceiver::Member {
                 receiver,
@@ -2824,6 +3012,7 @@ impl JavaDependencyLookup<'_> {
                 arity,
             } => {
                 let member = (name.clone(), arity.is_some());
+                let mut receiver_value = None;
                 let identity = if let DependencyValueReceiver::Lexical {
                     instances,
                     explicit,
@@ -2849,6 +3038,8 @@ impl JavaDependencyLookup<'_> {
                             if !candidates.is_empty()
                                 || owner.declaration.declared_names.contains(&member)
                             {
+                                receiver_value =
+                                    Some(JavaDependencyValue::nominal(owner.clone(), instance));
                                 found = if instance {
                                     self.value_member(&owner, &member)?
                                 } else {
@@ -2860,16 +3051,18 @@ impl JavaDependencyLookup<'_> {
                     }
                     found
                 } else {
-                    let Some((owner, instance)) =
+                    let Some(value) =
                         self.value_receiver(receiver, imports, identities, depth + 1)?
                     else {
                         return Ok(None);
                     };
-                    if instance {
-                        self.value_member(&owner, &member)?
+                    let identity = if value.instance {
+                        self.value_member(&value.owner, &member)?
                     } else {
-                        self.static_member(&owner.identity, &member)?
-                    }
+                        self.static_member(&value.owner.identity, &member)?
+                    };
+                    receiver_value = Some(value);
+                    identity
                 };
                 let Some(identity) = identity else {
                     return Ok(None);
@@ -2889,8 +3082,14 @@ impl JavaDependencyLookup<'_> {
                 if signatures.next().is_some() {
                     return Ok(None);
                 }
-                let Some(path) = &signature.path else {
+                let Some(result_type) = &signature.result_type else {
                     return Ok(None);
+                };
+                let substitution = match receiver_value {
+                    Some(value) => {
+                        self.declaring_value(&value, &identity, &mut HashSet::new(), 0)?
+                    }
+                    None => None,
                 };
                 let binding = JavaDependencyLookup {
                     contexts: &signature.contexts,
@@ -2904,11 +3103,17 @@ impl JavaDependencyLookup<'_> {
                 } else {
                     usize::MAX
                 };
-                let found = binding.value_type(path, position, &owner.declaration.imports)?;
+                let found = binding.result_value(
+                    result_type,
+                    position,
+                    &owner.declaration.imports,
+                    substitution.as_ref(),
+                    depth + 1,
+                )?;
                 if found.is_some() {
                     identities.insert(identity);
                 }
-                Ok(found.map(|owner| (owner, true)))
+                Ok(found)
             }
         }
     }
@@ -3352,14 +3557,14 @@ fn count_symbols_used_in_module(
                     contexts: &member.use_contexts,
                     ..lookup
                 };
-                if let Some((owner, instance)) =
+                if let Some(value) =
                     accessing.value_receiver(chain, &syntax.imports, &mut identities, 0)?
                 {
                     let key = (member.name, member.method);
-                    let identity = if instance {
-                        accessing.value_member(&owner, &key)?
+                    let identity = if value.instance {
+                        accessing.value_member(&value.owner, &key)?
                     } else {
-                        accessing.static_member(&owner.identity, &key)?
+                        accessing.static_member(&value.owner.identity, &key)?
                     };
                     if let Some(identity) = identity {
                         identities.insert(identity);

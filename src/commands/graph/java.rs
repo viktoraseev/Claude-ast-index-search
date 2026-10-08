@@ -2287,8 +2287,9 @@ fn collector_projection(
     JavaReceiver::Unknown
 }
 
-/// Nominal value members reuse graph variable scopes and exact declaration sites.
-/// Chained/inferred generic and overload signatures require separate evidence.
+/// Value members reuse graph variable scopes and exact declaration sites.
+/// Source result chains retain explicit class arguments and initializer scope;
+/// argument-type overload selection remains a separate unresolved contract.
 pub(crate) struct DependencyValueMember {
     pub path: String,
     pub position: usize,
@@ -2301,7 +2302,7 @@ pub(crate) struct DependencyValueMember {
 
 pub(crate) enum DependencyValueReceiver {
     Nominal {
-        path: String,
+        signature: crate::parsers::treesitter::java::DependencyResultType,
         position: usize,
         contexts: Vec<String>,
         instance: bool,
@@ -2311,6 +2312,10 @@ pub(crate) enum DependencyValueReceiver {
         explicit: bool,
     },
     Super,
+    Initializer {
+        receiver: Box<DependencyValueReceiver>,
+        contexts: Vec<String>,
+    },
     Member {
         receiver: Box<DependencyValueReceiver>,
         name: String,
@@ -2390,6 +2395,50 @@ pub(crate) fn dependency_value_members(
             node = parent;
         }
     }
+    fn parameter_receiver(
+        node: Node<'_>,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        scopes: &VariableScopes,
+        package: &str,
+    ) -> Option<DependencyValueReceiver> {
+        let (name, fields_only) = match node.kind() {
+            "identifier" => (text(node, source), false),
+            "field_access" if node.child_by_field_name("object")?.kind() == "this" => {
+                (text(node.child_by_field_name("field")?, source), true)
+            }
+            _ => return None,
+        };
+        let binding = variable_binding(node, name, fields_only, scopes, source)?;
+        if binding.site.is_some() || binding.declared.is_none() {
+            return None;
+        }
+        let name = tree
+            .root_node()
+            .descendant_for_byte_range(binding.position, binding.position + 1)?;
+        let declaration = name.parent()?;
+        let declaration = if declaration.kind() == "variable_declarator" {
+            declaration.parent()?
+        } else {
+            declaration
+        };
+        let ty = declaration.child_by_field_name("type")?;
+        let signature =
+            crate::parsers::treesitter::java::dependency_result_type(ty, source, package, 0)?;
+        if !matches!(
+            signature,
+            crate::parsers::treesitter::java::DependencyResultType::Parameter { .. }
+        ) || !available(node, ty, source)
+        {
+            return None;
+        }
+        Some(DependencyValueReceiver::Nominal {
+            signature,
+            position: ty.start_byte(),
+            contexts: dependency_contexts(ty, source, package),
+            instance: true,
+        })
+    }
     fn chain_receiver(
         node: Node<'_>,
         source: &str,
@@ -2402,27 +2451,38 @@ pub(crate) fn dependency_value_members(
         if depth >= 16 || node.has_error() {
             return None;
         }
+        if let Some(parameter) = parameter_receiver(node, source, tree, scopes, package) {
+            return Some(parameter);
+        }
         let owner = callable(node).unwrap_or(node);
         let inferred = expression_receiver(node, owner, source, scopes, 0);
         let site = expression_receiver_site(node, source, scopes, declarations);
         let nominal = match &inferred {
             JavaReceiver::Declared { receiver, site } => match receiver.as_ref() {
-                JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => {
-                    Some((path, site.position))
-                }
+                JavaReceiver::Type(path)
+                | JavaReceiver::Parameterized { path, .. }
+                | JavaReceiver::Parameter(path) => Some((path, site.position)),
                 _ => None,
             },
-            JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => {
-                site.as_ref().map(|site| (path, site.position))
-            }
+            JavaReceiver::Type(path)
+            | JavaReceiver::Parameterized { path, .. }
+            | JavaReceiver::Parameter(path) => site.as_ref().map(|site| (path, site.position)),
             _ => None,
         };
-        if let Some((path, position)) = nominal {
-            let ty = tree
+        if let Some((_, position)) = nominal {
+            let mut ty = tree
                 .root_node()
                 .descendant_for_byte_range(position, position + 1)?;
+            while let Some(parent) = ty.parent().filter(|parent| {
+                parent.start_byte() == position
+                    && matches!(parent.kind(), "generic_type" | "scoped_type_identifier")
+            }) {
+                ty = parent;
+            }
+            let signature =
+                crate::parsers::treesitter::java::dependency_result_type(ty, source, package, 0)?;
             return available(node, ty, source).then(|| DependencyValueReceiver::Nominal {
-                path: path.replace("::", "."),
+                signature,
                 position,
                 contexts: dependency_contexts(ty, source, package),
                 instance: true,
@@ -2433,7 +2493,10 @@ pub(crate) fn dependency_value_members(
         if node.kind() == "field_access" {
             if let Some(path) = method_reference_type(node, source, scopes, 0) {
                 return Some(DependencyValueReceiver::Nominal {
-                    path: path.replace("::", "."),
+                    signature: crate::parsers::treesitter::java::DependencyResultType::Named(
+                        path.replace("::", "."),
+                        Vec::new(),
+                    ),
                     position: node.start_byte(),
                     contexts: dependency_contexts(node, source, package),
                     instance: false,
@@ -2467,12 +2530,34 @@ pub(crate) fn dependency_value_members(
             // inference did not detect a value shadow or unknown binding.
             "identifier" | "scoped_identifier" => match inferred {
                 JavaReceiver::Type(path) => Some(DependencyValueReceiver::Nominal {
-                    path: path.replace("::", "."),
+                    signature: crate::parsers::treesitter::java::DependencyResultType::Named(
+                        path.replace("::", "."),
+                        Vec::new(),
+                    ),
                     position: node.start_byte(),
                     contexts: dependency_contexts(node, source, package),
                     instance: false,
                 }),
-                _ => None,
+                _ => {
+                    // Resolve an inferred local at its initializer, where every
+                    // qualifier and local type had its original lexical binding.
+                    let binding =
+                        variable_binding(node, text(node, source), false, scopes, source)?;
+                    if binding.declared.is_some() || binding.field {
+                        return None;
+                    }
+                    let name = tree
+                        .root_node()
+                        .descendant_for_byte_range(binding.position, binding.position + 1)?;
+                    let variable = name
+                        .parent()
+                        .filter(|parent| parent.kind() == "variable_declarator")?;
+                    let initializer = variable.child_by_field_name("value")?;
+                    Some(DependencyValueReceiver::Initializer {
+                        receiver: Box::new(nested(initializer)?),
+                        contexts: dependency_contexts(initializer, source, package),
+                    })
+                }
             },
             _ => None,
         }
@@ -2514,6 +2599,10 @@ pub(crate) fn dependency_value_members(
             }
             _ => None,
         };
+        let inferred_local = object.kind() == "identifier"
+            && variable_binding(object, text(object, source), false, &scopes, source)
+                .is_some_and(|binding| !binding.field && binding.declared.is_none());
+        let parameter = parameter_receiver(object, source, &tree, &scopes, package);
         if let Some((path, position)) = nominal {
             // Bind at the actual type node, not a later use in a nested callable.
             if let Some(ty) = tree
@@ -2533,13 +2622,14 @@ pub(crate) fn dependency_value_members(
                     chain: None,
                 });
             }
-        } else if let Some(chain) = matches!(
-            object.kind(),
-            "method_invocation" | "field_access" | "parenthesized_expression"
-        )
-        .then(|| chain_receiver(object, source, &tree, &scopes, &declarations, package, 0))
-        .flatten()
-        {
+        } else if let Some(chain) = parameter.or_else(|| {
+            (matches!(
+                object.kind(),
+                "method_invocation" | "field_access" | "parenthesized_expression"
+            ) || inferred_local)
+                .then(|| chain_receiver(object, source, &tree, &scopes, &declarations, package, 0))
+                .flatten()
+        }) {
             result.push(DependencyValueMember {
                 path: String::new(),
                 position: node.start_byte(),
@@ -2557,6 +2647,74 @@ pub(crate) fn dependency_value_members(
 
 #[cfg(test)]
 mod dependency_value_tests {
+    #[test]
+    fn bounded_record_receivers_keep_parameter_owner_and_instance_guards() {
+        let source = r#"record Probe<T extends shared.Child>(T value) {
+            int valid() { return value.instance(); }
+            static int invalid() { return value.instance(); }
+            java.util.function.IntSupplier capture() { return () -> value.instance(); }
+            static class Peer { int invalid() { return value.instance(); } }
+        }"#;
+        let members = super::dependency_value_members(source, "").unwrap();
+        assert_eq!(members.len(), 2);
+        for member in members {
+            assert_eq!(member.name, "instance");
+            assert!(
+                matches!(member.chain, Some(super::DependencyValueReceiver::Nominal {
+                signature: crate::parsers::treesitter::java::DependencyResultType::Parameter { owner, name }, ..
+            }) if owner == "Probe" && name == "T")
+            );
+        }
+    }
+
+    #[test]
+    fn inferred_chains_keep_initializer_scope_and_explicit_arguments() {
+        use super::DependencyValueReceiver;
+        let source = r#"class Box<T> { T get(){return null;} }
+        class Use { int run(Box<shared.Child> b) {
+            var c=b.get(); class Child {} return c.instance();
+        }}"#;
+        let members = super::dependency_value_members(source, "").unwrap();
+        let member = members
+            .iter()
+            .find(|member| member.name == "instance")
+            .unwrap();
+        let Some(DependencyValueReceiver::Initializer { receiver, contexts }) = &member.chain
+        else {
+            panic!("inferred receiver lost its initializer");
+        };
+        assert_eq!(contexts.first().map(String::as_str), Some("Use"));
+        let DependencyValueReceiver::Member {
+            receiver,
+            name,
+            arity,
+        } = receiver.as_ref()
+        else {
+            panic!("inferred invocation lost its source chain");
+        };
+        assert_eq!(name, "get");
+        assert_eq!(*arity, Some(0));
+        let DependencyValueReceiver::Nominal {
+            signature,
+            position,
+            ..
+        } = receiver.as_ref()
+        else {
+            panic!("parameter receiver lost its declaration");
+        };
+        let crate::parsers::treesitter::java::DependencyResultType::Named(path, arguments) =
+            signature
+        else {
+            panic!("parameter receiver lost its generic signature");
+        };
+        assert_eq!(path, "Box");
+        assert_eq!(*position, source.find("Box<shared.Child>").unwrap());
+        assert!(
+            matches!(arguments.as_slice(), [Some(crate::parsers::treesitter::java::DependencyResultType::Named(path, args))]
+            if path == "shared.Child" && args.is_empty())
+        );
+    }
+
     #[test]
     fn record_component_receivers_require_the_declaring_instance() {
         let source = r#"record Probe(shared.Child value) {

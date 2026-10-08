@@ -70,6 +70,7 @@ import java_inherited_type_contracts
 import java_parent_contracts
 import unused_dep_contracts
 import java_dependency_contracts
+import java_dependency_result_contracts
 import java_on_demand_contracts
 import android_dependency_contracts
 import format_contracts
@@ -591,6 +592,7 @@ class Fixture:
         self._module_root_results = None
         self._module_alias_results = None
         self._java_module_binding_results = None
+        self._java_dependency_result_results = None
         self._java_inherited_import_results = None
         self._selector_error_results = None
         self._operation_error_results = None
@@ -2215,6 +2217,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def java_dependency_result_check(self, check: sqlite3.Row):
+        if self._java_dependency_result_results is None:
+            self._java_dependency_result_results = java_dependency_result_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._java_dependency_result_results)
+        return {'source': java_dependency_result_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def java_inherited_import_check(self, check: sqlite3.Row):
         if self._java_inherited_import_results is None:
             self._java_inherited_import_results = java_inherited_import_contracts.exercise(self.binary, self.database.parent)
@@ -2428,6 +2438,8 @@ class Fixture:
                 handler = self.module_root_check
             if check['feature'] in java_module_binding_contracts.FEATURES:
                 handler = self.java_module_binding_check
+            if check['feature'] in java_dependency_result_contracts.FEATURES:
+                handler = self.java_dependency_result_check
             if check['feature'] in java_inherited_import_contracts.FEATURES:
                 handler = self.java_inherited_import_check
             if check['feature'] in module_alias_contracts.FEATURES:
@@ -2543,6 +2555,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_inherited_type_contracts.FEATURES)
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
     features.update(java_dependency_contracts.FEATURES)
+    features.update(java_dependency_result_contracts.FEATURES)
     features.update(java_on_demand_contracts.FEATURES)
     features.update(android_dependency_contracts.FEATURES | android_dependency_contracts.JAVA_FEATURES)
     features.update(format_contracts.FEATURES)
@@ -2763,6 +2776,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     graph_ambiguity_contracts.plan_contracts(state, root)
     module_alias_contracts.plan_aliases(state, root)
     java_module_binding_contracts.plan_binding(state, root)
+    java_dependency_result_contracts.plan_results(state, root)
     java_inherited_import_contracts.plan_imports(state, root)
     selector_error_contracts.plan_errors(state, root)
     operation_error_contracts.plan_errors(state, root)
