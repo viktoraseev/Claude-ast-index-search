@@ -230,8 +230,12 @@ def exercise(binary, base):
            locations=[(layouts[0], n) for n in range(1, 103)], xml_count=102)
     write(code_path, 'class Use {\n void use() {\n' + '  consume(R.string.shared);\n' * 102 + ' }\n}\n')
     runner.command('rebuild', '--force', '--max-files', 0)
-    for key, args in (('global-cap', ['shared']), ('module-cap', ['shared', '--module', 'app'])):
-        sample('resource-usages', key, args, locations=calls, groups=[('Kotlin/Java', 100)], total=100, omitted=[90])
+    # Keep the original case keys and exact location sample. The display cap
+    # must not truncate the authored total (including the unassigned site).
+    for key, args, count in (('global-cap', ['shared'], 103),
+                             ('module-cap', ['shared', '--module', 'app'], 102)):
+        sample('resource-usages', key, args, locations=calls,
+               groups=[('Kotlin/Java', count)], total=count, omitted=[count - len(calls)])
     return expected, actual
 
 

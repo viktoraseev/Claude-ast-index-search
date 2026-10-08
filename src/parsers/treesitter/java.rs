@@ -112,6 +112,7 @@ pub(crate) struct ResourceReference {
     pub name: String,
     pub line: usize,
     pub offset: usize,
+    pub qualifier: String,
 }
 
 /// Byte-scoped lexical names shared by Java dependencies and resource expressions.
@@ -436,6 +437,9 @@ pub(crate) fn resource_references(content: &str) -> Result<Vec<ResourceReference
                 name: name.to_owned(),
                 line: node_line(&node),
                 offset: node.start_byte(),
+                qualifier: parts(node, content)
+                    .and_then(|names| names.into_iter().next())
+                    .unwrap_or_else(|| node_text(content, &node).to_owned()),
             });
         };
         if node.kind() == "field_access" {

@@ -1849,6 +1849,13 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in actual.items()}
 
     def android_dependency_check(self, check: sqlite3.Row):
+        if check['feature'] in android_dependency_contracts.JAVA_FEATURES:
+            if getattr(self, '_android_dependency_java_results', None) is None:
+                self._android_dependency_java_results = android_dependency_contracts.exercise_java(self.binary, self.database.parent)
+            expected, actual = (section[check['feature']] for section in self._android_dependency_java_results)
+            return {'source': android_dependency_contracts.JAVA_REASON, 'samples': expected}, actual, \
+                {(key, canonical_json(value)) for key, value in expected.items()}, \
+                {(key, canonical_json(value)) for key, value in actual.items()}
         if self._android_dependency_results is None:
             self._android_dependency_results = android_dependency_contracts.exercise(self.binary, self.database.parent)
         expected, actual = (section[check['feature']] for section in self._android_dependency_results)
@@ -2330,7 +2337,7 @@ class Fixture:
                 handler = self.java_dependency_check
             if check['feature'] in java_on_demand_contracts.FEATURES:
                 handler = self.java_on_demand_check
-            if check['feature'] in android_dependency_contracts.FEATURES:
+            if check['feature'] in android_dependency_contracts.FEATURES | android_dependency_contracts.JAVA_FEATURES:
                 handler = self.android_dependency_check
             if check['feature'] in graph_contracts.FEATURES:
                 handler = self.graph_check
@@ -2483,6 +2490,7 @@ class Fixture:
 
 JAVA_EXCLUDED_FEATURES = (set(mobile_contracts.EXTENSIONS) | set(perl_contracts.EXTENSIONS)
                           | android_syntax_contracts.FEATURES
+                          | android_dependency_contracts.LEGACY_FEATURES
                           | {'composables', 'previews', 'swiftui', 'async-funcs',
                              'storyboard-usages', 'asset-usages', 'deeplinks:non-java',
                              'suppress:non-java', 'inject:non-java'})
@@ -2523,7 +2531,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(unused_dep_contracts.FEATURES | unused_dep_contracts.PENDING.keys() | {'unused-deps:target'})
     features.update(java_dependency_contracts.FEATURES)
     features.update(java_on_demand_contracts.FEATURES)
-    features.update(android_dependency_contracts.FEATURES)
+    features.update(android_dependency_contracts.FEATURES | android_dependency_contracts.JAVA_FEATURES)
     features.update(format_contracts.FEATURES)
     features.update(navigation_format_contracts.FEATURES)
     features.update(file_view_contracts.FEATURES)
@@ -2716,7 +2724,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     unused_dep_contracts.plan_unused(state, root)
     java_dependency_contracts.plan_dependencies(state, root)
     java_on_demand_contracts.plan_imports(state, root)
-    android_dependency_contracts.plan_dependencies(state, root)
+    android_dependency_contracts.plan_dependencies(state, root, java_only=java_only)
     format_contracts.plan_formats(state, root)
     file_view_contracts.plan_views(state, root)
     file_scope_contracts.plan_scope(state, root)

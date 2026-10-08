@@ -31,7 +31,7 @@ class AndroidDependencyContracts(unittest.TestCase):
         self.oracle.call.side_effect = AssertionError('source fixtures cannot claim MCP equivalence')
         self.fixture = Fixture(self.root, self.binary, self.directory / 'unused.sqlite', self.state, self.oracle)
         plan(self.state, [{'path': 'Sentinel.java'}], '  class  Classes\n  symbol  Symbols\n  file  Files',
-             root=self.root, java_only=True)
+             root=self.root, java_only=False)
 
     def evaluate(self, feature):
         check = self.state.execute('SELECT * FROM checks WHERE feature=?', (feature,)).fetchone()

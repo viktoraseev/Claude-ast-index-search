@@ -14,6 +14,23 @@ from mobile_contracts import inventory, inventory_snapshot
 
 
 class CompletionTests(unittest.TestCase):
+    def test_retained_mixed_cases_cannot_replace_missing_java_projection(self):
+        from android_dependency_contracts import LEGACY_FEATURES, JAVA_FEATURES
+        before = self.check()['checks']
+        for feature in LEGACY_FEATURES:
+            self.mutate("INSERT INTO checks(id,feature,subject,status,verdict) VALUES (?,?,?,'complete','pass')",
+                        ('legacy:' + feature, feature, 'retained-mixed'))
+        self.assertEqual(self.check()['checks'], before)
+        for feature in JAVA_FEATURES:
+            self.mutate("UPDATE checks SET verdict='fail' WHERE feature=?", (feature,))
+        with self.assertRaises(ToolError):
+            self.check()
+        self.mutate("UPDATE checks SET verdict='pass' WHERE feature IN (?,?)", tuple(sorted(JAVA_FEATURES)))
+        self.assertEqual(self.check()['checks'], before)
+        self.mutate('DELETE FROM coverage WHERE feature=?', (sorted(JAVA_FEATURES)[0],))
+        with self.assertRaises(ToolError):
+            self.check()
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

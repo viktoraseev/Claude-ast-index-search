@@ -217,67 +217,99 @@ pub fn cmd_resource_usages(
         );
 
         // Find resource usages
-        let results: Vec<(String, i64, String)> = if let Some(module) = module_filter {
+        let results: Vec<(String, i64, String, usize)> = if let Some(module) = module_filter {
             let mut stmt = conn.prepare(
-                "SELECT ru.usage_file, ru.usage_line, ru.usage_type
+                "WITH resource_modules AS (
+                    SELECT name,CASE WHEN root_path='' OR root_path=?4 THEN path
+                        ELSE root_path || '/' || path END AS path FROM modules
+                 ), matching AS (
+                 SELECT ru.usage_file, ru.usage_line, ru.usage_type
                  FROM resource_usages ru
                  JOIN resources r ON ru.resource_id = r.id
                  WHERE r.type = ?1 AND r.name = ?2 AND (
-                     SELECT m.name FROM modules m
+                     SELECT m.name FROM resource_modules m
                      WHERE m.path = '' OR ru.usage_file = m.path
                         OR substr(ru.usage_file, 1, length(m.path) + 1) = m.path || '/'
                      ORDER BY length(m.path) DESC LIMIT 1
                  ) = ?3
-                 ORDER BY ru.usage_file, ru.usage_line
-                 LIMIT 100",
+                 ), ranked AS (
+                     SELECT usage_file, usage_line, usage_type,
+                            COUNT(*) OVER (PARTITION BY usage_type) AS group_total,
+                            ROW_NUMBER() OVER (PARTITION BY usage_type ORDER BY usage_file, usage_line) AS position
+                     FROM matching
+                 )
+                 SELECT usage_file, usage_line, usage_type, group_total
+                 FROM ranked WHERE position <= 10
+                 ORDER BY usage_file, usage_line",
             )?;
-            let rows = stmt.query_map(params![res_type, res_name, module], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?;
+            let rows = stmt.query_map(
+                params![
+                    res_type,
+                    res_name,
+                    module,
+                    db::normalize_root_for_storage(root)
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
             rows.filter_map(|r| r.ok()).collect()
         } else {
             let mut stmt = conn.prepare(
-                "SELECT ru.usage_file, ru.usage_line, ru.usage_type
+                "WITH matching AS (
+                 SELECT ru.usage_file, ru.usage_line, ru.usage_type
                  FROM resource_usages ru
                  JOIN resources r ON ru.resource_id = r.id
                  WHERE r.type = ?1 AND r.name = ?2
-                 ORDER BY ru.usage_file, ru.usage_line
-                 LIMIT 100",
+                 ), ranked AS (
+                     SELECT usage_file, usage_line, usage_type,
+                            COUNT(*) OVER (PARTITION BY usage_type) AS group_total,
+                            ROW_NUMBER() OVER (PARTITION BY usage_type ORDER BY usage_file, usage_line) AS position
+                     FROM matching
+                 )
+                 SELECT usage_file, usage_line, usage_type, group_total
+                 FROM ranked WHERE position <= 10
+                 ORDER BY usage_file, usage_line",
             )?;
             let rows = stmt.query_map(params![res_type, res_name], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
         // Group by usage type
-        let code_usages: Vec<_> = results.iter().filter(|(_, _, t)| t == "code").collect();
-        let xml_usages: Vec<_> = results.iter().filter(|(_, _, t)| t == "xml").collect();
+        let code_usages: Vec<_> = results.iter().filter(|(_, _, t, _)| t == "code").collect();
+        let xml_usages: Vec<_> = results.iter().filter(|(_, _, t, _)| t == "xml").collect();
+        let code_total = code_usages.first().map_or(0, |row| row.3);
+        let xml_total = xml_usages.first().map_or(0, |row| row.3);
+        let group_totals: HashMap<&str, usize> = results
+            .iter()
+            .map(|(_, _, kind, total)| (kind.as_str(), *total))
+            .collect();
+        let total: usize = group_totals.values().sum();
 
         if !code_usages.is_empty() {
-            println!("\n{} ({}):", "Kotlin/Java".cyan(), code_usages.len());
-            for (file, line, _) in code_usages.iter().take(10) {
+            println!("\n{} ({}):", "Kotlin/Java".cyan(), code_total);
+            for (file, line, _, _) in code_usages.iter().take(10) {
                 println!("  {}:{}", file, line);
             }
-            if code_usages.len() > 10 {
-                println!("  ... and {} more", code_usages.len() - 10);
+            if code_total > code_usages.len() {
+                println!("  ... and {} more", code_total - code_usages.len());
             }
         }
 
         if !xml_usages.is_empty() {
-            println!("\n{} ({}):", "XML".cyan(), xml_usages.len());
-            for (file, line, _) in xml_usages.iter().take(10) {
+            println!("\n{} ({}):", "XML".cyan(), xml_total);
+            for (file, line, _, _) in xml_usages.iter().take(10) {
                 println!("  {}:{}", file, line);
             }
-            if xml_usages.len() > 10 {
-                println!("  ... and {} more", xml_usages.len() - 10);
+            if xml_total > xml_usages.len() {
+                println!("  ... and {} more", xml_total - xml_usages.len());
             }
         }
 
         if results.is_empty() {
             println!("  No usages found.");
         } else {
-            println!("\n{}", format!("Total: {} usages", results.len()).bold());
+            println!("\n{}", format!("Total: {} usages", total).bold());
         }
     }
 

@@ -2736,6 +2736,171 @@ impl JavaDependencyLookup<'_> {
     }
 }
 
+/// Filter Java resource candidates through the consumer's source classpath.
+/// Generated R stubs need not be indexed; authored names still take precedence.
+pub(crate) fn java_resource_references(
+    conn: &Connection,
+    root: &Path,
+    module: Option<i64>,
+    content: &str,
+    namespaces: &HashMap<String, Vec<i64>>,
+) -> Result<Vec<crate::parsers::treesitter::java::ResourceReference>> {
+    use crate::parsers::treesitter::java::{
+        dependency_contexts, dependency_syntax, resource_references,
+    };
+    let references = resource_references(content)?;
+    if references.is_empty() {
+        return Ok(references);
+    }
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS java_dependency_scope(
+             file_id INTEGER PRIMARY KEY, is_consumer INTEGER NOT NULL);
+         DELETE FROM temp.java_dependency_scope;",
+    )?;
+    let membership = MODULE_FILE_SCOPE.replace("?1", "m.path");
+    conn.execute(
+        &format!(
+            "WITH RECURSIVE consumer(id) AS (SELECT ?1), classpath(id) AS (
+                 SELECT id FROM consumer
+                 UNION SELECT d.dep_module_id FROM module_deps d JOIN consumer c ON c.id=d.module_id
+                 UNION SELECT d.dep_module_id FROM module_deps d JOIN classpath c ON c.id=d.module_id
+                       WHERE d.dep_kind='api'
+             )
+             INSERT INTO temp.java_dependency_scope
+             SELECT f.id,EXISTS(SELECT 1 FROM consumer c WHERE c.id=m.id)
+             FROM files f JOIN modules m ON (m.root_path='' OR m.root_path=f.root_path)
+             JOIN classpath c ON c.id=m.id WHERE {membership} AND substr(f.path,-5)='.java'"
+        ),
+        params![module],
+    )?;
+    // Standalone Java projects have no module classpath to select.
+    if module.is_none() {
+        conn.execute("INSERT OR IGNORE INTO temp.java_dependency_scope SELECT id,1 FROM files WHERE substr(path,-5)='.java'", [])?;
+    }
+    let syntax = dependency_syntax(content)?;
+    let resolver = super::PathResolver::try_from_conn(root, conn)?.with_decoration(false);
+    let language = tree_sitter_java::LANGUAGE.into();
+    let tree = crate::parsers::treesitter::parse_tree(content, &language)?;
+    let mut output = Vec::new();
+    for mut reference in references {
+        let Some(node) = tree
+            .root_node()
+            .descendant_for_byte_range(reference.offset, reference.offset + 1)
+        else {
+            continue;
+        };
+        let contexts = dependency_contexts(node, content, &syntax.package);
+        let lookup = JavaDependencyLookup {
+            conn,
+            root,
+            resolver: &resolver,
+            package: &syntax.package,
+            contexts: &contexts,
+            local_types: &syntax.local_types,
+            local_bindings: &syntax.local_bindings,
+            resolving_parent: false,
+        };
+        let field = (reference.qualifier.clone(), false);
+        if lookup
+            .lexical_member(
+                &field,
+                syntax.instance_contexts.get(&(
+                    reference.qualifier.clone(),
+                    false,
+                    contexts.clone(),
+                )),
+            )?
+            .is_some()
+            || (reference.qualifier != reference.name
+                && lookup.lexical_type(&reference.qualifier)?.0)
+        {
+            continue;
+        }
+        // Only an imported field reserves the expression namespace. A method
+        // of the same name must leave generated static constants available.
+        let mut explicit_field = false;
+        let explicit_resource_field = reference.qualifier == reference.name
+            && syntax.imports.iter().any(|(import, is_static)| {
+                *is_static
+                    && reference.namespace.as_ref().is_some_and(|namespace| {
+                        import
+                            == &format!(
+                                "{namespace}.R.{}.{}",
+                                reference.resource_type, reference.name
+                            )
+                    })
+            });
+        for (import, is_static) in &syntax.imports {
+            if *is_static && !explicit_resource_field {
+                if let Some(owner) = import.strip_suffix(".*") {
+                    let resource_owner = reference.namespace.as_ref().is_some_and(|namespace| {
+                        owner == format!("{namespace}.R.{}", reference.resource_type)
+                    });
+                    if !resource_owner && lookup.static_member(owner, &field)?.is_some() {
+                        explicit_field = true;
+                    }
+                }
+            }
+            if *is_static && !import.ends_with(".*") {
+                if let Some((owner, name)) = import.rsplit_once('.') {
+                    let resource_import = reference.namespace.as_ref().is_some_and(|namespace| {
+                        import
+                            == &format!(
+                                "{namespace}.R.{}.{}",
+                                reference.resource_type, reference.name
+                            )
+                    });
+                    if name == reference.qualifier
+                        && !resource_import
+                        && lookup.static_member(owner, &field)?.is_some()
+                    {
+                        explicit_field = true;
+                    }
+                }
+            }
+        }
+        if explicit_field {
+            continue;
+        }
+        // A single type import precedes same-package types. Otherwise a
+        // cross-file authored R/string type beats generated on-demand types.
+        let explicit_type = syntax.imports.iter().any(|(import, is_static)| {
+            !is_static && import.rsplit('.').next() == Some(reference.qualifier.as_str())
+        });
+        if !explicit_type && reference.qualifier != reference.name {
+            let candidate = if syntax.package.is_empty() {
+                reference.qualifier.clone()
+            } else {
+                format!("{}.{}", syntax.package, reference.qualifier)
+            };
+            if lookup.type_name(&candidate, true)?.is_some()
+                && (reference.qualifier != "R" || !namespaces.contains_key(&syntax.package))
+            {
+                continue;
+            }
+        }
+        if reference.namespace.is_none() && reference.qualifier == "R" {
+            if namespaces.contains_key(&syntax.package) {
+                reference.namespace = Some(syntax.package.clone());
+            } else {
+                let imported: std::collections::BTreeSet<_> = syntax
+                    .imports
+                    .iter()
+                    .filter(|(_, is_static)| !is_static)
+                    .filter_map(|(import, _)| import.strip_suffix(".*"))
+                    .filter(|namespace| namespaces.contains_key(*namespace))
+                    .collect();
+                if imported.len() > 1 {
+                    continue;
+                }
+                reference.namespace = imported.into_iter().next().map(str::to_owned);
+            }
+        }
+        output.push(reference);
+    }
+    Ok(output)
+}
+
 /// Check dependency identities using Java syntax and other languages' indexed refs.
 fn count_symbols_used_in_module(
     conn: &Connection,
@@ -3004,10 +3169,20 @@ fn count_symbols_used_in_module(
             }
         }
         for member in super::graph::dependency_value_members(&content, &syntax.package)? {
-            let binding = JavaDependencyLookup { contexts: &member.contexts, ..lookup };
-            if let Some(owner) = binding.value_type(&member.path, member.position, &syntax.imports)? {
-                let accessing = JavaDependencyLookup { contexts: &member.use_contexts, ..lookup };
-                if let Some(identity) = accessing.value_member(&owner, &(member.name, member.method))? {
+            let binding = JavaDependencyLookup {
+                contexts: &member.contexts,
+                ..lookup
+            };
+            if let Some(owner) =
+                binding.value_type(&member.path, member.position, &syntax.imports)?
+            {
+                let accessing = JavaDependencyLookup {
+                    contexts: &member.use_contexts,
+                    ..lookup
+                };
+                if let Some(identity) =
+                    accessing.value_member(&owner, &(member.name, member.method))?
+                {
                     identities.insert(identity);
                 }
             }

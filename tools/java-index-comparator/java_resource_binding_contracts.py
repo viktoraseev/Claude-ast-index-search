@@ -13,8 +13,9 @@ FEATURE = 'resource-usages:java-lexical-bindings'
 FEATURES = {FEATURE}
 REASON = ('independent source/state: javac-validated Java R/type alias and static constant '
           'lexical shadows, declaration points, captures, pattern/loop/try scopes and '
-          'import precedence through resource-usages/unused ownership; not MCP equivalence; '
-          'inherited and cross-file type/member binding remain pending')
+          'source-classpath inherited fields/types/constants, same-package type precedence and '
+          'field-versus-method import namespaces through resource-usages/unused ownership; '
+          'not MCP equivalence or a complete compiler-resolution contract')
 
 # Every expected line is authored independently of ast-index, including the
 # two sites on a single line where only one refers to the imported R class.
@@ -25,6 +26,30 @@ class Prefix { public Chain library = new Chain(); }
 class Chain { public Shadow R = new Shadow(); }
 '''
 CASES = {
+    'imported-wildcard-field': ('import fixture.library.R;\nimport static plain.Owner.*;',
+                                'class Use { int shadow() { return R.string.hit; } }\n', []),
+    'imported-wildcard-method': ('import fixture.library.R;\nimport static plain.OwnerMethods.*;',
+                                 'class Use { int real() { return R.string.hit; } }\n', [1]),
+    'package-wildcard': ('import fixture.library.*;',
+                         'class Use { int real() { return R.string.hit; } }\n', [1]),
+    'inherited-field': ('import fixture.library.R;', '''class Base { Shadow R = new Shadow(); }
+class Use extends Base { int shadow() { return R.string.hit; } }
+class Other { int real() { return R.string.hit; } }
+''', [3]),
+    'inherited-type': ('import fixture.library.R;', '''class Base { static class R { static class string { static int hit; } } }
+class Use extends Base { int shadow() { return R.string.hit; } }
+class Other { int real() { return R.string.hit; } }
+''', [3]),
+    'inherited-constant': ('import static fixture.library.R.string.*;', '''class Base { int hit; }
+class Use extends Base { int shadow() { return hit; } }
+class Other { int real() { return hit; } }
+''', [3]),
+    'imported-field': ('import static plain.string.hit;\nimport static fixture.library.R.string.*;',
+                       'class Use { int shadow() { return hit; } }\n', []),
+    'imported-method': ('import static plain.Methods.hit;\nimport static fixture.library.R.string.*;',
+                       'class Use { int real() { hit(); return hit; } }\n', [1]),
+    'cross-file': ('import fixture.library.*;',
+                  'class Use { int shadow() { return R.string.hit; } }\n', []),
     'parameter': ('import fixture.library.R;', '''class Use {
  int shadow(Shadow R) { return R.string.hit; }
  int real() { return R.string.hit; }
@@ -152,8 +177,9 @@ def plan_bindings(state, root):
                       (stable_id({'feature': FEATURE, 'subject': subject}), FEATURE, subject))
         note = ('; separate Java lexical resource binding checklist covers byte-scoped '
                 'declarations, captures, pattern/loop/try boundaries and explicit/nested/static '
-                'type imports; inherited/cross-file/member-kind binding and all other recorded '
-                'parent obligations remain pending; independent source/state, not MCP equivalence')
+                'type imports plus source-classpath inherited/cross-file/member-kind and '
+                'package-on-demand binding; other recorded parent obligations remain pending; '
+                'independent source/state, not MCP equivalence')
         state.execute("UPDATE coverage SET reason=reason || ? WHERE feature='android:syntax-resolution' "
                       "AND status='pending' AND instr(reason,?)=0", (note, note))
 
@@ -174,7 +200,8 @@ def exercise(binary, base):
 
     for module in ('app', 'library'):
         write(module + '/build.gradle', "plugins { id 'com.android.library' }\n"
-              + "android { namespace 'fixture." + module + "' }\n")
+              + "android { namespace 'fixture." + module + "' }\n"
+              + ('dependencies { implementation(project(":library")) }\n' if module == 'app' else ''))
         write(module + '/src/main/res/values/strings.xml',
               '<resources>' + ''.join('<string name="hit_' + label.replace('-', '_') +
               '">Value</string>' for label in CASES) + '</resources>\n')
@@ -182,13 +209,26 @@ def exercise(binary, base):
     names = {label: 'hit_' + label.replace('-', '_') for label in CASES}
     write('library/plain/string.java', 'package plain; public class string { ' +
           ''.join('public static int ' + name + ';' for name in names.values()) + ' }')
-    sources = [runner.root / 'library/plain/string.java']
+    write('library/plain/Methods.java', 'package plain; public class Methods { ' +
+          ''.join('public static void ' + name + '() {}' for name in names.values()) + ' }')
+    write('library/plain/Owner.java', 'package plain; public class Owner { '
+          'public static class Values { ' + ''.join('public int ' + name + ';' for name in names.values()) + ' } '
+          'public static class Shadow { public static Values string=new Values(); } '
+          'public static Shadow R=new Shadow(); }')
+    write('library/plain/OwnerMethods.java', 'package plain; public class OwnerMethods { public static void R() {} }')
+    sources = [runner.root / ('library/plain/' + name + '.java')
+               for name in ('string', 'Methods', 'Owner', 'OwnerMethods')]
     for label, (imports, body, lines) in CASES.items():
         path = 'app/' + label + '/Use.java'
         preamble = 'package probe.case_' + label.replace('-', '_') + ';\n' + imports + '\n'
         write(path, (preamble + body + SUPPORT).replace('hit', names[label]))
         sources.append(runner.root / path)
         locations[label] = [(path, line + preamble.count('\n')) for line in lines]
+        if label == 'cross-file':
+            extra = 'app/cross-file/R.java'
+            write(extra, 'package probe.case_cross_file; class R { static class string { '
+                  'static int ' + names[label] + '; } }')
+            sources.append(runner.root / extra)
     # Generated R stubs validate compilation, but never enter the indexed tree.
     stub = directory / 'R.java'
     stub.write_text('package fixture.library; public class R { public static class string { ' +
@@ -209,7 +249,7 @@ def exercise(binary, base):
         state.executescript('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT);' +
                            mobile_contracts.SCHEMA + ANDROID_SCHEMA)
         mobile_contracts.inventory(state, runner.root)
-        want = {'.java': len(CASES) + 1, '.gradle': 2, '.xml': 2}
+        want = {'.java': len(CASES) + 4 + int('cross-file' in CASES), '.gradle': 2, '.xml': 2}
         counts = dict(state.execute('SELECT extension,count(*) FROM file_inventory GROUP BY extension'))
         if counts != want:
             raise ToolError('Java resource binding full inventory incomplete')

@@ -635,6 +635,7 @@ fn rebuild_index(
 
             // Collect module_files from primary root
             let mut all_module_files = walk.module_files;
+            let mut all_res_files = walk.res_files;
 
             // Index extra roots and merge their module_files
             let extra_roots = db::get_extra_roots(&conn)?;
@@ -654,6 +655,10 @@ fn rebuild_index(
                     )?;
                     file_count += extra_walk.file_count;
                     all_module_files.extend(extra_walk.module_files);
+                    if !extra_walk.res_files.is_empty() {
+                        is_android = true;
+                    }
+                    all_res_files.extend(extra_walk.res_files);
                     if verbose {
                         eprintln!(
                             "[verbose] extra root: {} files in {:?}",
@@ -778,7 +783,7 @@ fn rebuild_index(
 
                 lifecycle_progress!("{}", "Indexing resources...".cyan());
                 let t = Instant::now();
-                let (rc, ruc) = indexer::index_resources(&mut conn, root, &walk.res_files, true)?;
+                let (rc, ruc) = indexer::index_resources(&mut conn, root, &all_res_files, true)?;
                 res_count = rc;
                 res_usage_count = ruc;
                 if verbose {

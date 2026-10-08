@@ -135,6 +135,37 @@ impl ModuleLookup {
             })
             .map(|(_, id)| *id)
     }
+
+    /// Resource paths outside the primary root retain their physical owner.
+    fn resource_paths(conn: &Connection, root: &Path) -> Result<Self> {
+        let mut statement = conn.prepare("SELECT id,path,root_path FROM modules")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut sorted = Vec::new();
+        for row in rows {
+            let (id, path, owner) = row?;
+            let physical = if owner.is_empty() {
+                root.join(path)
+            } else {
+                Path::new(&owner).join(path)
+            };
+            sorted.push((
+                physical
+                    .strip_prefix(root)
+                    .unwrap_or(&physical)
+                    .to_string_lossy()
+                    .to_string(),
+                id,
+            ));
+        }
+        sorted.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        Ok(Self { sorted })
+    }
 }
 
 /// Project type detected by markers
@@ -267,7 +298,12 @@ pub fn has_android_markers(root: &Path) -> bool {
 }
 
 /// Root files that mark a SwiftPM or Tuist project.
-const SWIFT_ROOT_MARKERS: &[&str] = &["Package.swift", "Project.swift", "Workspace.swift", "Tuist.swift"];
+const SWIFT_ROOT_MARKERS: &[&str] = &[
+    "Package.swift",
+    "Project.swift",
+    "Workspace.swift",
+    "Tuist.swift",
+];
 
 /// Check if project has iOS markers (Xcode/SPM/Tuist)
 pub fn has_ios_markers(root: &Path) -> bool {
@@ -1018,7 +1054,13 @@ fn detect_stacks_with_limits(
 
     let mut ios_markers = collect_markers(
         entries,
-        &["Package.swift", "Project.swift", "Workspace.swift", "Tuist.swift", "Podfile"],
+        &[
+            "Package.swift",
+            "Project.swift",
+            "Workspace.swift",
+            "Tuist.swift",
+            "Podfile",
+        ],
     );
     ios_markers.extend(collect_ext_markers(entries, "xcodeproj", 3));
     ios_markers.extend(collect_ext_markers(entries, "xcworkspace", 3));
@@ -1271,11 +1313,7 @@ fn parse_file(root: &Path, file_path: &Path) -> Result<Option<ParsedFile>> {
 /// [`parse_file`] with the storage key of `root` computed by the caller.
 /// The key costs a thread and a `realpath` per call, which a walk over tens
 /// of thousands of files must not pay per file.
-fn parse_file_keyed(
-    root: &Path,
-    root_key: &str,
-    file_path: &Path,
-) -> Result<Option<ParsedFile>> {
+fn parse_file_keyed(root: &Path, root_key: &str, file_path: &Path) -> Result<Option<ParsedFile>> {
     if minified::skip_by_name(file_path) {
         return Ok(None);
     }
@@ -1551,7 +1589,11 @@ pub fn build_files_fingerprint(module_files: &[PathBuf]) -> String {
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_secs() as i64);
-            (path.to_string_lossy().to_string(), mtime, metadata.map_or(0, |m| m.len()))
+            (
+                path.to_string_lossy().to_string(),
+                mtime,
+                metadata.map_or(0, |m| m.len()),
+            )
         })
         .collect();
     entries.sort();
@@ -2907,7 +2949,13 @@ fn index_swift_manifest_modules(
         };
         let parsed = swift_manifest::parse_manifest(&content);
         if parsed.declares_project && parsed.targets.is_empty() {
-            unread.push(manifest.strip_prefix(root).unwrap_or(manifest).to_string_lossy().to_string());
+            unread.push(
+                manifest
+                    .strip_prefix(root)
+                    .unwrap_or(manifest)
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
         for target in parsed.targets {
             declared.push((kind, dir, target));
@@ -4312,8 +4360,9 @@ pub fn index_resources(
     res_files: &[PathBuf],
     progress: bool,
 ) -> Result<(usize, usize)> {
-    let module_lookup = ModuleLookup::from_db(conn)?;
+    let module_lookup = ModuleLookup::resource_paths(conn, root)?;
     let namespace_owners = java_resources::namespace_owners(conn, root)?;
+    let merged_owners = java_resources::merged_owners(conn, root)?;
 
     if progress {
         eprintln!("Found {} resource files to analyze...", res_files.len());
@@ -4369,11 +4418,22 @@ pub fn index_resources(
                 .to_string();
 
             let module_id = module_lookup.find(&rel_path);
+            let folder = res_path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let is_folder = |kind: &str| {
+                folder == kind
+                    || folder
+                        .strip_prefix(kind)
+                        .is_some_and(|suffix| suffix.starts_with('-'))
+            };
 
             // Drawable files
-            if rel_path.contains("/drawable") || rel_path.contains("/mipmap") {
+            if is_folder("drawable") || is_folder("mipmap") {
                 if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
-                    let res_type = if rel_path.contains("/mipmap") {
+                    let res_type = if is_folder("mipmap") {
                         "mipmap"
                     } else {
                         "drawable"
@@ -4384,7 +4444,7 @@ pub fn index_resources(
             }
 
             // Layout files
-            if rel_path.contains("/layout") && rel_path.ends_with(".xml") {
+            if is_folder("layout") && rel_path.ends_with(".xml") {
                 if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
                     res_stmt.execute(rusqlite::params![module_id, "layout", name, rel_path, 1])?;
                     resource_count += 1;
@@ -4392,15 +4452,22 @@ pub fn index_resources(
             }
 
             // Values files (strings, colors, dimens, styles)
-            if rel_path.contains("/values") && rel_path.ends_with(".xml") {
+            if is_folder("values") && rel_path.ends_with(".xml") {
                 if let Ok(content) = fs::read_to_string(res_path) {
                     let visible = android_xml::visible(&content);
                     for tag in android_xml::tags(&visible) {
-                        if matches!(tag.name, "string" | "color" | "dimen" | "style") {
+                        let resource_type = match tag.name {
+                            "string" | "color" | "dimen" | "style" | "integer" | "bool"
+                            | "plurals" | "array" => Some(tag.name),
+                            "string-array" | "integer-array" => Some("array"),
+                            "item" => tag.attribute("type").map(|value| value.value.as_ref()),
+                            _ => None,
+                        };
+                        if let Some(resource_type) = resource_type {
                             if let Some(name) = tag.attribute("name") {
                                 res_stmt.execute(rusqlite::params![
                                     module_id,
-                                    tag.name,
+                                    resource_type,
                                     name.value.as_ref(),
                                     rel_path,
                                     tag.line as i64
@@ -4448,20 +4515,56 @@ pub fn index_resources(
         // Resource XML is collected by the Android walker, but is not a
         // symbol source and may be absent from `files`. Include it explicitly.
         let code_rel_paths: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT path FROM files WHERE path LIKE '%.kt' OR path LIKE '%.java' OR path LIKE '%.xml'")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut stmt = tx.prepare("SELECT path,root_path FROM files WHERE path LIKE '%.kt' OR path LIKE '%.java' OR path LIKE '%.xml'")?;
+            let rows = stmt.query_map([], |row| {
+                let path: String = row.get(0)?;
+                let owner: String = row.get(1)?;
+                let physical = if owner.is_empty() {
+                    root.join(&path)
+                } else {
+                    Path::new(&owner).join(&path)
+                };
+                Ok(physical
+                    .strip_prefix(root)
+                    .unwrap_or(&physical)
+                    .to_string_lossy()
+                    .to_string())
+            })?;
             let mut paths: Vec<String> = rows.filter_map(|r| r.ok()).collect();
             paths.extend(
                 res_files
                     .iter()
                     .filter(|p| p.extension().is_some_and(|e| e == "xml"))
-                    .filter_map(|p| p.strip_prefix(root).ok())
-                    .map(|p| p.to_string_lossy().to_string()),
+                    .map(|p| {
+                        p.strip_prefix(root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .to_string()
+                    }),
             );
             paths.sort();
             paths.dedup();
             paths
         };
+        // Classpath binding uses the leased connection; stream one bounded
+        // Java source at a time before parallel ownership/usage insertion.
+        let mut java_references = HashMap::new();
+        for path in code_rel_paths.iter().filter(|path| path.ends_with(".java")) {
+            let content = crate::commands::grep::read_java_syntax_source(
+                &root.join(path),
+                max_file_size_bytes(),
+            )?;
+            java_references.insert(
+                path.clone(),
+                crate::commands::modules::java_resource_references(
+                    &tx,
+                    root,
+                    module_lookup.find(path),
+                    &content,
+                    &namespace_owners,
+                )?,
+            );
+        }
         if progress {
             eprintln!("Scanning resource usages in parallel...");
         }
@@ -4525,12 +4628,24 @@ pub fn index_resources(
                             let [owner] = owners.as_slice() else {
                                 return None;
                             };
-                            resource_ids
-                                .get(res_type)?
-                                .get(res_name)?
+                            let owners = resource_ids.get(res_type)?.get(res_name)?;
+                            if let Some((_, id)) =
+                                owners.iter().find(|(module, _)| *module == Some(*owner))
+                            {
+                                return Some(*id);
+                            }
+                            let dependencies = merged_owners.get(owner)?;
+                            let matches: Vec<_> = owners
                                 .iter()
-                                .find(|(module, _)| *module == Some(*owner))
-                                .map(|(_, id)| *id)
+                                .filter(|(module, _)| {
+                                    module.is_some_and(|id| dependencies.contains(&id))
+                                })
+                                .collect();
+                            let (declaring, id) = matches.first()?;
+                            matches
+                                .iter()
+                                .all(|(other, _)| other == declaring)
+                                .then_some(*id)
                         };
                     let mut usages = Vec::new();
 
@@ -4538,11 +4653,9 @@ pub fn index_resources(
                     // text. Preserve qualified/imported R ownership instead
                     // of silently falling back to a colliding local resource.
                     if rel_path.ends_with(".java") {
-                        let references =
-                            match crate::parsers::treesitter::java::resource_references(&content) {
-                                Ok(references) => references,
-                                Err(_) => return Vec::new(),
-                            };
+                        let Some(references) = java_references.get(rel_path) else {
+                            return Vec::new();
+                        };
                         let mut sites: std::collections::BTreeMap<usize, (usize, Vec<i64>)> =
                             std::collections::BTreeMap::new();
                         for reference in references {
@@ -4553,7 +4666,31 @@ pub fn index_resources(
                                     &reference.name,
                                 )
                             } else {
-                                resolve_resource(&reference.resource_type, &reference.name)
+                                // Java R is owned by its module and explicitly
+                                // merged dependency closure, never an unrelated
+                                // unique resource elsewhere in the workspace.
+                                let owners = resource_ids
+                                    .get(&reference.resource_type)
+                                    .and_then(|types| types.get(&reference.name));
+                                owners.and_then(|owners| {
+                                    if let Some((_, id)) =
+                                        owners.iter().find(|(owner, _)| *owner == module_id)
+                                    {
+                                        return Some(*id);
+                                    }
+                                    let dependencies = merged_owners.get(&module_id?)?;
+                                    let matches: Vec<_> = owners
+                                        .iter()
+                                        .filter(|(owner, _)| {
+                                            owner.is_some_and(|id| dependencies.contains(&id))
+                                        })
+                                        .collect();
+                                    let (declaring, id) = matches.first()?;
+                                    matches
+                                        .iter()
+                                        .all(|(other, _)| other == declaring)
+                                        .then_some(*id)
+                                })
                             };
                             if let Some(id) = resource_id {
                                 let site = sites

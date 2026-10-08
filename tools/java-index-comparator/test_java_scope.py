@@ -10,9 +10,31 @@ import annotation_contracts
 import android_contracts
 import android_syntax_contracts
 import java_resource_contracts
+import android_dependency_contracts
 
 
 class JavaScopeTests(unittest.TestCase):
+    def test_mixed_legacy_xml_failures_leave_java_projection_pending_and_ids_intact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = connect(Path(temporary) / 'evidence.sqlite')
+            self.addCleanup(state.close)
+            state.executescript(SCHEMA)
+            state.execute("INSERT INTO metadata VALUES ('audit_scope','java')")
+            rows = [('mixed-' + feature, feature, 'captured', 'complete', 'fail')
+                    for feature in sorted(android_dependency_contracts.LEGACY_FEATURES)]
+            state.executemany('INSERT INTO checks(id,feature,subject,status,verdict) VALUES (?,?,?,?,?)', rows)
+            android_dependency_contracts.plan_dependencies(state, Path(temporary), java_only=True)
+            self.assertEqual(list(problem_batch(state, 100)), [])
+            self.assertIn(next_check(state)['feature'], android_dependency_contracts.JAVA_FEATURES)
+            for row in rows:
+                retained = state.execute('SELECT id,feature,subject,status,verdict FROM checks WHERE id=?', (row[0],)).fetchone()
+                self.assertEqual(tuple(retained), row)
+                self.assertEqual(state.execute('SELECT status FROM coverage WHERE feature=?', (row[1],)).fetchone()[0], 'out-of-scope')
+            for feature in android_dependency_contracts.JAVA_FEATURES:
+                check = state.execute('SELECT * FROM checks WHERE feature=?', (feature,)).fetchone()
+                state.execute("UPDATE checks SET status='complete',verdict='fail' WHERE id=?", (check['id'],))
+            self.assertEqual({r['feature'] for r in problem_batch(state, 100)}, android_dependency_contracts.JAVA_FEATURES)
+
     def test_java_scope_excludes_xml_only_criteria_preserving_legacy_ids_and_java_ownership(self):
         artifacts = Path(__file__).resolve().parents[2] / '.artifacts/tests'
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -122,7 +144,12 @@ class JavaScopeTests(unittest.TestCase):
                  [], root, java_only=True)
             for feature in JAVA_EXCLUDED_FEATURES:
                 self.assertEqual(state.execute('SELECT status FROM coverage WHERE feature=?', (feature,)).fetchone()[0], 'out-of-scope')
-                self.assertEqual(state.execute('SELECT count(*) FROM checks WHERE feature=?', (feature,)).fetchone()[0], 0)
+                archived = list(state.execute('SELECT status,verdict,expected_json,actual_json FROM checks WHERE feature=?', (feature,)))
+                if feature in android_dependency_contracts.LEGACY_FEATURES:
+                    self.assertEqual([tuple(row) for row in archived], [('pending', None, None, None)])
+                else:
+                    self.assertEqual(archived, [])
+            self.assertNotIn(next_check(state)['feature'], JAVA_EXCLUDED_FEATURES)
             self.assertEqual(annotation_contracts.applicability(state, 'composables')[0], 'out-of-scope')
             self.assertEqual([row['path'] for row in annotation_contracts.applicable_paths(state, 'provides')], ['Example.java'])
             self.assertEqual(state.execute("SELECT count(*) FROM file_inventory WHERE extension IN ('.kts','.pm')").fetchone()[0], 2)

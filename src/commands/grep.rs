@@ -29,7 +29,7 @@ use super::{
 };
 use crate::db;
 
-pub(super) fn read_java_syntax_source(path: &Path, budget: u64) -> Result<String> {
+pub(crate) fn read_java_syntax_source(path: &Path, budget: u64) -> Result<String> {
     let file = std::fs::File::open(path)?;
     anyhow::ensure!(
         file.metadata()?.len() <= budget,

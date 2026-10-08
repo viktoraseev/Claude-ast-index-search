@@ -16,6 +16,7 @@ class StaleEvidence(ToolError):
 
 def verify(evidence: Path, root: Path, binary: Path) -> dict:
     from audit import JAVA_EXCLUDED_FEATURES, required_features, check_scope_filter
+    from android_dependency_contracts import LEGACY_FEATURES
 
     root, binary, evidence = root.resolve(), binary.resolve(), evidence.resolve()
     snapshot, files = source_snapshot(root)
@@ -72,8 +73,13 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
         if state.execute("""SELECT 1 FROM coverage c WHERE c.status='implemented'
             AND NOT EXISTS (SELECT 1 FROM checks k WHERE k.feature=c.feature) LIMIT 1""").fetchone():
             raise ToolError('implemented coverage contract has no executed check')
+        # Mixed legacy expectations stay immutable, including past verdicts.
+        # Their new required Java projections are checked above; historical
+        # XML/mixed rows do not contribute to Java counts or readiness.
+        legacy = tuple(sorted(LEGACY_FEATURES))
         if state.execute("""SELECT 1 FROM checks k JOIN coverage c USING(feature)
-            WHERE c.status='out-of-scope' AND k.verdict='pass' LIMIT 1""").fetchone():
+            WHERE c.status='out-of-scope' AND k.verdict='pass'
+            AND k.feature NOT IN (?,?) LIMIT 1""", legacy).fetchone():
             raise ToolError('foreign checks cannot count toward a final Java audit')
         if state.execute("""SELECT 1 FROM checks k LEFT JOIN coverage c USING(feature)
             WHERE c.feature IS NULL LIMIT 1""").fetchone():
