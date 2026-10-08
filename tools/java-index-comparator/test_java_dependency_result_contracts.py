@@ -51,6 +51,17 @@ class DependencyResultTests(unittest.TestCase):
         self.assertFalse(self.fixture.database.exists())
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['Foreign.kt', 'Sentinel.java'])
 
+    def test_known_remaining_overload_and_external_projection_are_positive_obligations(self):
+        # Neither failure may disappear by being converted to an invalid-Java
+        # guard or by replacing the external List signature with authored Box.
+        for name in ('inherited-overload', 'jdk-list-projection'):
+            self.assertIs(contracts.CASES[name][3], True)
+        self.assertIn('java.util.List<shared.Child>', contracts.CASES['jdk-list-projection'][0])
+        self.assertIn('get(0).instance()', contracts.CASES['jdk-list-projection'][2])
+        self.assertEqual(contracts.CASES['inherited-overload'][2], 'b.choose("x")')
+        self.assertIn('child-overload-control', contracts.VALID_NEGATIVE_CASES)
+        self.assertIs(contracts.CASES['child-overload-control'][3], False)
+
     def test_bad_missing_or_interrupted_results_never_pass_or_close_parents(self):
         self.assertIn(self.feature, required_features())
         before = [tuple(row) for row in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')]

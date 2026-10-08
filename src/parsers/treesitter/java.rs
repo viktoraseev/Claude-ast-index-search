@@ -583,7 +583,7 @@ pub(crate) struct DependencySyntax {
 }
 
 /// Import metadata retains hiding barriers even for inaccessible members.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct DependencyImportDeclaration {
     pub accessible: bool,
     pub member_accessible: bool,
@@ -678,6 +678,11 @@ pub(crate) struct DependencyMemberType {
     pub position: usize,
     pub arity: Option<usize>,
     pub contexts: Vec<String>,
+    pub parameters: Option<Vec<Option<String>>>,
+    pub is_static: bool,
+    pub public: bool,
+    pub private: bool,
+    pub protected: bool,
 }
 
 fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> DependencyMemberType {
@@ -724,6 +729,55 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
             }
             Some(count)
         });
+    let modifiers = member
+        .named_children(&mut member.walk())
+        .find(|child| child.kind() == "modifiers");
+    let modifier = |word| {
+        modifiers.is_some_and(|node| {
+            node.children(&mut node.walk())
+                .any(|child| node_text(content, &child) == word)
+        })
+    };
+    let interface_member = member
+        .parent()
+        .is_some_and(|body| matches!(body.kind(), "interface_body" | "annotation_type_body"));
+    let parameters = member
+        .child_by_field_name("parameters")
+        .and_then(|parameters| {
+            let mut result = Vec::new();
+            for p in parameters
+                .named_children(&mut parameters.walk())
+                .filter(|p| !p.is_extra())
+            {
+                if p.kind() == "spread_parameter" {
+                    return None;
+                }
+                if p.kind() != "formal_parameter" {
+                    continue;
+                }
+                result.push(p.child_by_field_name("type").and_then(|ty| {
+                    // Inference and parameterized formal conversions are separate
+                    // contracts. Never erase them into a guessed overload match.
+                    if ty.kind() == "generic_type"
+                        || parameter(ty, node_text(content, &ty), content)
+                    {
+                        return None;
+                    }
+                    let dimensions = p
+                        .named_children(&mut p.walk())
+                        .filter(|child| child.kind() == "dimensions")
+                        .map(|child| node_text(content, &child))
+                        .collect::<String>();
+                    Some(
+                        format!("{}{dimensions}", node_text(content, &ty))
+                            .chars()
+                            .filter(|c| !c.is_whitespace())
+                            .collect(),
+                    )
+                }));
+            }
+            Some(result)
+        });
     DependencyMemberType {
         path,
         result_type: ty
@@ -736,6 +790,11 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         position: ty.map_or(member.start_byte(), |ty| ty.start_byte()),
         arity,
         contexts: dependency_contexts(member, content, package),
+        parameters,
+        is_static: modifier("static"),
+        public: modifier("public") || interface_member && !modifier("private"),
+        private: modifier("private"),
+        protected: modifier("protected"),
     }
 }
 
@@ -1031,6 +1090,8 @@ fn dependency_declarations(
                         .any(|signature| signature.arity == Some(0))
                     {
                         value.arity = Some(0);
+                        value.parameters = Some(Vec::new());
+                        value.public = true;
                         signatures.push(value);
                         declared_names.insert(method.clone());
                         instance_names.insert(method);

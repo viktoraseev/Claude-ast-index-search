@@ -2237,6 +2237,8 @@ fn java_dependency_declaration(
 struct JavaDependencyType {
     identity: String,
     declaration: crate::parsers::treesitter::java::DependencyImportDeclaration,
+    /// A bounded JDK result contract, never an indexed project declaration.
+    platform: bool,
 }
 
 #[derive(Clone)]
@@ -2294,6 +2296,7 @@ impl JavaDependencyLookup<'_> {
             return Ok(Some(JavaDependencyType {
                 identity: name.to_owned(),
                 declaration: declaration.clone(),
+                platform: false,
             }));
         }
         Ok(
@@ -2301,6 +2304,7 @@ impl JavaDependencyLookup<'_> {
                 .map(|declaration| JavaDependencyType {
                     identity: name.to_owned(),
                     declaration,
+                    platform: false,
                 }),
         )
     }
@@ -2806,7 +2810,370 @@ impl JavaDependencyLookup<'_> {
         Ok(Some(identity))
     }
 
-    /// Instantiate only source-declared class parameters and explicit arguments.
+    /// Resolve fixed-arity source overloads without hiding a parent's other signatures.
+    fn method_candidates(
+        &self,
+        owner: &JavaDependencyType,
+        name: &str,
+        inherited: bool,
+        visiting: &mut HashSet<String>,
+    ) -> Result<
+        Vec<(
+            JavaDependencyType,
+            crate::parsers::treesitter::java::DependencyMemberType,
+        )>,
+    > {
+        if visiting.len() >= 128 || !visiting.insert(owner.identity.clone()) {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        if let Some(signatures) = owner.declaration.value_types.get(&(name.to_owned(), true)) {
+            for signature in signatures {
+                if !inherited
+                    || !signature.private && !(signature.is_static && owner.declaration.interface)
+                {
+                    result.push((owner.clone(), signature.clone()));
+                }
+            }
+        }
+        let mut hiding = Vec::new();
+        for (declaring, signature) in &result {
+            if !signature.private {
+                if let Some(parameters) = self.method_parameters(declaring, signature)? {
+                    hiding.push(parameters);
+                }
+            }
+        }
+        for parent in self.parents(owner)? {
+            for (declaring, signature) in self.method_candidates(&parent, name, true, visiting)? {
+                if !signature.public
+                    && !signature.protected
+                    && declaring.declaration.package != owner.declaration.package
+                {
+                    continue;
+                }
+                if self
+                    .method_parameters(&declaring, &signature)?
+                    .is_some_and(|parameters| hiding.contains(&parameters))
+                {
+                    continue;
+                }
+                if !result.iter().any(|(prior, previous)| {
+                    prior.identity == declaring.identity && previous.position == signature.position
+                }) {
+                    result.push((declaring, signature));
+                }
+            }
+        }
+        visiting.remove(&owner.identity);
+        Ok(result)
+    }
+
+    /// Bind nominal invocation types, retaining uncertainty for generic formals.
+    fn invocation_identity(
+        &self,
+        ty: &str,
+        position: usize,
+        imports: &[(String, bool)],
+    ) -> Result<Option<String>> {
+        let ty = ty.replace("::", ".");
+        let base = ty.trim_end_matches("[]");
+        let suffix = &ty[base.len()..];
+        if base.contains(['<', '?']) {
+            return Ok(None);
+        }
+        if matches!(
+            base,
+            "boolean" | "byte" | "short" | "char" | "int" | "long" | "float" | "double" | "null"
+        ) {
+            return Ok(Some(ty));
+        }
+        if let Some(found) = self.value_type(base, position, imports)? {
+            return Ok(Some(format!("{}{suffix}", found.identity)));
+        }
+        if base.contains('.') && base.chars().next().is_some_and(char::is_lowercase) {
+            return Ok(Some(ty));
+        }
+        if let Some((import, _)) = imports.iter().find(|(import, static_)| {
+            !static_ && !import.ends_with(".*") && import.rsplit('.').next() == Some(base)
+        }) {
+            return Ok(Some(format!("{import}{suffix}")));
+        }
+        if matches!(
+            base,
+            "String"
+                | "Object"
+                | "Integer"
+                | "Long"
+                | "Boolean"
+                | "Double"
+                | "Float"
+                | "Short"
+                | "Byte"
+                | "Character"
+        ) && !self.lexical_type(base)?.0
+            && self.raw(&format!("{}.{base}", self.package))?.is_none()
+            && !self
+                .local_bindings
+                .iter()
+                .any(|(name, _, range)| name == base && range.contains(&position))
+        {
+            return Ok(Some(format!("java.lang.{base}{suffix}")));
+        }
+        Ok(None)
+    }
+
+    fn method_parameters(
+        &self,
+        owner: &JavaDependencyType,
+        signature: &crate::parsers::treesitter::java::DependencyMemberType,
+    ) -> Result<Option<Vec<String>>> {
+        let Some(parameters) = &signature.parameters else {
+            return Ok(None);
+        };
+        let binding = JavaDependencyLookup {
+            package: &owner.declaration.package,
+            contexts: &signature.contexts,
+            ..*self
+        };
+        let mut result = Vec::new();
+        for parameter in parameters {
+            let Some(ty) = parameter else { return Ok(None) };
+            let Some(ty) = binding.invocation_identity(
+                ty,
+                if owner.identity.contains('@') {
+                    signature.position
+                } else {
+                    usize::MAX
+                },
+                &owner.declaration.imports,
+            )?
+            else {
+                return Ok(None);
+            };
+            result.push(ty);
+        }
+        Ok(Some(result))
+    }
+
+    fn invocation_conversion(&self, argument: &str, formal: &str) -> Result<bool> {
+        if argument == formal {
+            return Ok(true);
+        }
+        let primitive = |ty| {
+            matches!(
+                ty,
+                "boolean" | "byte" | "short" | "char" | "int" | "long" | "float" | "double"
+            )
+        };
+        if argument == "null" {
+            return Ok(!primitive(formal));
+        }
+        if primitive(argument) || primitive(formal) {
+            return Ok(matches!(
+                (argument, formal),
+                ("byte", "short" | "int" | "long" | "float" | "double")
+                    | ("short" | "char", "int" | "long" | "float" | "double")
+                    | ("int", "long" | "float" | "double")
+                    | ("long", "float" | "double")
+                    | ("float", "double")
+            ));
+        }
+        if formal == "java.lang.Object" {
+            return Ok(true);
+        }
+        if argument.ends_with("[]") || formal.ends_with("[]") {
+            return Ok(false);
+        }
+        self.subclass(argument, formal, &mut HashSet::new())
+    }
+
+    fn value_method(
+        &self,
+        value: &JavaDependencyValue,
+        name: &str,
+        arguments: &[super::graph::DependencyInvocationArgument],
+        imports: &[(String, bool)],
+    ) -> Result<
+        Option<(
+            String,
+            crate::parsers::treesitter::java::DependencyMemberType,
+        )>,
+    > {
+        let mut applicable = Vec::new();
+        let mut uncertain = false;
+        for (owner, signature) in
+            self.method_candidates(&value.owner, name, false, &mut HashSet::new())?
+        {
+            if signature.arity != Some(arguments.len()) || !value.instance && !signature.is_static {
+                continue;
+            }
+            let allowed = if signature.private {
+                self.private_access(&owner.identity, &owner.declaration.package)
+            } else if signature.public || owner.declaration.package == self.package {
+                true
+            } else if signature.protected {
+                let mut allowed = false;
+                for context in self.contexts {
+                    if self.subclass(context, &owner.identity, &mut HashSet::new())?
+                        && (signature.is_static
+                            || self.subclass(
+                                &value.owner.identity,
+                                context,
+                                &mut HashSet::new(),
+                            )?)
+                    {
+                        allowed = true;
+                    }
+                }
+                allowed
+            } else {
+                false
+            };
+            if !allowed {
+                continue;
+            }
+            let Some(parameters) = self.method_parameters(&owner, &signature)? else {
+                uncertain = true;
+                continue;
+            };
+            let mut compatible = true;
+            let mut unknown = false;
+            for (argument, formal) in arguments.iter().zip(&parameters) {
+                match self.invocation_argument(argument, imports)? {
+                    Some(argument) => {
+                        compatible &= self.invocation_conversion(&argument, formal)?
+                    }
+                    None => unknown = true,
+                }
+            }
+            if compatible {
+                if unknown {
+                    uncertain = true;
+                } else {
+                    applicable.push((owner, signature, parameters));
+                }
+            }
+        }
+        if uncertain {
+            return Ok(None);
+        }
+        let mut best = Vec::new();
+        for (index, (owner, _, parameters)) in applicable.iter().enumerate() {
+            let mut dominated = false;
+            for (other_index, (other, _, other_parameters)) in applicable.iter().enumerate() {
+                if index == other_index {
+                    continue;
+                }
+                let mut more_specific = true;
+                for (other, current) in other_parameters.iter().zip(parameters) {
+                    more_specific &= self.invocation_conversion(other, current)?;
+                }
+                if more_specific
+                    && (other_parameters != parameters
+                        || other.identity != owner.identity
+                            && self.subclass(
+                                &other.identity,
+                                &owner.identity,
+                                &mut HashSet::new(),
+                            )?)
+                {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                best.push(index);
+            }
+        }
+        Ok(if let [index] = best.as_slice() {
+            let (owner, signature, _) = applicable.swap_remove(*index);
+            Some((owner.identity, signature))
+        } else {
+            None
+        })
+    }
+
+    /// Preserve an argument's declared namespace across later local shadows.
+    fn invocation_argument(
+        &self,
+        argument: &super::graph::DependencyInvocationArgument,
+        imports: &[(String, bool)],
+    ) -> Result<Option<String>> {
+        let Some(ty) = &argument.ty else {
+            return Ok(None);
+        };
+        JavaDependencyLookup {
+            contexts: &argument.contexts,
+            ..*self
+        }
+        .invocation_identity(ty, argument.position, imports)
+    }
+
+    /// Instantiate source-declared parameters and bounded known JDK result types.
+    fn platform_result_owner(
+        &self,
+        path: &str,
+        position: usize,
+        imports: &[(String, bool)],
+    ) -> Result<Option<JavaDependencyType>> {
+        use crate::parsers::treesitter::java::DependencyImportDeclaration;
+        // Source/local/import barriers take precedence even when inaccessible.
+        let first = path.split('.').next().unwrap_or(path);
+        if self.lexical_type(first)?.0
+            || self
+                .local_bindings
+                .iter()
+                .any(|(name, _, range)| name == first && range.contains(&position))
+            || self.raw(&format!("{}.{path}", self.package))?.is_some()
+        {
+            return Ok(None);
+        }
+        let identity = if path.contains('.') {
+            path.to_owned()
+        } else if let Some((import, static_)) = imports
+            .iter()
+            .find(|(import, _)| !import.ends_with(".*") && import.rsplit('.').next() == Some(path))
+        {
+            if *static_ {
+                return Ok(None);
+            }
+            import.clone()
+        } else {
+            if imports
+                .iter()
+                .any(|(import, static_)| *static_ && import.ends_with(".*"))
+            {
+                return Ok(None);
+            }
+            let wildcards: Vec<_> = imports
+                .iter()
+                .filter_map(|(import, static_)| {
+                    (!static_).then(|| import.strip_suffix(".*")).flatten()
+                })
+                .collect();
+            let [prefix] = wildcards.as_slice() else {
+                return Ok(None);
+            };
+            format!("{prefix}.{path}")
+        };
+        let parameters = match identity.as_str() {
+            "java.util.List" | "java.util.Optional" | "java.util.function.Supplier" => {
+                vec!["E".to_owned()]
+            }
+            "java.util.Map" => vec!["K".to_owned(), "V".to_owned()],
+            _ => return Ok(None),
+        };
+        Ok(Some(JavaDependencyType {
+            identity,
+            platform: true,
+            declaration: DependencyImportDeclaration {
+                type_parameters: parameters,
+                ..Default::default()
+            },
+        }))
+    }
+
     fn result_value(
         &self,
         signature: &crate::parsers::treesitter::java::DependencyResultType,
@@ -2855,7 +3222,11 @@ impl JavaDependencyLookup<'_> {
                 )
             }
             DependencyResultType::Named(path, arguments) => {
-                let Some(owner) = self.value_type(path, position, imports)? else {
+                let owner = match self.value_type(path, position, imports)? {
+                    Some(owner) => Some(owner),
+                    None => self.platform_result_owner(path, position, imports)?,
+                };
+                let Some(owner) = owner else {
                     return Ok(None);
                 };
                 if !arguments.is_empty()
@@ -3010,9 +3381,11 @@ impl JavaDependencyLookup<'_> {
                 receiver,
                 name,
                 arity,
+                arguments,
             } => {
                 let member = (name.clone(), arity.is_some());
                 let mut receiver_value = None;
+                let mut selected_signature = None;
                 let identity = if let DependencyValueReceiver::Lexical {
                     instances,
                     explicit,
@@ -3038,13 +3411,20 @@ impl JavaDependencyLookup<'_> {
                             if !candidates.is_empty()
                                 || owner.declaration.declared_names.contains(&member)
                             {
-                                receiver_value =
-                                    Some(JavaDependencyValue::nominal(owner.clone(), instance));
-                                found = if instance {
+                                let value = JavaDependencyValue::nominal(owner.clone(), instance);
+                                found = if let Some(arguments) = arguments {
+                                    self.value_method(&value, name, arguments, imports)?.map(
+                                        |(identity, signature)| {
+                                            selected_signature = Some(signature);
+                                            identity
+                                        },
+                                    )
+                                } else if instance {
                                     self.value_member(&owner, &member)?
                                 } else {
                                     self.static_member(&owner.identity, &member)?
                                 };
+                                receiver_value = Some(value);
                                 break;
                             }
                         }
@@ -3056,7 +3436,48 @@ impl JavaDependencyLookup<'_> {
                     else {
                         return Ok(None);
                     };
-                    let identity = if value.instance {
+                    if value.owner.platform {
+                        if !value.instance {
+                            return Ok(None);
+                        }
+                        let index = match (value.owner.identity.as_str(), name.as_str(), arity) {
+                            ("java.util.List", "get", Some(1)) => {
+                                let Some(argument) =
+                                    arguments.as_ref().and_then(|args| args.first())
+                                else {
+                                    return Ok(None);
+                                };
+                                let Some(argument) = self.invocation_argument(argument, imports)?
+                                else {
+                                    return Ok(None);
+                                };
+                                if !self.invocation_conversion(&argument, "int")?
+                                    && argument != "java.lang.Integer"
+                                {
+                                    return Ok(None);
+                                }
+                                0
+                            }
+                            ("java.util.Map", "get", Some(1)) => 1,
+                            (
+                                "java.util.Optional" | "java.util.function.Supplier",
+                                "get",
+                                Some(0),
+                            ) => 0,
+                            _ => return Ok(None),
+                        };
+                        // This is result projection only. External declarations
+                        // must never be recorded as a project dependency owner.
+                        return Ok(value.arguments.get(index).and_then(Clone::clone));
+                    }
+                    let identity = if let Some(arguments) = arguments {
+                        self.value_method(&value, name, arguments, imports)?.map(
+                            |(identity, signature)| {
+                                selected_signature = Some(signature);
+                                identity
+                            },
+                        )
+                    } else if value.instance {
                         self.value_member(&value.owner, &member)?
                     } else {
                         self.static_member(&value.owner.identity, &member)?
@@ -3070,18 +3491,24 @@ impl JavaDependencyLookup<'_> {
                 let Some(owner) = self.raw(&identity)? else {
                     return Ok(None);
                 };
-                let Some(signatures) = owner.declaration.value_types.get(&member) else {
-                    return Ok(None);
+                let signature = match selected_signature {
+                    Some(signature) => signature,
+                    None => {
+                        let Some(signatures) = owner.declaration.value_types.get(&member) else {
+                            return Ok(None);
+                        };
+                        let mut signatures = signatures
+                            .iter()
+                            .filter(|signature| arity.is_none() || signature.arity == *arity);
+                        let Some(signature) = signatures.next() else {
+                            return Ok(None);
+                        };
+                        if signatures.next().is_some() {
+                            return Ok(None);
+                        }
+                        signature.clone()
+                    }
                 };
-                let mut signatures = signatures
-                    .iter()
-                    .filter(|signature| arity.is_none() || signature.arity == *arity);
-                let Some(signature) = signatures.next() else {
-                    return Ok(None);
-                };
-                if signatures.next().is_some() {
-                    return Ok(None);
-                }
                 let Some(result_type) = &signature.result_type else {
                     return Ok(None);
                 };
@@ -3560,8 +3987,12 @@ fn count_symbols_used_in_module(
                 if let Some(value) =
                     accessing.value_receiver(chain, &syntax.imports, &mut identities, 0)?
                 {
-                    let key = (member.name, member.method);
-                    let identity = if value.instance {
+                    let key = (member.name.clone(), member.method);
+                    let identity = if let Some(arguments) = &member.arguments {
+                        accessing
+                            .value_method(&value, &member.name, arguments, &syntax.imports)?
+                            .map(|(identity, _)| identity)
+                    } else if value.instance {
                         accessing.value_member(&value.owner, &key)?
                     } else {
                         accessing.static_member(&value.owner.identity, &key)?
@@ -3583,9 +4014,19 @@ fn count_symbols_used_in_module(
                     contexts: &member.use_contexts,
                     ..lookup
                 };
-                if let Some(identity) =
+                let identity = if let Some(arguments) = &member.arguments {
+                    accessing
+                        .value_method(
+                            &JavaDependencyValue::nominal(owner, true),
+                            &member.name,
+                            arguments,
+                            &syntax.imports,
+                        )?
+                        .map(|(identity, _)| identity)
+                } else {
                     accessing.value_member(&owner, &(member.name, member.method))?
-                {
+                };
+                if let Some(identity) = identity {
                     identities.insert(identity);
                 }
             }
@@ -3610,6 +4051,7 @@ fn count_symbols_used_in_module(
             let owner = JavaDependencyType {
                 identity: identity.clone(),
                 declaration: declaration.clone(),
+                platform: false,
             };
             for parent in lookup.parents(&owner)? {
                 if !parent.identity.contains('@') && parent.declaration.accessible {

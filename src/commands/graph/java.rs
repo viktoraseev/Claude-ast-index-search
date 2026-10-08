@@ -2289,7 +2289,7 @@ fn collector_projection(
 
 /// Value members reuse graph variable scopes and exact declaration sites.
 /// Source result chains retain explicit class arguments and initializer scope;
-/// argument-type overload selection remains a separate unresolved contract.
+/// Invocation argument types remain explicit; unknown inference stays unresolved.
 pub(crate) struct DependencyValueMember {
     pub path: String,
     pub position: usize,
@@ -2298,6 +2298,13 @@ pub(crate) struct DependencyValueMember {
     pub name: String,
     pub method: bool,
     pub chain: Option<DependencyValueReceiver>,
+    pub arguments: Option<Vec<DependencyInvocationArgument>>,
+}
+
+pub(crate) struct DependencyInvocationArgument {
+    pub ty: Option<String>,
+    pub position: usize,
+    pub contexts: Vec<String>,
 }
 
 pub(crate) enum DependencyValueReceiver {
@@ -2320,6 +2327,7 @@ pub(crate) enum DependencyValueReceiver {
         receiver: Box<DependencyValueReceiver>,
         name: String,
         arity: Option<usize>,
+        arguments: Option<Vec<DependencyInvocationArgument>>,
     },
 }
 
@@ -2328,6 +2336,35 @@ pub(crate) fn dependency_value_members(
     package: &str,
 ) -> Result<Vec<DependencyValueMember>> {
     use crate::parsers::treesitter::java::{dependency_contexts, dependency_instances};
+    fn arguments(
+        node: Node<'_>,
+        source: &str,
+        scopes: &VariableScopes,
+        tree: &tree_sitter::Tree,
+        declarations: &HashMap<usize, InvocationOwner>,
+        package: &str,
+    ) -> Option<Vec<DependencyInvocationArgument>> {
+        let owner = callable(node).unwrap_or(node);
+        Some(
+            node.child_by_field_name("arguments")?
+                .named_children(&mut node.child_by_field_name("arguments")?.walk())
+                .filter(|child| !child.is_extra())
+                .map(|argument| {
+                    let position = expression_receiver_site(argument, source, scopes, declarations)
+                        .map_or(argument.start_byte(), |site| site.position);
+                    let binding = tree
+                        .root_node()
+                        .descendant_for_byte_range(position, position + 1)
+                        .unwrap_or(argument);
+                    DependencyInvocationArgument {
+                        ty: invocation_argument_type(argument, owner, source, scopes, 0),
+                        position,
+                        contexts: dependency_contexts(binding, source, package),
+                    }
+                })
+                .collect(),
+        )
+    }
     fn is_static(node: Node<'_>, source: &str) -> bool {
         let mut cursor = node.walk();
         let found = node.named_children(&mut cursor).any(|child| {
@@ -2520,11 +2557,13 @@ pub(crate) fn dependency_value_members(
                 }),
                 name: text(node.child_by_field_name("name")?, source).to_owned(),
                 arity: Some(argument_count(node)?),
+                arguments: arguments(node, source, scopes, tree, declarations, package),
             }),
             "field_access" => Some(DependencyValueReceiver::Member {
                 receiver: Box::new(nested(node.child_by_field_name("object")?)?),
                 name: text(node.child_by_field_name("field")?, source).to_owned(),
                 arity: None,
+                arguments: None,
             }),
             // An unbound syntax name is a type qualifier only when receiver
             // inference did not detect a value shadow or unknown binding.
@@ -2620,6 +2659,7 @@ pub(crate) fn dependency_value_members(
                     name: text(member, source).to_owned(),
                     method,
                     chain: None,
+                    arguments: arguments(node, source, &scopes, &tree, &declarations, package),
                 });
             }
         } else if let Some(chain) = parameter.or_else(|| {
@@ -2638,6 +2678,7 @@ pub(crate) fn dependency_value_members(
                 name: text(member, source).to_owned(),
                 method,
                 chain: Some(chain),
+                arguments: arguments(node, source, &scopes, &tree, &declarations, package),
             });
         }
         WalkControl::Continue
@@ -2688,6 +2729,7 @@ mod dependency_value_tests {
             receiver,
             name,
             arity,
+            ..
         } = receiver.as_ref()
         else {
             panic!("inferred invocation lost its source chain");

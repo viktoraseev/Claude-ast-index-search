@@ -12,8 +12,8 @@ REASON = ('independent source/javac/CLI: explicit class generic result substitut
           'fields/records/inheritance and initializer-site var chains with access, '
           'ambiguity and attached classpath guards; not MCP equivalence')
 
-# Each input has an authored declaring owner. Guards intentionally use invalid
-# Java and must remain uncredited, rather than become evidence of resolution.
+# Each input has an authored declaring owner. Invalid-Java guards must remain
+# uncredited; VALID_NEGATIVE_CASES separately compile valid ownership controls.
 CASES = {
     'generic': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'b.get().instance()', True),
     'inferred': ('class Box { shared.Child get(){return null;} }', 'Box b', 'var c=b.get(); return c.instance()', True),
@@ -24,6 +24,32 @@ CASES = {
     'inherited-result': ('class Box<T> { T get(){return null;} } class Wrap<U> extends Box<U> {}', 'Wrap<shared.Child> b', 'b.get().instance()', True),
     'record-result': ('record Box<T>(T value) {}', 'Box<shared.Child> b', 'b.value().instance()', True),
     'record-projection': ('class Box<T> { T get(){return null;} } record Wrap<U>(Box<U> value) {}', 'Wrap<shared.Child> b', 'b.value().get().instance()', True),
+    'inherited-overload': ('', 'shared.Child b', 'b.choose("x")', True),
+    'jdk-list-projection': ('record Box(java.util.List<shared.Child> values) {}', 'Box b', 'b.values().get(0).instance()', True),
+    'inherited-overload-variable': ('', 'shared.Child b, String value', 'b.choose(value)', True),
+    'inherited-overload-null': ('', 'shared.Child b', 'b.choose(null)', True),
+    'child-overload-control': ('', 'shared.Child b', 'b.choose(0)', False),
+    'overloaded-result': ('class Box { shared.Child get(String value){return null;} Object get(int value){return null;} }', 'Box b', 'b.get("x").instance()', True),
+    'overload-private-sibling': ('class Box { shared.Child get(String value){return null;} private Object get(int value){return null;} }', 'Box b', 'b.get("x").instance()', True),
+    'argument-declaration-site': ('class Arg {} class Box { shared.Child get(Arg value){return null;} Object get(int value){return null;} }', 'Box b, Arg value', 'class Arg {} return b.get(value).instance()', True),
+    'argument-local-shadow-guard': ('class Arg {} class Box { shared.Child get(Arg value){return null;} Object get(int value){return null;} }', 'Box b', 'class Arg {} Arg value=new Arg(); return b.get(value).instance()', False),
+    'inherited-overloaded-result': ('class Parent<T> { T get(String value){return null;} } class Box<T> extends Parent<T> { Object get(int value){return null;} }', 'Box<shared.Child> b', 'b.get("x").instance()', True),
+    'inherited-arity-result': ('class Parent<T> { T get(int value){return null;} } class Box<T> extends Parent<T> { Object get(){return null;} }', 'Box<shared.Child> b', 'b.get(0).instance()', True),
+    'jdk-imported-list': ('import java.util.List; record Box(List<shared.Child> values) {}', 'Box b', 'var c=b.values().get(0); return c.instance()', True),
+    'jdk-wildcard-list': ('import java.util.*; record Box(List<shared.Child> values) {}', 'Box b', 'b.values().get(0).instance()', True),
+    'jdk-nested-projection': ('record Box(java.util.Map<String,java.util.List<shared.Child>> values) {}', 'Box b', 'b.values().get("x").get(0).instance()', True),
+    'jdk-optional-projection': ('record Box(java.util.Optional<shared.Child> value) {}', 'Box b', 'b.value().get().instance()', True),
+    'jdk-supplier-projection': ('record Box(java.util.function.Supplier<shared.Child> value) {}', 'Box b', 'b.value().get().instance()', True),
+    'inherited-overload-arity-guard': ('', 'shared.Child b', 'b.choose()', False),
+    'inherited-overload-type-guard': ('', 'shared.Child b', 'b.choose(new Object())', False),
+    'overloaded-result-type-guard': ('class Box { shared.Child get(String value){return null;} Object get(int value){return null;} }', 'Box b', 'b.get(0).instance()', False),
+    'overload-private-guard': ('class Box { public Object get(String value){return null;} private shared.Child get(int value){return null;} }', 'Box b', 'b.get(0).instance()', False),
+    'jdk-index-type-guard': ('record Box(java.util.List<shared.Child> values) {}', 'Box b', 'b.values().get(0L).instance()', False),
+    'jdk-list-arity-guard': ('record Box(java.util.List<shared.Child> values) {}', 'Box b', 'b.values().get().instance()', False),
+    'jdk-list-wildcard-guard': ('record Box(java.util.List<?> values) {}', 'Box b', 'b.values().get(0).instance()', False),
+    'jdk-list-raw-guard': ('record Box(java.util.List values) {}', 'Box b', 'b.values().get(0).instance()', False),
+    'jdk-shadow-guard': ('class List<T> { Object get(int value){return null;} } record Box(List<shared.Child> values) {}', 'Box b', 'b.values().get(0).instance()', False),
+    'jdk-static-guard': ('record Box(java.util.List<shared.Child> values) {}', 'Box b', 'java.util.List.get(0).instance()', False),
     'capture': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'var c=b.get(); return ((java.util.function.IntSupplier)()->c.instance()).getAsInt()', True),
     'reference': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'var c=b.get(); return ((java.util.function.IntSupplier)c::instance).getAsInt()', True),
     'later-shadow': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'var c=b.get(); class Child {} return c.instance()', True),
@@ -44,6 +70,10 @@ CASES = {
     'block-guard': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', '{var c=b.get();} return c.instance()', False),
     'sibling-guard': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'var c=b.get(); return 0; } int other(){return c.instance()', False),
 }
+
+# Valid calls selecting the child overload must not borrow the parent's owner.
+# This is a positive Java compilation with an authored negative ownership result.
+VALID_NEGATIVE_CASES = {'child-overload-control'}
 
 
 def plan_results(state, root):
@@ -78,15 +108,15 @@ def exercise(binary, base):
 
         write('base/build.gradle', 'plugins {}')
         write('lib/build.gradle', 'dependencies { api(project(":base")) }')
-        base_source = write('base/Base.java', 'package shared; public class Base { public int instance(){return 1;} }')
-        child_source = write('lib/Child.java', 'package shared; public class Child extends Base {}')
+        base_source = write('base/Base.java', 'package shared; public class Base { public int instance(){return 1;} public int choose(String value){return 2;} }')
+        child_source = write('lib/Child.java', 'package shared; public class Child extends Base { public int choose(int value){return 3;} }')
         valid, invalid = [], []
         for label, (declarations, parameter, body, used) in CASES.items():
             body = body if 'return ' in body else 'return ' + body
             source = 'package fixture.' + label.replace('-', '_') + '; ' + declarations + ' class Use { int run(' + parameter + '){' + body + ';} }'
             path = write(label + '/Use.java', source)
             write(label + '/build.gradle', 'dependencies { implementation(project(":base")); implementation(project(":lib")) }')
-            if used:
+            if used or label in VALID_NEGATIVE_CASES:
                 valid.append(path)
             else:
                 invalid.append(path)
