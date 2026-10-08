@@ -246,8 +246,9 @@ def exercise_java(binary, base):
             expected['unused-deps:java-android-ownership'][label] = value
             actual['unused-deps:java-android-ownership'][label] = dependency_observation(output, verbose)
         for label, flags, used, strict in (
-                ('strict', ('--strict', '--verbose'), [], True),
-                ('no-transitive', ('--no-transitive', '--verbose'), ['views', 'views.child', 'reslib'], False)):
+                ('strict:default-switches', ('--strict', '--verbose'), [], True),
+                ('no-transitive:with-java-class-tags', ('--no-transitive', '--verbose'),
+                 ['views', 'views.child', 'reslib'], False)):
             _, output = runner.command('unused-deps', 'app', *flags)
             wanted = {'summary': [6 - len(used), 0, len(used), 6],
                       'unused': sorted(set(dep.replace('/', '.') for dep in deps) - set(used)),
@@ -260,9 +261,9 @@ def exercise_java(binary, base):
                       'Resource-samples': ['@string/shared (code)'] if used else []}
             expected['unused-deps:java-android-ownership'][label] = wanted
             actual['unused-deps:java-android-ownership'][label] = dependency_observation(output, True)
-        # Strict and no-transitive were Java-applicable criteria in the
-        # archived mixed family too. Retain them without XML resource-reference
-        # syntax inputs; ordinary tags referring to Java classes stay covered.
+        # Retain the existing keys/expectations for these direct-Java controls.
+        # The separately named variants above must not be overwritten: they
+        # preserve the no-transitive Java-class-tag ownership assertion too.
         for label, flags, source_key, strict in (
                 ('strict', ('--strict', '--verbose'), str((False, False, True)), True),
                 ('no-transitive', ('--no-transitive', '--no-xml', '--verbose'),

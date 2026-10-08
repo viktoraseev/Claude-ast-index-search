@@ -198,6 +198,21 @@ fn sync_watch_roots(
     Ok(())
 }
 
+/// Pair registration/availability transitions with an index reconciliation.
+fn refresh_watch_roots(
+    provider: &mut notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
+    roots: &mut BTreeMap<PathBuf, bool>,
+    current: BTreeMap<PathBuf, bool>,
+    reconciliation_pending: &mut bool,
+) -> Result<()> {
+    if current != *roots {
+        sync_watch_roots(provider, roots, &current)?;
+        *roots = current;
+        *reconciliation_pending = true;
+    }
+    Ok(())
+}
+
 /// Print a stable watcher status. Callers that only need the exit status use
 /// `--quiet`; the CLI exits successfully only while this project is watched.
 pub fn cmd_watch_status(root: &Path, quiet: bool, format: &str) -> Result<bool> {
@@ -283,11 +298,12 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
         if let Some(ref mut provider) = debouncer {
             match watch_roots(root) {
                 Ok(current) => {
-                    if current != roots {
-                        sync_watch_roots(provider, &roots, &current)?;
-                        roots = current;
-                        reconciliation_pending = true;
-                    }
+                    refresh_watch_roots(
+                        provider,
+                        &mut roots,
+                        current,
+                        &mut reconciliation_pending,
+                    )?;
                 }
                 Err(error) => eprintln!("Update error: {}", error),
             }
@@ -361,12 +377,11 @@ pub fn cmd_watch(root: &Path) -> Result<()> {
                 return Err(anyhow::anyhow!("Channel error: {}", e));
             }
         }
-        // Config can attach another owner during the update itself. Register
-        // it before waiting for the next notification, closing the startup gap.
+        // Config or availability can change during the update itself. Register
+        // and reconcile that transition even when native notifications miss it.
         if let Some(ref mut provider) = debouncer {
             if let Ok(current) = watch_roots(root) {
-                sync_watch_roots(provider, &roots, &current)?;
-                roots = current;
+                refresh_watch_roots(provider, &mut roots, current, &mut reconciliation_pending)?;
             }
         }
     }
@@ -451,6 +466,63 @@ fn update_index(root: &Path) -> Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_root_return_after_update_is_reconciled_without_notifications() {
+        let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let fixture = tempfile::tempdir_in(artifacts).unwrap();
+        let root = fixture.path().join("project");
+        let extra = fixture.path().join("build");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(root.join("Left.java"), "class WatchScopeLeft {}\n").unwrap();
+        std::fs::write(extra.join("Probe.java"), "class WatchScopeAttached {}\n").unwrap();
+        let mut conn = rusqlite::Connection::open(fixture.path().join("index.sqlite")).unwrap();
+        db::init_db(&conn).unwrap();
+        // The disposable sources are under this checkout's ignored .artifacts.
+        conn.execute("INSERT INTO metadata VALUES ('no_ignore', '1')", [])
+            .unwrap();
+        db::add_extra_root(&conn, &extra.to_string_lossy()).unwrap();
+        indexer::update_directory_incremental(&mut conn, &root, false, None, None).unwrap();
+        assert_eq!(
+            db::search_symbols(&conn, "WatchScope*", 100).unwrap().len(),
+            2
+        );
+
+        // Complete the unavailable-root scan first. Recreate the directory
+        // before the bottom-of-loop poll, without depending on OS event timing.
+        std::fs::remove_dir_all(&extra).unwrap();
+        indexer::update_directory_incremental(&mut conn, &root, false, None, None).unwrap();
+        let mut roots = BTreeMap::from([(root.clone(), true), (extra.clone(), false)]);
+        let (tx, _rx) = mpsc::channel();
+        let mut provider = new_debouncer(Duration::from_millis(500), tx).unwrap();
+        sync_watch_roots(&mut provider, &BTreeMap::new(), &roots).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        std::fs::write(extra.join("Probe.java"), "class WatchScopeReturned {}\n").unwrap();
+        let mut pending = false;
+        let current = BTreeMap::from([(root.clone(), true), (extra.clone(), true)]);
+        refresh_watch_roots(&mut provider, &mut roots, current.clone(), &mut pending).unwrap();
+        // The next idle iteration has no notification. It must still scan.
+        if pending {
+            indexer::update_directory_incremental(&mut conn, &root, false, None, None).unwrap();
+            pending = false;
+        }
+        let mut names: Vec<_> = db::search_symbols(&conn, "WatchScope*", 100)
+            .unwrap()
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["WatchScopeLeft", "WatchScopeReturned"]);
+
+        // Idle polls must not schedule repeated walks, or clear a failed update.
+        refresh_watch_roots(&mut provider, &mut roots, current.clone(), &mut pending).unwrap();
+        assert!(!pending);
+        pending = true;
+        refresh_watch_roots(&mut provider, &mut roots, current, &mut pending).unwrap();
+        assert!(pending);
+    }
 
     #[test]
     fn java_watch_events_include_directory_tombstones_and_module_descriptors() {

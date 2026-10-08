@@ -81,6 +81,20 @@ class AndroidDependencyContracts(unittest.TestCase):
         with patch.object(contracts, 'exercise', side_effect=ToolError('synthetic interruption')):
             self.assertEqual(self.evaluate(sorted(contracts.FEATURES)[0])['verdict'], 'error')
 
+    def test_java_projection_retains_both_no_transitive_switch_variants(self):
+        expected, actual = contracts.exercise_java(self.binary, self.directory)
+        feature = 'unused-deps:java-android-ownership'
+        samples = expected[feature]
+        self.assertIn('no-transitive:with-java-class-tags', samples)
+        self.assertEqual(samples['no-transitive:with-java-class-tags']['XML'], [('views', 2), ('views.child', 1)])
+        self.assertEqual(samples['no-transitive:with-java-class-tags']['Resource'], [('reslib', 1)])
+        self.assertEqual(samples['no-transitive']['XML'], [])
+        self.assertEqual(samples['no-transitive']['Resource'], [('reslib', 1)])
+        self.assertIn('strict:default-switches', samples)
+        self.assertTrue(samples['strict:default-switches']['strict'])
+        for projection in contracts.JAVA_FEATURES:
+            self.assertEqual(actual[projection], expected[projection])
+
     def test_resume_fingerprint_and_artifact_boundary(self):
         original, read = adapter_digest(), Path.read_bytes
         with patch.object(Path, 'read_bytes', lambda p: read(p) + (
