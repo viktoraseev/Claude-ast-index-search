@@ -2296,13 +2296,33 @@ pub(crate) struct DependencyValueMember {
     pub use_contexts: Vec<String>,
     pub name: String,
     pub method: bool,
+    pub chain: Option<DependencyValueReceiver>,
+}
+
+pub(crate) enum DependencyValueReceiver {
+    Nominal {
+        path: String,
+        position: usize,
+        contexts: Vec<String>,
+        instance: bool,
+    },
+    Lexical {
+        instances: std::collections::BTreeSet<String>,
+        explicit: bool,
+    },
+    Super,
+    Member {
+        receiver: Box<DependencyValueReceiver>,
+        name: String,
+        arity: Option<usize>,
+    },
 }
 
 pub(crate) fn dependency_value_members(
     source: &str,
     package: &str,
 ) -> Result<Vec<DependencyValueMember>> {
-    use crate::parsers::treesitter::java::dependency_contexts;
+    use crate::parsers::treesitter::java::{dependency_contexts, dependency_instances};
     fn is_static(node: Node<'_>, source: &str) -> bool {
         let mut cursor = node.walk();
         let found = node.named_children(&mut cursor).any(|child| {
@@ -2343,6 +2363,110 @@ pub(crate) fn dependency_value_members(
             declaration = node.parent();
         }
         true
+    }
+    fn instance_context(mut node: Node<'_>, source: &str) -> bool {
+        loop {
+            if node.kind() == "static_initializer"
+                || matches!(node.kind(), "method_declaration" | "field_declaration")
+                    && is_static(node, source)
+            {
+                return false;
+            }
+            if matches!(node.kind(), "class_body" | "interface_body" | "enum_body") {
+                return true;
+            }
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+    fn chain_receiver(
+        node: Node<'_>,
+        source: &str,
+        tree: &tree_sitter::Tree,
+        scopes: &VariableScopes,
+        declarations: &HashMap<usize, InvocationOwner>,
+        package: &str,
+        depth: usize,
+    ) -> Option<DependencyValueReceiver> {
+        if depth >= 16 || node.has_error() {
+            return None;
+        }
+        let owner = callable(node).unwrap_or(node);
+        let inferred = expression_receiver(node, owner, source, scopes, 0);
+        let site = expression_receiver_site(node, source, scopes, declarations);
+        let nominal = match &inferred {
+            JavaReceiver::Declared { receiver, site } => match receiver.as_ref() {
+                JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => {
+                    Some((path, site.position))
+                }
+                _ => None,
+            },
+            JavaReceiver::Type(path) | JavaReceiver::Parameterized { path, .. } => {
+                site.as_ref().map(|site| (path, site.position))
+            }
+            _ => None,
+        };
+        if let Some((path, position)) = nominal {
+            let ty = tree
+                .root_node()
+                .descendant_for_byte_range(position, position + 1)?;
+            return available(node, ty, source).then(|| DependencyValueReceiver::Nominal {
+                path: path.replace("::", "."),
+                position,
+                contexts: dependency_contexts(ty, source, package),
+                instance: true,
+            });
+        }
+        let nested =
+            |node| chain_receiver(node, source, tree, scopes, declarations, package, depth + 1);
+        if node.kind() == "field_access" {
+            if let Some(path) = method_reference_type(node, source, scopes, 0) {
+                return Some(DependencyValueReceiver::Nominal {
+                    path: path.replace("::", "."),
+                    position: node.start_byte(),
+                    contexts: dependency_contexts(node, source, package),
+                    instance: false,
+                });
+            }
+        }
+        match node.kind() {
+            "parenthesized_expression" => nested(node.named_child(0)?),
+            "this" => instance_context(node, source).then(|| DependencyValueReceiver::Lexical {
+                instances: dependency_instances(node, source, package),
+                explicit: true,
+            }),
+            "super" => instance_context(node, source).then_some(DependencyValueReceiver::Super),
+            "method_invocation" => Some(DependencyValueReceiver::Member {
+                receiver: Box::new(match node.child_by_field_name("object") {
+                    Some(object) => nested(object)?,
+                    None => DependencyValueReceiver::Lexical {
+                        instances: dependency_instances(node, source, package),
+                        explicit: false,
+                    },
+                }),
+                name: text(node.child_by_field_name("name")?, source).to_owned(),
+                arity: Some(argument_count(node)?),
+            }),
+            "field_access" => Some(DependencyValueReceiver::Member {
+                receiver: Box::new(nested(node.child_by_field_name("object")?)?),
+                name: text(node.child_by_field_name("field")?, source).to_owned(),
+                arity: None,
+            }),
+            // An unbound syntax name is a type qualifier only when receiver
+            // inference did not detect a value shadow or unknown binding.
+            "identifier" | "scoped_identifier" => match inferred {
+                JavaReceiver::Type(path) => Some(DependencyValueReceiver::Nominal {
+                    path: path.replace("::", "."),
+                    position: node.start_byte(),
+                    contexts: dependency_contexts(node, source, package),
+                    instance: false,
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
     }
     let tree = parse_tree(source, &LANGUAGE)?;
     let declarations = callable_declarations(tree.root_node(), source);
@@ -2397,8 +2521,25 @@ pub(crate) fn dependency_value_members(
                     use_contexts: dependency_contexts(node, source, package),
                     name: text(member, source).to_owned(),
                     method,
+                    chain: None,
                 });
             }
+        } else if let Some(chain) = matches!(
+            object.kind(),
+            "method_invocation" | "field_access" | "parenthesized_expression"
+        )
+        .then(|| chain_receiver(object, source, &tree, &scopes, &declarations, package, 0))
+        .flatten()
+        {
+            result.push(DependencyValueMember {
+                path: String::new(),
+                position: node.start_byte(),
+                contexts: Vec::new(),
+                use_contexts: dependency_contexts(node, source, package),
+                name: text(member, source).to_owned(),
+                method,
+                chain: Some(chain),
+            });
         }
         WalkControl::Continue
     });

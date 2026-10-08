@@ -592,6 +592,8 @@ pub(crate) struct DependencyImportDeclaration {
     pub protected_names: std::collections::HashSet<(String, bool)>,
     pub instance_names: std::collections::HashSet<(String, bool)>,
     pub protected_instance_names: std::collections::HashSet<(String, bool)>,
+    pub private_static_names: std::collections::HashSet<(String, bool)>,
+    pub private_instance_names: std::collections::HashSet<(String, bool)>,
     pub package_member: bool,
     pub static_member: bool,
     pub static_names: std::collections::HashSet<(String, bool)>,
@@ -601,6 +603,68 @@ pub(crate) struct DependencyImportDeclaration {
     pub package: String,
     pub imports: Vec<(String, bool)>,
     pub interface: bool,
+    /// Exact nominal field/return types; ambiguous overloads retain all signatures.
+    pub value_types: std::collections::HashMap<(String, bool), Vec<DependencyMemberType>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DependencyMemberType {
+    pub path: Option<String>,
+    pub position: usize,
+    pub arity: Option<usize>,
+    pub contexts: Vec<String>,
+}
+
+fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> DependencyMemberType {
+    fn parameter(mut node: Node<'_>, name: &str, content: &str) -> bool {
+        loop {
+            if let Some(parameters) = node.child_by_field_name("type_parameters") {
+                let mut cursor = parameters.walk();
+                if parameters.named_children(&mut cursor).any(|parameter| {
+                    parameter
+                        .named_child(0)
+                        .is_some_and(|identifier| node_text(content, &identifier) == name)
+                }) {
+                    return true;
+                }
+            }
+            let Some(parent) = node.parent() else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+    let ty = member.child_by_field_name("type");
+    // Arrays, type variables and generic projections need signature inference;
+    // their erasure is not evidence of a nominal result receiver.
+    let path = ty
+        .filter(|ty| {
+            matches!(ty.kind(), "type_identifier" | "scoped_type_identifier")
+                && !parameter(*ty, node_text(content, ty), content)
+                && !member
+                    .named_children(&mut member.walk())
+                    .any(|n| n.kind() == "dimensions")
+        })
+        .map(|ty| node_text(content, &ty).to_owned());
+    let arity = member
+        .child_by_field_name("parameters")
+        .and_then(|parameters| {
+            let mut count = 0;
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if parameter.kind() == "spread_parameter" {
+                    return None;
+                }
+                count += usize::from(parameter.kind() == "formal_parameter");
+            }
+            Some(count)
+        });
+    DependencyMemberType {
+        path,
+        position: ty.map_or(member.start_byte(), |ty| ty.start_byte()),
+        arity,
+        contexts: dependency_contexts(member, content, package),
+    }
 }
 
 /// Keep local declarations distinct even when names and source lines collide.
@@ -767,9 +831,12 @@ fn dependency_declarations(
         let mut protected_names = std::collections::HashSet::new();
         let mut instance_names = std::collections::HashSet::new();
         let mut protected_instance_names = std::collections::HashSet::new();
+        let mut private_static_names = std::collections::HashSet::new();
+        let mut private_instance_names = std::collections::HashSet::new();
         let mut static_names = std::collections::HashSet::new();
         let mut declared_names = std::collections::HashSet::new();
         let mut package_names = std::collections::HashSet::new();
+        let mut value_types = std::collections::HashMap::<_, Vec<_>>::new();
         if let Some(body) = node.child_by_field_name("body") {
             super::walk_tree_preorder(&body, |member| {
                 if member.id() == body.id() || member.kind() == "enum_body_declarations" {
@@ -804,6 +871,13 @@ fn dependency_declarations(
                             protected_instance_names.insert(key.clone());
                         }
                     }
+                    if modifier(member, content, "private") {
+                        if is_static {
+                            private_static_names.insert(key.clone());
+                        } else {
+                            private_instance_names.insert(key.clone());
+                        }
+                    }
                     if allowed {
                         if is_static {
                             static_names.insert(key);
@@ -815,7 +889,11 @@ fn dependency_declarations(
                 if member.kind() == "method_declaration" {
                     if let Some(name) = member.child_by_field_name("name") {
                         let key = (node_text(content, &name).to_owned(), true);
-                        record(key);
+                        record(key.clone());
+                        value_types
+                            .entry(key)
+                            .or_default()
+                            .push(dependency_member_type(member, content, &package));
                     }
                 } else {
                     let mut cursor = member.walk();
@@ -825,7 +903,15 @@ fn dependency_declarations(
                     {
                         if let Some(name) = variable.child_by_field_name("name") {
                             let key = (node_text(content, &name).to_owned(), false);
-                            record(key);
+                            record(key.clone());
+                            let mut value = dependency_member_type(member, content, &package);
+                            if variable
+                                .named_children(&mut variable.walk())
+                                .any(|n| n.kind() == "dimensions")
+                            {
+                                value.path = None;
+                            }
+                            value_types.entry(key).or_default().push(value);
                         }
                     }
                 }
@@ -887,6 +973,8 @@ fn dependency_declarations(
                 protected_names,
                 instance_names,
                 protected_instance_names,
+                private_static_names,
+                private_instance_names,
                 package_member: package_member(node, content),
                 static_member,
                 static_names,
@@ -899,6 +987,7 @@ fn dependency_declarations(
                     node.kind(),
                     "interface_declaration" | "annotation_type_declaration"
                 ),
+                value_types,
             },
         );
         if qualified.is_some() {
@@ -1048,6 +1137,67 @@ pub(crate) fn dependency_contexts(node: Node<'_>, content: &str, package: &str) 
     result
 }
 
+/// Instance availability is occurrence-scoped, including each enclosing capture.
+pub(crate) fn dependency_instances(
+    node: Node<'_>,
+    content: &str,
+    package: &str,
+) -> std::collections::BTreeSet<String> {
+    let owners = dependency_contexts(node, content, package);
+    let mut allowed = std::collections::BTreeSet::new();
+    let mut parent = Some(node);
+    let mut instance = true;
+    let mut owner_index = 0;
+    while let Some(scope) = parent {
+        let is_static = {
+            let mut cursor = scope.walk();
+            let found = scope
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "modifiers")
+                .is_some_and(|modifiers| {
+                    let mut cursor = modifiers.walk();
+                    let found = modifiers
+                        .children(&mut cursor)
+                        .any(|child| child.kind() == "static");
+                    found
+                });
+            found
+        };
+        if scope.kind() == "static_initializer"
+            || is_static && matches!(scope.kind(), "method_declaration" | "field_declaration")
+        {
+            instance = false;
+        }
+        if matches!(
+            scope.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+        ) {
+            if scope
+                .child_by_field_name("body")
+                .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
+            {
+                if instance {
+                    if let Some(owner) = owners.get(owner_index) {
+                        allowed.insert(owner.clone());
+                    }
+                }
+                owner_index += 1;
+            }
+            // Static nested types retain their own instance, but cannot
+            // borrow an enclosing one. Lambdas preserve the current this.
+            if is_static || scope.kind() != "class_declaration" {
+                instance = false;
+            }
+        }
+        parent = scope.parent();
+    }
+    allowed
+}
+
 pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     fn spelling(node: tree_sitter::Node<'_>, content: &str) -> String {
         let mut parts = Vec::new();
@@ -1088,57 +1238,11 @@ pub(crate) fn dependency_syntax(content: &str) -> Result<DependencySyntax> {
     ) {
         let owners = dependency_contexts(node, content, &result.package);
         let key = (name, method, owners.clone());
-        let allowed = result.instance_contexts.entry(key.clone()).or_default();
-        let mut parent = Some(node);
-        let mut instance = true;
-        let mut owner_index = 0;
-        while let Some(scope) = parent {
-            let is_static = {
-                let mut cursor = scope.walk();
-                let found = scope
-                    .named_children(&mut cursor)
-                    .find(|child| child.kind() == "modifiers")
-                    .is_some_and(|modifiers| {
-                        let mut cursor = modifiers.walk();
-                        let found = modifiers
-                            .children(&mut cursor)
-                            .any(|child| child.kind() == "static");
-                        found
-                    });
-                found
-            };
-            if scope.kind() == "static_initializer"
-                || is_static && matches!(scope.kind(), "method_declaration" | "field_declaration")
-            {
-                instance = false;
-            }
-            if matches!(
-                scope.kind(),
-                "class_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "record_declaration"
-                    | "annotation_type_declaration"
-            ) {
-                if scope
-                    .child_by_field_name("body")
-                    .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
-                {
-                    if instance {
-                        if let Some(owner) = owners.get(owner_index) {
-                            allowed.insert(owner.clone());
-                        }
-                    }
-                    owner_index += 1;
-                }
-                // Static nested types retain their own instance, but cannot
-                // borrow an enclosing one. Lambdas preserve the current this.
-                if is_static || scope.kind() != "class_declaration" {
-                    instance = false;
-                }
-            }
-            parent = scope.parent();
-        }
+        result
+            .instance_contexts
+            .entry(key.clone())
+            .or_default()
+            .extend(dependency_instances(node, content, &result.package));
         result.member_uses.insert(key);
     }
     let mut result = DependencySyntax::default();

@@ -16,6 +16,8 @@ REASON = ('independent source/state and javac: inherited Java member type/static
           'enclosing-subclass/sibling/import guards, inherited lexical instance fields/methods '
           'and interface defaults, occurrence-owned local subclass inheritance and lexical superclass '
           'binding/hiding with static-context boundaries, nominal value-qualified receiver declaration sites, '
+          'nominal field/return chains, inherited/this/super/private lexical results, occurrence-scoped '
+          'captures and declaring-import/arity/access/array guards, '
           'inherited member ownership and protected qualifier guards in default/strict JSON/text; not MCP equivalence')
 
 
@@ -69,6 +71,14 @@ def plan_imports(state, root):
                     'resolution remain pending; not MCP equivalence')
             state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
                           "AND instr(reason,?)=0", (note, parent, note))
+            note = ('; separate executed nominal chain ownership fixture covers field/method-result chains, '
+                    'inherited/protected/this/super/private lexical results, occurrence-scoped captures/imports, static factories, '
+                    'new/casts/references and access/arity/ambiguous-result/array/static-context guards '
+                    'across attached roots, JSON/text, strict/options and refresh; generic projections, '
+                    'inference, signature dispatch, implicit record results and classpath-order ownership '
+                    'remain pending; independent source/javac/CLI, not MCP equivalence')
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,?)=0", (note, parent, note))
 
 
 def exercise(binary, base):
@@ -107,6 +117,22 @@ def exercise(binary, base):
         'base/Other.java': 'package shared; public interface Other { class Token {} int FLAG=2; }',
         'base/HiddenBase.java': 'package shared; class HiddenBase { public static class Exported {} public static int EXPORTED=1; }',
         'lib/Child.java': 'package shared; public class Child extends Parent {}',
+        'base/ParentBox.java': '''package shared; public class ParentBox {
+            public Parent inherited; public Parent inheritedGet(){return inherited;}
+            protected Parent protectedGet(){return inherited;}
+        }''',
+        'lib/ImportedBox.java': '''package bridge; import shared.Child;
+            public class ImportedBox { public Child get(){return null;} }''',
+        'lib/Box.java': '''package shared; public class Box extends ParentBox {
+            public Child value; public Box next;
+            public Child get(){return value;} public static Child make(){return null;}
+            public Child get(int n){return value;}
+            private Child hidden; private Child secret(){return value;}
+            public Object unknown(){return value;}
+            public Child choose(String x){return value;} public LocalBase choose(Integer x){return null;}
+            public Child[] array(){return null;}
+            public Child postfix()[]{return null;}
+        }''',
         'lib/VALUEOBJ.java': 'package shared; public class VALUEOBJ {}',
         'lib/HiddenChild.java': 'package shared; public class HiddenChild extends HiddenBase {}',
         'lib/Left.java': 'package shared; public interface Left extends Port {}',
@@ -129,6 +155,39 @@ def exercise(binary, base):
         }''',
     }
     cases = [
+        ('chain-field', 'class Use { int run(shared.Box b){return b.value.instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-return', 'class Use { int run(shared.Box b){return b.get().OPEN;} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-multi', 'class Use { int run(shared.Box b){return b.next.next.get(1).instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-static', 'class Use { int run(){return shared.Box.make().instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-new', 'class Use { int run(){return new shared.Box().get().instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-cast', 'class Use { int run(Object b){return ((shared.Box)b).value.instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-reference', 'class Use { java.util.function.IntSupplier run(shared.Box b){return b.get()::instance;} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-capture', 'class Use { void run(shared.Box b){class Local {int read(){return b.value.instance();}}} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-local-return', 'class Use { shared.Child provide(){return null;} int run(){return provide().instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('chain-later-shadow', 'import shared.Box; class Use { int run(Box b){class Box {} return b.value.instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-private-field', 'class Use { int run(shared.Box b){return b.hidden.instance();} }', False, {'lib': ['Box']}),
+        ('chain-private-return', 'class Use { int run(shared.Box b){return b.secret().instance();} }', False, {'lib': ['Box']}),
+        ('chain-ambiguous-return', 'class Use { int run(shared.Box b){return b.choose(null).instance();} }', False, {'lib': ['Box']}),
+        ('chain-unknown-return', 'class Use { int run(shared.Box b){return b.unknown().instance();} }', False, {'lib': ['Box']}),
+        ('chain-array-guard', 'class Use { int run(shared.Box b){return b.array().instance();} }', False, {'lib': ['Box']}),
+        ('chain-static-context', 'class Use { shared.Box b; static int run(){return b.value.instance();} }', False, {'lib': ['Box']}),
+        ('chain-inherited-field', 'class Use { int run(shared.Box b){return b.inherited.instance();} }', True, {'base': ['Parent', 'ParentBox'], 'lib': ['Box']}),
+        ('chain-inherited-return', 'class Use { int run(shared.Box b){return b.inheritedGet().instance();} }', True, {'base': ['Parent', 'ParentBox'], 'lib': ['Box']}),
+        ('chain-protected-return', 'class Use extends shared.Box { int run(){return protectedGet().instance();} }', True, {'base': ['Parent', 'ParentBox'], 'lib': ['Box']}),
+        ('chain-protected-guard', 'class Use extends shared.Box { int run(shared.Box b){return b.protectedGet().instance();} }', False, {'lib': ['Box']}),
+        ('chain-declaring-import', 'class Child {} class Use { int run(bridge.ImportedBox b){return b.get().instance();} }', True, {'base': ['Parent'], 'lib': ['ImportedBox']}),
+        ('chain-postfix-array', 'class Use { int run(shared.Box b){return b.postfix().instance();} }', False, {'lib': ['Box']}),
+        ('chain-arity-guard', 'class Use { int run(shared.Box b){return b.get(1,2).instance();} }', False, {'lib': ['Box']}),
+        ('chain-static-qualifier', 'class Use { int run(){return shared.Box.get().instance();} }', False, {'lib': ['Box']}),
+        ('chain-this-return', 'class Use extends shared.Box { int run(){return this.get().instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-super-return', 'class Use extends shared.Box { int run(){return super.get().instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
+        ('chain-own-private', 'class Use { private shared.Child provide(){return null;} int run(){return provide().instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('chain-private-capture', 'class Use { private shared.Child provide(){return null;} void run(){class Local {int read(){return provide().instance();}}} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('chain-private-static', 'class Use { private static shared.Child provide(){return null;} static int run(){return provide().instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('chain-private-sibling', 'class Use { private shared.Child provide(){return null;} } class Peer { int run(Use u){return u.provide().instance();} }', False, {'lib': ['Child']}),
+        ('chain-private-static-capture', 'class Use { private shared.Child provide(){return null;} static void run(){class Local {int read(){return provide().instance();}}} }', False, {'lib': ['Child']}),
+        ('chain-explicit-this-guard', 'class Use { private shared.Child provide(){return null;} void run(){class Local {int read(){return this.provide().instance();}}} }', False, {'lib': ['Child']}),
+        ('chain-private-result', 'class Use { private static class Inner extends shared.Child {} private Inner provide(){return null;} int run(){return provide().instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('value-parameter', 'class Use { int run(shared.Child x){return x.OPEN+x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('value-local', 'class Use { int run(){shared.Child x=null; return x.OPEN+x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
         ('value-field', 'class Use { shared.Child x; int run(){return this.x.OPEN+this.x.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
@@ -343,6 +402,10 @@ def exercise(binary, base):
         record('value-option:' + ','.join(flags),
                [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Child'])],
                [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+        document = runner.json('unused-deps', 'attached::chain-multi', '--verbose', *flags)
+        record('chain-option:' + ','.join(flags),
+               [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Box'])],
+               [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
         document = runner.json('unused-deps', 'attached::static-field', '--verbose', *flags)
         transitive = '--no-transitive' not in flags
         record('option:' + ','.join(flags), [('attached::base', 'direct', ['Parent']),
@@ -370,6 +433,12 @@ def exercise(binary, base):
            [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
     _, text = runner.command('unused-deps', 'attached::value-parameter')
     record('value-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
+    document = runner.json('unused-deps', 'attached::chain-inherited-return')
+    record('chain-nonverbose', [('attached::base', 'direct', 2, False),
+                               ('attached::lib', 'direct', 1, False)],
+           [(r['name'], r['category'], r['usage']['direct'], 'examples' in r) for r in document['items']])
+    _, text = runner.command('unused-deps', 'attached::chain-inherited-return')
+    record('chain-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
     document = runner.json('unused-deps', 'attached::instance-protected')
     record('instance-nonverbose', [('attached::base', 'direct', 1, False),
                                   ('attached::lib', 'direct', 1, False)],
@@ -390,6 +459,8 @@ def exercise(binary, base):
     record('protected-nonverbose-text', True, 'Total: 0 unused, 0 exported, 2 used of 2 dependencies' in text)
     record('local-selection', 'missing_module', runner.json('--local', 'unused-deps', 'attached::member-types').get('empty_reason'))
     record('cwd-selection', 'missing_module', runner.json('unused-deps', 'attached::member-types', cwd=runner.root / 'lib').get('empty_reason'))
+    record('chain-local-selection', 'missing_module', runner.json('--local', 'unused-deps', 'attached::chain-multi').get('empty_reason'))
+    record('chain-cwd-selection', 'missing_module', runner.json('unused-deps', 'attached::chain-multi', cwd=runner.root / 'lib').get('empty_reason'))
     for args in (('rebuild', '--type', 'modules'), ('update',)):
         runner.command(*args)
         record('refresh:' + args[0], ['Exported'], runner.json('unused-deps', 'attached::hidden-owner-type', '--verbose')['items'][0]['examples']['direct'])
@@ -404,6 +475,11 @@ def exercise(binary, base):
                             ('value-reference', ['Parent']),
                             ('value-protected-guard', []),
                             ('value-protected-subclass', ['Parent']),
+                            ('chain-multi', ['Parent']),
+                            ('chain-inherited-return', ['Parent', 'ParentBox']),
+                            ('chain-declaring-import', ['Parent']),
+                            ('chain-protected-guard', []),
+                            ('chain-ambiguous-return', []),
                             ('local-import-type-hiding', []),
                             ('local-self-parent-guard', [])]:
             record('protected-refresh:' + args[0] + ':' + label, want,

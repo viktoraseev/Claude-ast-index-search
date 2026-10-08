@@ -2299,6 +2299,26 @@ impl JavaDependencyLookup<'_> {
         Ok(false)
     }
 
+    fn private_access(&self, name: &str, package: &str) -> bool {
+        let prefix = if package.is_empty() {
+            String::new()
+        } else {
+            format!("{package}.")
+        };
+        let Some(nest) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.split('.').next())
+        else {
+            return false;
+        };
+        self.contexts.iter().any(|context| {
+            context
+                .strip_prefix(&prefix)
+                .and_then(|context| context.split('.').next())
+                == Some(nest)
+        })
+    }
+
     fn direct(&self, name: &str) -> Result<Option<JavaDependencyType>> {
         let Some(mut found) = self.raw(name)? else {
             return Ok(None);
@@ -2306,7 +2326,8 @@ impl JavaDependencyLookup<'_> {
         if !found.declaration.accessible {
             let mut allowed = true;
             for (owner, protected) in &found.declaration.access_barriers {
-                allowed &= *protected && self.protected_access(owner)?;
+                allowed &= self.private_access(owner, &found.declaration.package)
+                    || *protected && self.protected_access(owner)?;
             }
             found.declaration.accessible = allowed;
         }
@@ -2332,6 +2353,18 @@ impl JavaDependencyLookup<'_> {
                 .declaration
                 .instance_names
                 .extend(found.declaration.protected_instance_names.iter().cloned());
+        }
+        // Private members are available inside the declaring top-level nest,
+        // including nested/local captures; they are never inherited by a child.
+        if !self.resolving_parent && self.private_access(name, &found.declaration.package) {
+            found
+                .declaration
+                .static_names
+                .extend(found.declaration.private_static_names.iter().cloned());
+            found
+                .declaration
+                .instance_names
+                .extend(found.declaration.private_instance_names.iter().cloned());
         }
         Ok(Some(found))
     }
@@ -2593,9 +2626,13 @@ impl JavaDependencyLookup<'_> {
         let refreshed = self.direct(&owner.identity)?;
         let owner = refreshed.as_ref().unwrap_or(owner);
         if owner.declaration.declared_names.contains(member) {
-            if (owner.declaration.static_names.contains(member)
-                && !(inherited && member.1 && owner.declaration.interface))
-                || allow_instance && owner.declaration.instance_names.contains(member)
+            let private_inherited = inherited
+                && (owner.declaration.private_static_names.contains(member)
+                    || owner.declaration.private_instance_names.contains(member));
+            if !private_inherited
+                && ((owner.declaration.static_names.contains(member)
+                    && !(inherited && member.1 && owner.declaration.interface))
+                    || allow_instance && owner.declaration.instance_names.contains(member))
             {
                 matches.insert(owner.identity.clone());
             }
@@ -2733,6 +2770,147 @@ impl JavaDependencyLookup<'_> {
             }
         }
         Ok(Some(identity))
+    }
+
+    /// Bind nominal chains without guessing an inaccessible or overloaded result.
+    fn value_receiver(
+        &self,
+        receiver: &super::graph::DependencyValueReceiver,
+        imports: &[(String, bool)],
+        identities: &mut std::collections::BTreeSet<String>,
+        depth: usize,
+    ) -> Result<Option<(JavaDependencyType, bool)>> {
+        use super::graph::DependencyValueReceiver;
+        if depth >= 16 {
+            return Ok(None);
+        }
+        match receiver {
+            DependencyValueReceiver::Nominal {
+                path,
+                position,
+                contexts,
+                instance,
+            } => {
+                let binding = JavaDependencyLookup { contexts, ..*self };
+                Ok(binding
+                    .value_type(path, *position, imports)?
+                    .map(|owner| (owner, *instance)))
+            }
+            DependencyValueReceiver::Lexical { instances, .. } => Ok(match self.contexts.first() {
+                Some(context) => self
+                    .raw(context)?
+                    .map(|owner| (owner, instances.contains(context))),
+                None => None,
+            }),
+            DependencyValueReceiver::Super => {
+                let Some(context) = self.contexts.first() else {
+                    return Ok(None);
+                };
+                let Some(owner) = self.raw(context)? else {
+                    return Ok(None);
+                };
+                let mut parents = self
+                    .parents(&owner)?
+                    .into_iter()
+                    .filter(|parent| !parent.declaration.interface);
+                let Some(parent) = parents.next() else {
+                    return Ok(None);
+                };
+                Ok(parents.next().is_none().then_some((parent, true)))
+            }
+            DependencyValueReceiver::Member {
+                receiver,
+                name,
+                arity,
+            } => {
+                let member = (name.clone(), arity.is_some());
+                let identity = if let DependencyValueReceiver::Lexical {
+                    instances,
+                    explicit,
+                } = receiver.as_ref()
+                {
+                    // An enclosing callable's result remains available inside
+                    // captures, but a hiding declaration reserves the name.
+                    let mut found = None;
+                    for context in
+                        self.contexts
+                            .iter()
+                            .take(if *explicit { 1 } else { self.contexts.len() })
+                    {
+                        let instance = instances.contains(context);
+                        if let Some(owner) = self.raw(context)? {
+                            let candidates = self.member_origins(
+                                &owner,
+                                &member,
+                                false,
+                                instance,
+                                &mut HashSet::new(),
+                            )?;
+                            if !candidates.is_empty()
+                                || owner.declaration.declared_names.contains(&member)
+                            {
+                                found = if instance {
+                                    self.value_member(&owner, &member)?
+                                } else {
+                                    self.static_member(&owner.identity, &member)?
+                                };
+                                break;
+                            }
+                        }
+                    }
+                    found
+                } else {
+                    let Some((owner, instance)) =
+                        self.value_receiver(receiver, imports, identities, depth + 1)?
+                    else {
+                        return Ok(None);
+                    };
+                    if instance {
+                        self.value_member(&owner, &member)?
+                    } else {
+                        self.static_member(&owner.identity, &member)?
+                    }
+                };
+                let Some(identity) = identity else {
+                    return Ok(None);
+                };
+                let Some(owner) = self.raw(&identity)? else {
+                    return Ok(None);
+                };
+                let Some(signatures) = owner.declaration.value_types.get(&member) else {
+                    return Ok(None);
+                };
+                let mut signatures = signatures
+                    .iter()
+                    .filter(|signature| arity.is_none() || signature.arity == *arity);
+                let Some(signature) = signatures.next() else {
+                    return Ok(None);
+                };
+                if signatures.next().is_some() {
+                    return Ok(None);
+                }
+                let Some(path) = &signature.path else {
+                    return Ok(None);
+                };
+                let binding = JavaDependencyLookup {
+                    contexts: &signature.contexts,
+                    package: &owner.declaration.package,
+                    ..*self
+                };
+                // Byte coordinates from another file cannot bind a local
+                // declaration in the consumer merely because offsets collide.
+                let position = if identity.contains('@') {
+                    signature.position
+                } else {
+                    usize::MAX
+                };
+                let found = binding.value_type(path, position, &owner.declaration.imports)?;
+                if found.is_some() {
+                    identities.insert(identity);
+                }
+                Ok(found.map(|owner| (owner, true)))
+            }
+        }
     }
 }
 
@@ -3169,6 +3347,26 @@ fn count_symbols_used_in_module(
             }
         }
         for member in super::graph::dependency_value_members(&content, &syntax.package)? {
+            if let Some(chain) = &member.chain {
+                let accessing = JavaDependencyLookup {
+                    contexts: &member.use_contexts,
+                    ..lookup
+                };
+                if let Some((owner, instance)) =
+                    accessing.value_receiver(chain, &syntax.imports, &mut identities, 0)?
+                {
+                    let key = (member.name, member.method);
+                    let identity = if instance {
+                        accessing.value_member(&owner, &key)?
+                    } else {
+                        accessing.static_member(&owner.identity, &key)?
+                    };
+                    if let Some(identity) = identity {
+                        identities.insert(identity);
+                    }
+                }
+                continue;
+            }
             let binding = JavaDependencyLookup {
                 contexts: &member.contexts,
                 ..lookup

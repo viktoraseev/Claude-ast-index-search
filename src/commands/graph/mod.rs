@@ -37,7 +37,7 @@
 //! the full stored graph; their output rows are restricted to the selection.
 
 mod java;
-pub(crate) use java::dependency_value_members;
+pub(crate) use java::{dependency_value_members, DependencyValueReceiver};
 mod metrics;
 mod resolve;
 mod rust;
