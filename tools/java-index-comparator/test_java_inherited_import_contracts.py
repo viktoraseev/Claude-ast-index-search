@@ -22,6 +22,17 @@ class InheritedImportContracts(unittest.TestCase):
     def test_inherited_imports_execute_production_and_javac(self):
         expected, actual = contracts.exercise(self.binary, self.directory)
         for feature in contracts.FEATURES:
+            for label in ('record-accessor', 'record-explicit-accessor', 'record-overload',
+                          'record-other-component', 'record-import-site', 'record-local',
+                          'record-member-result', 'record-own-member',
+                          'record-own-field', 'record-nest-field', 'record-private-field',
+                          'record-array-guard', 'record-spread-guard', 'record-static-field'):
+                self.assertIn('javac:' + label, expected[feature])
+                for scope in ('all', 'attached'):
+                    for mode in ('default', 'strict'):
+                        key = scope + ':' + label + ':' + mode
+                        self.assertIn(key, expected[feature])
+                        self.assertIn(key + ':text', expected[feature])
             differences = [key for key in expected[feature] if expected[feature][key] != actual[feature].get(key)]
             self.assertEqual(differences, [])
 

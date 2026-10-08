@@ -2336,15 +2336,24 @@ pub(crate) fn dependency_value_members(
     fn available(call: Node<'_>, ty: Node<'_>, source: &str) -> bool {
         let mut declaration = Some(ty);
         while let Some(node) = declaration {
-            if node.kind() == "field_declaration" {
-                if !node
-                    .child_by_field_name("type")
-                    .is_some_and(|field_type| field_type.byte_range().contains(&ty.start_byte()))
-                    || is_static(node, source)
+            let record_component = node.kind() == "record_declaration"
+                && node
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| parameters.byte_range().contains(&ty.start_byte()));
+            if node.kind() == "field_declaration" || record_component {
+                if !record_component
+                    && (!node.child_by_field_name("type").is_some_and(|field_type| {
+                        field_type.byte_range().contains(&ty.start_byte())
+                    }) || is_static(node, source))
                 {
                     return true;
                 }
-                let body = node.parent().map(|body| body.id());
+                let body = if record_component {
+                    node.child_by_field_name("body")
+                } else {
+                    node.parent()
+                }
+                .map(|body| body.id());
                 let mut context = Some(call);
                 while let Some(node) = context {
                     if Some(node.id()) == body {
@@ -2548,6 +2557,24 @@ pub(crate) fn dependency_value_members(
 
 #[cfg(test)]
 mod dependency_value_tests {
+    #[test]
+    fn record_component_receivers_require_the_declaring_instance() {
+        let source = r#"record Probe(shared.Child value) {
+            int valid() { return value.instance(); }
+            static int invalid() { return value.instance(); }
+            java.util.function.IntSupplier capture() { return () -> value.instance(); }
+            static class Peer { int invalid() { return value.instance(); } }
+            static int parameter(shared.Child value) { return value.instance(); }
+        }"#;
+        let members = super::dependency_value_members(source, "").unwrap();
+        assert_eq!(members.len(), 3);
+        assert!(members
+            .iter()
+            .all(|member| member.path == "shared.Child" && member.name == "instance"));
+        assert_eq!(members[0].position, members[1].position);
+        assert_ne!(members[0].position, members[2].position);
+    }
+
     #[test]
     fn static_fields_and_local_instances_keep_their_own_type_sites() {
         let source = r#"class Probe {

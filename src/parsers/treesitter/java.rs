@@ -918,6 +918,52 @@ fn dependency_declarations(
                 super::WalkControl::SkipChildren
             });
         }
+        if node.kind() == "record_declaration" {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                let mut cursor = parameters.walk();
+                for component in parameters.named_children(&mut cursor).filter(|component| {
+                    matches!(component.kind(), "formal_parameter" | "spread_parameter")
+                }) {
+                    let component_name = component.child_by_field_name("name").or_else(|| {
+                        component
+                            .named_children(&mut component.walk())
+                            .find(|child| child.kind() == "variable_declarator")
+                            .and_then(|variable| variable.child_by_field_name("name"))
+                    });
+                    let Some(component_name) = component_name else {
+                        continue;
+                    };
+                    let component_name = node_text(content, &component_name).to_owned();
+                    let mut value = dependency_member_type(component, content, &package);
+                    // Component types are declared in the record header, but
+                    // may name the record's own member types.
+                    if value.contexts.first() != Some(&name) {
+                        value.contexts.insert(0, name.clone());
+                    }
+                    if component.kind() == "spread_parameter" {
+                        value.path = None;
+                    }
+                    let field = (component_name.clone(), false);
+                    declared_names.insert(field.clone());
+                    private_instance_names.insert(field.clone());
+                    value_types.entry(field).or_default().push(value.clone());
+
+                    let method = (component_name, true);
+                    let signatures = value_types.entry(method.clone()).or_default();
+                    // An overload does not replace the implicit accessor. An
+                    // explicitly declared zero-argument accessor does.
+                    if !signatures
+                        .iter()
+                        .any(|signature| signature.arity == Some(0))
+                    {
+                        value.arity = Some(0);
+                        signatures.push(value);
+                        declared_names.insert(method.clone());
+                        instance_names.insert(method);
+                    }
+                }
+            }
+        }
         let mut parents = Vec::new();
         let mut cursor = node.walk();
         for branch in node.named_children(&mut cursor).filter(|child| {
@@ -1307,9 +1353,13 @@ pub(crate) fn dependency_contexts(node: Node<'_>, content: &str, package: &str) 
                 | "enum_declaration"
                 | "record_declaration"
                 | "annotation_type_declaration"
-        ) && owner
+        ) && (owner
             .child_by_field_name("body")
             .is_some_and(|body| body.byte_range().contains(&node.start_byte()))
+            || owner.kind() == "record_declaration"
+                && owner
+                    .child_by_field_name("parameters")
+                    .is_some_and(|parameters| parameters.byte_range().contains(&node.start_byte())))
         {
             result.push(dependency_type_identity(owner, content, package));
         }
@@ -2885,6 +2935,57 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             .protected_names
             .contains(&("SECRET".into(), false)));
         assert!(!declaration.static_names.contains(&("SECRET".into(), false)));
+    }
+
+    #[test]
+    fn dependency_record_members_keep_implicit_accessors_and_private_fields() {
+        let source = r#"package fixture; import other.Child;
+public record Carrier(Child value, Child other, Child[] array, Child... spread) {
+    public Child value(int n) { return value; }
+    public Child other() { return other; }
+}"#;
+        let declaration = dependency_import_declaration(source, "fixture.Carrier", "consumer")
+            .unwrap()
+            .unwrap();
+        for name in ["value", "other", "array", "spread"] {
+            let method = (name.to_owned(), true);
+            let field = (name.to_owned(), false);
+            assert!(declaration.instance_names.contains(&method), "{name}");
+            assert!(declaration.declared_names.contains(&field), "{name}");
+            assert!(
+                declaration.private_instance_names.contains(&field),
+                "{name}"
+            );
+            assert!(!declaration.instance_names.contains(&field), "{name}");
+            assert!(!declaration.static_names.contains(&method), "{name}");
+            assert!(!declaration.package_names.contains(&method), "{name}");
+        }
+        let values = &declaration.value_types[&("value".into(), true)];
+        assert_eq!(values.len(), 2);
+        assert!(values.iter().any(|value| value.arity == Some(0)
+            && value.path.as_deref() == Some("Child")
+            && value.position == source.find("Child value").unwrap()));
+        assert!(values.iter().any(|value| value.arity == Some(1)));
+        let tree = parse_tree(source, &JAVA_LANGUAGE).unwrap();
+        let position = source.find("Child value").unwrap();
+        let ty = tree
+            .root_node()
+            .descendant_for_byte_range(position, position + 1)
+            .unwrap();
+        assert_eq!(
+            dependency_contexts(ty, source, "fixture"),
+            ["fixture.Carrier"]
+        );
+        // A user-declared accessor replaces only its zero-argument signature.
+        assert_eq!(declaration.value_types[&("other".into(), true)].len(), 1);
+        for name in ["array", "spread"] {
+            assert!(declaration.value_types[&(name.into(), true)][0]
+                .path
+                .is_none());
+            assert!(declaration.value_types[&(name.into(), false)][0]
+                .path
+                .is_none());
+        }
     }
 
     #[test]

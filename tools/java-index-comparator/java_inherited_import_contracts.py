@@ -18,6 +18,8 @@ REASON = ('independent source/state and javac: inherited Java member type/static
           'binding/hiding with static-context boundaries, nominal value-qualified receiver declaration sites, '
           'nominal field/return chains, inherited/this/super/private lexical results, occurrence-scoped '
           'captures and declaring-import/arity/access/array guards, '
+          'nominal record accessors/backing fields with explicit accessor/overload, local/nested/nest access, '
+          'component-site import, capture and static/array/spread/primitive guards, '
           'inherited member ownership and protected qualifier guards in default/strict JSON/text; not MCP equivalence')
 
 
@@ -53,6 +55,14 @@ def plan_imports(state, root):
                     'fields and methods, interface defaults/diamonds, enclosing captures and static-context guards; '
                     'value-qualified receivers, local subclass superclass hiding, overload signature lookup, '
                     'external/platform and classpath-order resolution remain pending; not MCP equivalence')
+            state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
+                          "AND instr(reason,?)=0", (note, parent, note))
+            note = ('; separate executed nominal record member checklist covers implicit/explicit accessors '
+                    'and overloads, private backing fields and nest access, local/nested records, component-site '
+                    'imports, new/cast/var/captures/references, static/access/arity/array/spread/primitive guards, '
+                    'attached classpath ownership, strict/options/JSON/text and refresh; generic record result '
+                    'substitution, other signature inference/dispatch and recorded parent obligations remain '
+                    'pending; independent source/javac/CLI, not MCP equivalence')
             state.execute("UPDATE coverage SET reason=reason || ? WHERE feature=? AND status='pending' "
                           "AND instr(reason,?)=0", (note, parent, note))
             note = ('; separate executed nominal value member ownership fixture covers parameters/locals/fields, '
@@ -123,6 +133,24 @@ def exercise(binary, base):
         }''',
         'lib/ImportedBox.java': '''package bridge; import shared.Child;
             public class ImportedBox { public Child get(){return null;} }''',
+        'lib/Carrier.java': '''package shared; public record Carrier(Child value, Child other) {
+            public Child value(int n){return value;}
+        }''',
+        'lib/ExplicitCarrier.java': '''package shared; public record ExplicitCarrier(Child value) {
+            public Child value(){return value;}
+        }''',
+        'lib/ArrayCarrier.java': 'package shared; public record ArrayCarrier(Child[] values) {}',
+        'lib/SpreadCarrier.java': 'package shared; public record SpreadCarrier(Child... values) {}',
+        'lib/PrimitiveCarrier.java': 'package shared; public record PrimitiveCarrier(int value) {}',
+        'lib/ImportedCarrier.java': '''package bridge; import shared.Child;
+            public record ImportedCarrier(Child value) {}''',
+        'lib/RecordNest.java': '''package shared; public class RecordNest {
+            public record Carrier(Child value) {}
+            private record Hidden(Child value) {}
+        }''',
+        'lib/RecordMembers.java': '''package shared; public record RecordMembers(Inner value) {
+            public static class Inner extends Child {}
+        }''',
         'lib/Box.java': '''package shared; public class Box extends ParentBox {
             public Child value; public Box next;
             public Child get(){return value;} public static Child make(){return null;}
@@ -155,6 +183,35 @@ def exercise(binary, base):
         }''',
     }
     cases = [
+        ('record-accessor', 'class Use { int run(shared.Carrier b){return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-other-component', 'class Use { int run(shared.Carrier b){return b.other().OPEN;} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-explicit-accessor', 'class Use { int run(shared.ExplicitCarrier b){return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['ExplicitCarrier']}),
+        ('record-overload', 'class Use { int run(shared.Carrier b){return b.value(1).instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-import-site', 'class Child {} class Use { int run(bridge.ImportedCarrier b){return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['ImportedCarrier']}),
+        ('record-nested', 'class Use { int run(shared.RecordNest.Carrier b){return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-member-result', 'class Use { int run(shared.RecordMembers b){return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['RecordMembers']}),
+        ('record-local', 'class Use { int run(){record Local(shared.Child value) {} Local b=null; return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-new', 'class Use { int run(){return new shared.Carrier(null,null).value().instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-cast', 'class Use { int run(Object b){return ((shared.Carrier)b).value().instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-var', 'class Use { int run(){var b=new shared.Carrier(null,null); return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-reference', 'class Use { java.util.function.IntSupplier run(shared.Carrier b){return b.value()::instance;} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-capture', 'class Use { void run(shared.Carrier b){class Local {int read(){return b.value().instance();}}} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-declaration-site', 'import shared.Carrier; class Use { int run(Carrier b){record Carrier(int other) {} return b.value().instance();} }', True, {'base': ['Parent'], 'lib': ['Carrier']}),
+        ('record-own-field', 'record Use(shared.Child value) { int run(){return value.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-own-member', 'record Use(Inner value) { static class Inner extends shared.Child {} int run(){return value.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-own-this-field', 'record Use(shared.Child value) { int run(){return this.value.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-own-accessor', 'record Use(shared.Child value) { int run(){return value().instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-nest-field', 'class Use { record Local(shared.Child value) {} int run(Local b){return b.value.instance();} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-local-field', 'class Use { void run(){record Local(shared.Child value) {int read(){return this.value.instance();}}} }', True, {'base': ['Parent'], 'lib': ['Child']}),
+        ('record-private-field', 'class Use { int run(shared.Carrier b){return b.value.instance();} }', False, {'lib': ['Carrier']}),
+        ('record-hidden-type', 'class Use { int run(shared.RecordNest.Hidden b){return b.value().instance();} }', False, {}),
+        ('record-static-qualifier', 'class Use { int run(){return shared.Carrier.value().instance();} }', False, {'lib': ['Carrier']}),
+        ('record-wrong-arity', 'class Use { int run(shared.Carrier b){return b.value(1,2).instance();} }', False, {'lib': ['Carrier']}),
+        ('record-array-guard', 'class Use { int run(shared.ArrayCarrier b){return b.values().instance();} }', False, {'lib': ['ArrayCarrier']}),
+        ('record-spread-guard', 'class Use { int run(shared.SpreadCarrier b){return b.values().instance();} }', False, {'lib': ['SpreadCarrier']}),
+        ('record-primitive-guard', 'class Use { int run(shared.PrimitiveCarrier b){return b.value().instance();} }', False, {'lib': ['PrimitiveCarrier']}),
+        ('record-static-field', 'record Use(shared.Child value) { static int run(){return value.instance();} }', False, {'lib': ['Child']}),
+        ('record-static-capture', 'record Use(shared.Child value) { static class Peer {int run(){return value.instance();}} }', False, {'lib': ['Child']}),
         ('chain-field', 'class Use { int run(shared.Box b){return b.value.instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
         ('chain-return', 'class Use { int run(shared.Box b){return b.get().OPEN;} }', True, {'base': ['Parent'], 'lib': ['Box']}),
         ('chain-multi', 'class Use { int run(shared.Box b){return b.next.next.get(1).instance();} }', True, {'base': ['Parent'], 'lib': ['Box']}),
@@ -406,6 +463,10 @@ def exercise(binary, base):
         record('chain-option:' + ','.join(flags),
                [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Box'])],
                [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
+        document = runner.json('unused-deps', 'attached::record-accessor', '--verbose', *flags)
+        record('record-option:' + ','.join(flags),
+               [('attached::base', 'direct', ['Parent']), ('attached::lib', 'direct', ['Carrier'])],
+               [(r['name'], r['category'], r['examples']['direct']) for r in document['items']])
         document = runner.json('unused-deps', 'attached::static-field', '--verbose', *flags)
         transitive = '--no-transitive' not in flags
         record('option:' + ','.join(flags), [('attached::base', 'direct', ['Parent']),
@@ -480,6 +541,10 @@ def exercise(binary, base):
                             ('chain-declaring-import', ['Parent']),
                             ('chain-protected-guard', []),
                             ('chain-ambiguous-return', []),
+                            ('record-accessor', ['Parent']),
+                            ('record-explicit-accessor', ['Parent']),
+                            ('record-private-field', []),
+                            ('record-local-field', ['Parent']),
                             ('local-import-type-hiding', []),
                             ('local-self-parent-guard', [])]:
             record('protected-refresh:' + args[0] + ':' + label, want,
