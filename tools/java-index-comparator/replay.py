@@ -14,6 +14,7 @@ import call_hierarchy_contracts
 import graph_mcp_contracts
 import call_tree_mcp_contracts
 import parent_acceptance
+import scope_acceptance
 
 
 class StoredOracle:
@@ -165,6 +166,8 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                                           (check['subject'], *tuple(dependency)))
                 if check['feature'] == parent_acceptance.FEATURE:
                     parent_acceptance.replay_children(fixture, source)
+                if check['feature'] == scope_acceptance.FEATURE:
+                    scope_acceptance.replay_children(fixture, source)
                 fixture.evaluate(check)
                 try:
                     oracle.assert_consumed()

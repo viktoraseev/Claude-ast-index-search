@@ -13,6 +13,49 @@ use rusqlite::params;
 
 use crate::db;
 
+/// Select indexed occurrence paths before caps and counts, retaining declaration
+/// metadata outside the scope for Java references to another module's resources.
+fn open_android_query_db(root: &Path) -> Result<db::LeasedConnection> {
+    let conn = db::open_db_leased(root)?;
+    let resolver = super::PathResolver::try_from_conn(root, &conn)?;
+    let cwd = std::env::current_dir()?;
+    let prefix = cwd
+        .strip_prefix(root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty());
+    conn.execute_batch("CREATE TEMP TABLE android_scope_files(path TEXT PRIMARY KEY);")?;
+    {
+        let mut stmt = conn.prepare(
+            "SELECT file_path FROM main.xml_usages
+             UNION SELECT file_path FROM main.resources
+             UNION SELECT usage_file FROM main.resource_usages",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let stored: String = row.get(0)?;
+            let physical = root.join(&stored);
+            if resolver
+                .scoped_relative_path(&physical)
+                .is_some_and(|relative| {
+                    prefix.is_none_or(|prefix| Path::new(&relative).starts_with(prefix))
+                })
+            {
+                conn.execute(
+                    "INSERT INTO android_scope_files VALUES (?1)",
+                    params![stored],
+                )?;
+            }
+        }
+    }
+    conn.execute_batch(
+        "CREATE TEMP VIEW xml_usages AS
+             SELECT x.* FROM main.xml_usages x JOIN android_scope_files s ON s.path=x.file_path;
+         CREATE TEMP VIEW resource_usages AS
+             SELECT r.* FROM main.resource_usages r JOIN android_scope_files s ON s.path=r.usage_file;",
+    )?;
+    Ok(conn)
+}
+
 /// Find XML usages of a class (layouts, views)
 pub fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>) -> Result<()> {
     if !db::db_exists(root) {
@@ -23,10 +66,11 @@ pub fn cmd_xml_usages(root: &Path, class_name: &str, module_filter: Option<&str>
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_android_query_db(root)?;
 
     // Check if XML usages are indexed
-    let xml_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0))?;
+    let xml_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM main.xml_usages", [], |row| row.get(0))?;
     if xml_count == 0 {
         println!(
             "{}",
@@ -128,7 +172,7 @@ pub fn cmd_resource_usages(
         return Ok(());
     }
 
-    let conn = db::open_db_leased(root)?;
+    let conn = open_android_query_db(root)?;
 
     // Check if resources are indexed
     let res_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))?;
@@ -167,8 +211,9 @@ pub fn cmd_resource_usages(
             "SELECT r.type, r.name, r.file_path
              FROM resources r
              JOIN modules m ON r.module_id = m.id
-             WHERE m.name = ?1 AND NOT EXISTS (
-                 SELECT 1 FROM resource_usages ru
+             WHERE m.name = ?1 AND r.file_path IN (SELECT path FROM android_scope_files)
+               AND NOT EXISTS (
+                 SELECT 1 FROM main.resource_usages ru
                  JOIN resources used ON used.id = ru.resource_id
                  WHERE used.type = r.type AND used.name = r.name
                    AND used.module_id IS r.module_id

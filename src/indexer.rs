@@ -1602,6 +1602,31 @@ pub fn build_files_fingerprint(module_files: &[PathBuf]) -> String {
     format!("{}:{:016x}", entries.len(), hasher.finish())
 }
 
+/// Fingerprint Android reference inputs without loading resource files in memory.
+fn java_resource_files_fingerprint(files: &[PathBuf]) -> Result<String> {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in files {
+        path.hash(&mut hasher);
+        let metadata = fs::metadata(path)?;
+        metadata.len().hash(&mut hasher);
+        metadata.modified()?.hash(&mut hasher);
+        if path.extension().is_some_and(|ext| ext == "xml") {
+            let mut file = fs::File::open(path)?;
+            let mut buffer = [0_u8; 65536];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.write(&buffer[..count]);
+            }
+        }
+    }
+    Ok(format!("{}:{:016x}", files.len(), hasher.finish()))
+}
+
 /// Module-related file names to collect during directory walk
 pub(crate) fn is_module_file(name: &str) -> bool {
     name == "build.gradle"
@@ -2609,6 +2634,7 @@ pub fn update_directory_incremental(
     // Build files are collected regardless of extension: `build.gradle.kts`,
     // `pom.xml`, `ya.make` are not parsed as sources but define the module graph.
     let mut module_files: Vec<PathBuf> = Vec::new();
+    let mut resource_files: Vec<PathBuf> = Vec::new();
     let no_ignore = load_config(root)
         .and_then(|config| config.no_ignore)
         .unwrap_or(db::get_metadata_value(conn, "no_ignore")?.as_deref() == Some("1"));
@@ -2652,6 +2678,7 @@ pub fn update_directory_incremental(
         // so the ids they get) differs from the former serial walk order.
         let (tx, rx) = crossbeam_channel::unbounded::<PathBuf>();
         let (module_tx, module_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let (resource_tx, resource_rx) = crossbeam_channel::unbounded::<PathBuf>();
         let walk_error = Arc::new(Mutex::new(None));
         builder
             .threads(effective_num_threads())
@@ -2659,10 +2686,16 @@ pub fn update_directory_incremental(
             .run(|| {
                 let tx = tx.clone();
                 let module_tx = module_tx.clone();
+                let resource_tx = resource_tx.clone();
                 let walk_error = walk_error.clone();
                 Box::new(move |entry| {
                     match entry {
                         Ok(entry) => {
+                            if entry.file_type().is_some_and(|t| t.is_file())
+                                && is_android_res_path(&entry.path().to_string_lossy())
+                            {
+                                let _ = resource_tx.send(entry.path().to_path_buf());
+                            }
                             if entry.file_type().is_some_and(|t| t.is_file())
                                 && entry.file_name().to_str().is_some_and(is_module_file)
                             {
@@ -2699,6 +2732,8 @@ pub fn update_directory_incremental(
         }
         drop(tx);
         drop(module_tx);
+        drop(resource_tx);
+        resource_files.extend(resource_rx);
         let mut walked: Vec<PathBuf> = rx.into_iter().collect();
         walked.sort_unstable();
         let mut walked_modules: Vec<PathBuf> = module_rx.into_iter().collect();
@@ -2787,9 +2822,33 @@ pub fn update_directory_incremental(
     let fingerprint = build_files_fingerprint(&module_files);
     let stored_fingerprint = db::get_build_files_fingerprint(conn)?;
     let module_fingerprint_changed = stored_fingerprint.as_ref() != Some(&fingerprint);
+    const JAVA_RESOURCE_FINGERPRINT: &str = "java_android_aux_fingerprint";
+    resource_files.sort();
+    resource_files.dedup();
+    let has_java = current_paths
+        .iter()
+        .chain(existing_files.keys())
+        .any(|(_, path)| path.ends_with(".java"));
+    let had_android_refs: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM resources) OR EXISTS(SELECT 1 FROM xml_usages)",
+        [],
+        |row| row.get(0),
+    )?;
+    let resource_fingerprint = if has_java && (!resource_files.is_empty() || had_android_refs) {
+        Some(java_resource_files_fingerprint(&resource_files)?)
+    } else {
+        None
+    };
+    let stored_resource_fingerprint = db::get_metadata_value(conn, JAVA_RESOURCE_FINGERPRINT)?;
+    let refresh_java_resources = resource_fingerprint.as_ref().is_some_and(|fingerprint| {
+        stored_resource_fingerprint.as_ref() != Some(fingerprint)
+            || module_fingerprint_changed
+            || !files_to_parse.is_empty()
+            || !deleted_paths.is_empty()
+    });
     let was_dirty = db::has_index_update_dirty(conn)?;
     let has_planned_mutations = !files_to_parse.is_empty() || !deleted_paths.is_empty();
-    if has_planned_mutations || module_fingerprint_changed {
+    if has_planned_mutations || module_fingerprint_changed || refresh_java_resources {
         db::mark_index_update_dirty(conn)?;
     }
 
@@ -2896,10 +2955,30 @@ pub fn update_directory_incremental(
         Some(_) => {}
     }
 
+    if refresh_java_resources {
+        let layouts: Vec<PathBuf> = resource_files
+            .iter()
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "xml")
+                    && is_android_layout_path(&path.to_string_lossy())
+            })
+            .cloned()
+            .collect();
+        index_xml_usages(conn, root, &layouts, progress)?;
+        index_resources(conn, root, &resource_files, progress)?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key,value) VALUES (?1,?2)",
+            rusqlite::params![JAVA_RESOURCE_FINGERPRINT, resource_fingerprint],
+        )?;
+    }
+
     // File writes alone are not a completed update: derived module state and
     // its fingerprint must also succeed before clearing the durable marker.
     if all_planned_files_written
-        && (has_planned_mutations || module_fingerprint_changed || was_dirty)
+        && (has_planned_mutations
+            || module_fingerprint_changed
+            || refresh_java_resources
+            || was_dirty)
     {
         db::complete_index_update(conn)?;
     }
@@ -4195,7 +4274,7 @@ pub fn index_xml_usages(
     xml_layout_files: &[PathBuf],
     progress: bool,
 ) -> Result<usize> {
-    let module_lookup = ModuleLookup::from_db(conn)?;
+    let module_lookup = ModuleLookup::resource_paths(conn, root)?;
 
     if progress {
         eprintln!(

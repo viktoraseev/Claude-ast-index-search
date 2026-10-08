@@ -109,6 +109,8 @@ import graph_directory_contracts
 import graph_ambiguity_contracts
 import call_hierarchy_contracts
 import parent_acceptance
+import scope_acceptance
+import java_resource_scope_contracts
 
 
 SCHEMA = """
@@ -138,7 +140,7 @@ CREATE TABLE IF NOT EXISTS source_injection_targets(
     name TEXT NOT NULL, path TEXT NOT NULL, line INTEGER NOT NULL,
     PRIMARY KEY(name,path,line)
 );
-""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA + graph_mcp_contracts.SCHEMA + parent_acceptance.SCHEMA
+""" + ORACLE_SCHEMA + mobile_contracts.SCHEMA + text_snapshot.SCHEMA + android_contracts.SCHEMA + call_hierarchy_contracts.SCHEMA + graph_mcp_contracts.SCHEMA + parent_acceptance.SCHEMA + scope_acceptance.SCHEMA
 
 
 class Unsupported(ToolError):
@@ -169,8 +171,10 @@ def next_check(state: sqlite3.Connection):
         ORDER BY (feature='outline' OR feature GLOB 'outline:*'),feature,subject LIMIT 1""", parameters).fetchone()
     if check is None:
         return None
-    if check['feature'] == parent_acceptance.FEATURE:
-        child = parent_acceptance.pending_children(state)
+    acceptance = next((policy for policy in (parent_acceptance, scope_acceptance)
+                       if check['feature'] == policy.FEATURE), None)
+    if acceptance is not None:
+        child = acceptance.pending_children(state)
         if child is not None:
             return child
     if check['feature'] == 'outline' or check['feature'].startswith('outline:'):
@@ -2317,12 +2321,21 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in actual.items()}
 
     def parent_acceptance_check(self, check: sqlite3.Row):
+        policy = scope_acceptance if check['feature'] == scope_acceptance.FEATURE else parent_acceptance
         try:
-            return parent_acceptance.exercise(self)
+            return policy.exercise(self)
         except parent_acceptance.AcceptancePending as error:
             with self.state:
                 self.state.execute("UPDATE coverage SET status='pending' WHERE feature=?", (check['feature'],))
             raise Unsupported(str(error)) from error
+
+    def java_resource_scope_check(self, check: sqlite3.Row):
+        if getattr(self, '_java_resource_scope_results', None) is None:
+            self._java_resource_scope_results = java_resource_scope_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._java_resource_scope_results)
+        return {'source': java_resource_scope_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
 
     def evaluate(self, check: sqlite3.Row) -> None:
         started = time.perf_counter()
@@ -2481,9 +2494,11 @@ class Fixture:
                 handler = self.android_syntax_check
             if check['feature'] in java_resource_contracts.FEATURES:
                 handler = self.java_resource_check
+            if check['feature'] in java_resource_scope_contracts.FEATURES:
+                handler = self.java_resource_scope_check
             if check['feature'] == 'api':
                 handler = self.api_check
-            if check['feature'] == parent_acceptance.FEATURE:
+            if check['feature'] in {parent_acceptance.FEATURE, scope_acceptance.FEATURE}:
                 handler = self.parent_acceptance_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
@@ -2517,10 +2532,11 @@ class Fixture:
                     (verdict, canonical_json(expected), canonical_json(actual),
                      canonical_json({"missing": missing, "unexpected": unexpected}), now_ms(), check["id"]),
                 )
-                if check['feature'] == parent_acceptance.FEATURE:
+                if check['feature'] in {parent_acceptance.FEATURE, scope_acceptance.FEATURE}:
+                    policy = scope_acceptance if check['feature'] == scope_acceptance.FEATURE else parent_acceptance
                     self.state.execute('UPDATE coverage SET status=?,reason=? WHERE feature=?',
                                        ('implemented' if verdict == 'pass' else 'pending',
-                                        parent_acceptance.REASON, check['feature']))
+                                        policy.REASON, check['feature']))
         except (ToolError, OSError, subprocess.TimeoutExpired) as error:
             verdict = "unsupported" if isinstance(error, Unsupported) else "error"
             with self.metrics.checkpoint('checkpoint.finish'):
@@ -2612,6 +2628,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(cache_collision_contracts.FEATURES)
     features.update(graph_root_contracts.FEATURES)
     features.update(graph_directory_contracts.FEATURES)
+    features.update(java_resource_scope_contracts.FEATURES)
     features.update(graph_ambiguity_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
     features.update(graph_mcp_contracts.FEATURES)
@@ -2786,6 +2803,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     module_scope_contracts.plan_scope(state, root)
     graph_root_contracts.plan_scope(state, root)
     graph_directory_contracts.plan_scope(state, root)
+    java_resource_scope_contracts.plan_scope(state, root)
     module_root_contracts.plan_scope(state, root)
     analysis_scope_contracts.plan_scope(state, root)
     management_format_contracts.plan_formats(state, root)
@@ -2809,6 +2827,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     watch_scope_contracts.plan_scope(state, root)
     cache_collision_contracts.plan_cache(state, root)
     parent_acceptance.plan(state, java_only=java_only and root is not None)
+    scope_acceptance.plan(state, java_only=java_only and root is not None)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

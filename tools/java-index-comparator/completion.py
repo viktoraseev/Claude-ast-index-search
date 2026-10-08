@@ -47,6 +47,8 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
             raise ToolError('final evidence has unresolved coverage contracts')
         from parent_acceptance import readiness
         readiness(state, {**metadata, **fingerprints})
+        from scope_acceptance import readiness as scope_readiness
+        scope_readiness(state, {**metadata, **fingerprints})
         if any(status == 'out-of-scope' and feature not in JAVA_EXCLUDED_FEATURES
                for feature, status in coverage.items()):
             raise ToolError('Java-applicable contract was classified outside the task')

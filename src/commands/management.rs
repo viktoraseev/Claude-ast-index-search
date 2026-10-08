@@ -636,6 +636,7 @@ fn rebuild_index(
             // Collect module_files from primary root
             let mut all_module_files = walk.module_files;
             let mut all_res_files = walk.res_files;
+            let mut all_xml_files = walk.xml_layout_files;
 
             // Index extra roots and merge their module_files
             let extra_roots = db::get_extra_roots(&conn)?;
@@ -659,6 +660,7 @@ fn rebuild_index(
                         is_android = true;
                     }
                     all_res_files.extend(extra_walk.res_files);
+                    all_xml_files.extend(extra_walk.xml_layout_files);
                     if verbose {
                         eprintln!(
                             "[verbose] extra root: {} files in {:?}",
@@ -775,8 +777,9 @@ fn rebuild_index(
             if is_android {
                 lifecycle_progress!("{}", "Indexing XML layouts...".cyan());
                 let t = Instant::now();
-                xml_count =
-                    indexer::index_xml_usages(&mut conn, root, &walk.xml_layout_files, true)?;
+                all_xml_files.sort();
+                all_xml_files.dedup();
+                xml_count = indexer::index_xml_usages(&mut conn, root, &all_xml_files, true)?;
                 if verbose {
                     eprintln!("[verbose] xml_usages: {} in {:?}", xml_count, t.elapsed());
                 }
