@@ -8,11 +8,13 @@ from common import ToolError, connect, stable_id
 from root_contracts import Runner
 from android_contracts import observation, applicability, SCHEMA as ANDROID_SCHEMA
 import mobile_contracts
+from java_pattern_continuations import cases as continuation_cases
 
 FEATURE = 'resource-usages:java-lexical-bindings'
 FEATURES = {FEATURE}
 REASON = ('independent source/state: javac-validated Java R/type alias and static constant '
-          'lexical shadows, declaration points, captures, pattern/loop/try scopes and '
+          'lexical shadows, declaration points, captures, pattern/loop/try scopes, '
+          'nested abrupt guards, jump targets, condition-exit continuations and '
           'source-classpath inherited fields/types/constants, same-package type precedence and '
           'field-versus-method import namespaces through resource-usages/unused ownership; '
           'not MCP equivalence or a complete compiler-resolution contract')
@@ -182,6 +184,11 @@ def plan_bindings(state, root):
                 'independent source/state, not MCP equivalence')
         state.execute("UPDATE coverage SET reason=reason || ? WHERE feature='android:syntax-resolution' "
                       "AND status='pending' AND instr(reason,?)=0", (note, note))
+
+
+for label, body, shadowed in continuation_cases('Shadow', 'R', 'R.string.hit', 'R.string.hit'):
+    CASES['continuation-' + label] = ('import fixture.library.R;',
+                                    'class Use { ' + body + ' }\n', [] if shadowed else [1])
 
 
 def exercise(binary, base):

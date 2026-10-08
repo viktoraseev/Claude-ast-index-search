@@ -42,6 +42,9 @@ class JavaResourceBindingContractsTests(unittest.TestCase):
         row = self.verdict()
         self.assertEqual(row['verdict'], 'pass', row['diff_json'] or row['error'])
         self.assertEqual(json.loads(row['expected_json'])['source'], contracts.REASON)
+        samples = json.loads(row['expected_json'])['samples']
+        for label, _, _ in contracts.continuation_cases('Shadow', 'R', 'R.string.hit', 'R.string.hit'):
+            self.assertIn('continuation-' + label, samples)
         self.oracle.call.assert_not_called()
         self.assertFalse(self.fixture.database.exists())
         self.assertEqual(list(self.root.iterdir()), [self.root / 'Sentinel.java'])

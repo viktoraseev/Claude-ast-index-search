@@ -49,6 +49,16 @@ class PatternScopeContractsTests(unittest.TestCase):
                                       'missing': len(diff.get('missing', [])),
                                       'unexpected': len(diff.get('unexpected', []))})
                     self.assertIn('not MCP equivalence', json.loads(result['expected_json'])['source'])
+                    samples = json.loads(result['expected_json'])['samples']
+                    if feature == scopes.GRAPH:
+                        for label, _, _ in scopes.continuation_cases('Item', 'slot', 'slot.itemMarker()', 'slot.decoyMarker()'):
+                            self.assertIn('continuation:' + label + ':True:100', samples)
+                            self.assertIn('continuation:' + label + ':path', samples)
+                    else:
+                        for offset in range(0, len(scopes.continuation_cases('Item', 'slot', 'slot.itemMarker()', 'slot.decoyMarker()')), 5):
+                            for owner in ('Item', 'Decoy'):
+                                key = f'continuation:{offset}:{owner}'
+                                self.assertIn(key + ':100' if feature == scopes.TREE else key, samples)
             self.assertEqual(exercise.call_count, 1)
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['Foreign.kt', 'Sentinel.java'])
         self.assertFalse(self.fixture.database.exists())

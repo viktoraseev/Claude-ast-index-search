@@ -6,6 +6,7 @@ import tempfile
 
 from common import ToolError, connect, stable_id
 import mobile_contracts
+from java_pattern_continuations import cases as continuation_cases
 from root_contracts import Runner
 from unused_dep_contracts import result
 
@@ -14,7 +15,8 @@ FLOW = 'unused-deps:java-flow-shadows'
 FEATURES = {'unused-deps:java-imports', 'unused-deps:java-qualified-types', SHADOWS, FLOW}
 REASON = ('independent source/state: disposable Java explicit/static/import-only and wildcard '
           'imports, qualified/nested/annotation types, package precedence, API exports and '
-          'javac-validated lexical type/value, boolean pattern, loop and resource shadow boundaries; '
+          'javac-validated lexical type/value, boolean pattern, loop and resource shadow boundaries, '
+          'nested abrupt guards, jump targets and loop-exit continuations; '
           'not MCP equivalence or compiler-wide semantic resolution')
 
 
@@ -139,6 +141,9 @@ def exercise(binary, base):
             ('enhanced-for-expression', 'void local() { for (String Signal : new String[]{"" + Signal.VALUE}) { Signal.length(); } }', True),
             ('for-local-boundary', 'int local() { for (String Signal = ""; Signal.isEmpty(); Signal = "x") { Signal.length(); } return Signal.VALUE; }', True),
         ]
+        flow_cases += [('continuation-' + label, body, not shadowed)
+                       for label, body, shadowed in continuation_cases(
+                           'String', 'Signal', 'Signal.length()', 'Signal.VALUE')]
         cases += [(label, 'import alpha.*; class Use { ' + body + ' }',
                    'alpha' if used else None, 'Signal' if used else None)
                   for label, body, used in flow_cases]

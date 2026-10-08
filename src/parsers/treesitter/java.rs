@@ -1,7 +1,7 @@
 //! Tree-sitter based Java parser
 
 use anyhow::Result;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::LazyLock;
 use tree_sitter::{Language, Node, Query, QueryCursor, StreamingIterator};
 
@@ -999,6 +999,184 @@ fn dependency_declarations(
     Ok(result)
 }
 
+#[derive(Default)]
+struct StatementFlow {
+    normal: bool,
+    breaks: HashSet<usize>,
+    continues: HashSet<usize>,
+    uncertain: bool,
+}
+
+impl StatementFlow {
+    fn merge(&mut self, other: Self) {
+        self.normal |= other.normal;
+        self.breaks.extend(other.breaks);
+        self.continues.extend(other.continues);
+        self.uncertain |= other.uncertain;
+    }
+}
+
+fn jump_target(node: Node<'_>, source: &str) -> Option<usize> {
+    let label = node.named_child(0).map(|label| node_text(source, &label));
+    let mut parent = node.parent();
+    while let Some(scope) = parent {
+        if matches!(
+            scope.kind(),
+            "lambda_expression" | "method_declaration" | "constructor_declaration"
+        ) {
+            break;
+        }
+        if let Some(label) = label {
+            if scope.kind() == "labeled_statement"
+                && scope
+                    .named_child(0)
+                    .is_some_and(|name| node_text(source, &name) == label)
+            {
+                return if node.kind() == "continue_statement" {
+                    scope.named_child(1).map(|body| body.id())
+                } else {
+                    Some(scope.id())
+                };
+            }
+        } else if matches!(
+            scope.kind(),
+            "while_statement" | "for_statement" | "enhanced_for_statement" | "do_statement"
+        ) || (node.kind() == "break_statement" && scope.kind() == "switch_expression")
+        {
+            return Some(scope.id());
+        }
+        parent = scope.parent();
+    }
+    None
+}
+
+/// Track normal completion and escaping jumps without inspecting nested callables.
+fn statement_flow(node: Node<'_>, source: &str, depth: usize) -> StatementFlow {
+    let normal = || StatementFlow {
+        normal: true,
+        ..Default::default()
+    };
+    if depth >= 128 {
+        return StatementFlow {
+            uncertain: true,
+            ..normal()
+        };
+    }
+    let flow = |child| statement_flow(child, source, depth + 1);
+    match node.kind() {
+        "return_statement" | "throw_statement" => StatementFlow::default(),
+        "break_statement" | "continue_statement" => {
+            let Some(target) = jump_target(node, source) else {
+                return StatementFlow {
+                    uncertain: true,
+                    ..normal()
+                };
+            };
+            let mut result = StatementFlow::default();
+            if node.kind() == "break_statement" {
+                result.breaks.insert(target);
+            } else {
+                result.continues.insert(target);
+            }
+            result
+        }
+        "block" | "constructor_body" | "switch_block_statement_group" => {
+            let mut result = normal();
+            let mut cursor = node.walk();
+            for child in node
+                .named_children(&mut cursor)
+                .filter(|child| !child.is_extra())
+            {
+                if !result.normal {
+                    break;
+                }
+                result.normal = false;
+                result.merge(flow(child));
+            }
+            result
+        }
+        "if_statement" => {
+            let mut result = node
+                .child_by_field_name("consequence")
+                .map_or_else(normal, flow);
+            result.merge(
+                node.child_by_field_name("alternative")
+                    .map_or_else(normal, flow),
+            );
+            result
+        }
+        "synchronized_statement" | "catch_clause" | "finally_clause" => node
+            .child_by_field_name("body")
+            .or_else(|| {
+                let mut cursor = node.walk();
+                let body = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "block");
+                body
+            })
+            .map_or_else(normal, flow),
+        "try_statement" | "try_with_resources_statement" => {
+            let mut result = node.child_by_field_name("body").map_or_else(normal, flow);
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if child.kind() == "catch_clause" {
+                    result.merge(flow(child));
+                } else if child.kind() == "finally_clause" {
+                    let final_flow = flow(child);
+                    if !final_flow.normal && !final_flow.uncertain {
+                        return final_flow;
+                    }
+                    let was_normal = result.normal;
+                    result.merge(final_flow);
+                    result.normal = was_normal;
+                }
+            }
+            result
+        }
+        "labeled_statement" => {
+            let mut result = node.named_child(1).map_or_else(normal, flow);
+            result.normal |= result.breaks.remove(&node.id());
+            result
+        }
+        "while_statement" | "for_statement" | "enhanced_for_statement" | "do_statement" => {
+            let mut result = node.child_by_field_name("body").map_or_else(normal, flow);
+            let reaches_condition = result.normal | result.continues.remove(&node.id());
+            let constant_true = node.child_by_field_name("condition").map_or(
+                node.kind() == "for_statement",
+                |condition| {
+                    node_text(source, &condition).trim_matches(['(', ')', ' ', '\n']) == "true"
+                },
+            );
+            result.normal = (!constant_true
+                && (node.kind() != "do_statement" || reaches_condition))
+                | result.breaks.remove(&node.id());
+            result
+        }
+        "switch_expression" => {
+            // Preserve escaping jumps from all arms; normal switch completion
+            // remains conservative rather than assuming exhaustiveness.
+            let mut result = normal();
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for child in body.named_children(&mut cursor) {
+                    result.merge(flow(child));
+                }
+            }
+            result.breaks.remove(&node.id());
+            result
+        }
+        "switch_rule" => {
+            let mut result = normal();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                result.merge(flow(child));
+            }
+            result
+        }
+        _ => normal(),
+    }
+}
+
 /// Check where a pattern is definitely matched, without lending its type to
 /// the opposite branch or to expressions evaluated before the match.
 pub(crate) fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(Node<'a>, usize)> {
@@ -1057,23 +1235,12 @@ pub(crate) fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(N
                 }
                 if parent.kind() == "if_statement" {
                     let terminal = |branch: Option<Node<'_>>| {
-                        branch
-                            .and_then(|branch| {
-                                if branch.kind() == "block" {
-                                    branch.named_child(
-                                        branch.named_child_count().saturating_sub(1) as u32
-                                    )
-                                } else {
-                                    Some(branch)
-                                }
-                            })
-                            .is_some_and(|node| {
-                                matches!(node.kind(), "return_statement" | "throw_statement")
-                            })
+                        branch.is_some_and(|branch| {
+                            let flow = statement_flow(branch, source, 0);
+                            !flow.normal && !flow.uncertain
+                        })
                     };
-                    // Retain simple abrupt guards. General reachability,
-                    // labelled breaks and loop-exit flow need more evidence.
-                    if (on_false && terminal(consequence) && alternative.is_none())
+                    if (on_false && terminal(consequence) && !terminal(alternative))
                         || (on_true && terminal(alternative) && !terminal(consequence))
                     {
                         if let Some(block) = parent
@@ -1086,12 +1253,11 @@ pub(crate) fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(N
                 }
                 break;
             }
-            "while_statement" | "for_statement" => {
-                if on_true
-                    && parent
-                        .child_by_field_name("condition")
-                        .is_some_and(|condition| condition.id() == expression.id())
-                {
+            "while_statement" | "for_statement" | "do_statement" => {
+                let condition = parent
+                    .child_by_field_name("condition")
+                    .is_some_and(|condition| condition.id() == expression.id());
+                if on_true && parent.kind() != "do_statement" && condition {
                     scopes.extend(
                         parent
                             .child_by_field_name("body")
@@ -1104,6 +1270,21 @@ pub(crate) fn pattern_flow_scopes<'a>(pattern: Node<'a>, source: &str) -> Vec<(N
                                 .children_by_field_name("update", &mut cursor)
                                 .map(|update| (update, position)),
                         );
+                    }
+                }
+                if on_false && condition {
+                    // Breaks consumed by inner loops/labels do not exit this
+                    // loop. Escaping breaks bypass the matched condition exit.
+                    let flow = parent
+                        .child_by_field_name("body")
+                        .map(|body| statement_flow(body, source, 0));
+                    if flow.is_some_and(|flow| flow.breaks.is_empty() && !flow.uncertain) {
+                        if let Some(block) = parent
+                            .parent()
+                            .filter(|node| matches!(node.kind(), "block" | "constructor_body"))
+                        {
+                            scopes.push((block, parent.end_byte()));
+                        }
                     }
                 }
                 break;

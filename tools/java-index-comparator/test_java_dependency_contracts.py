@@ -48,6 +48,11 @@ class JavaDependencyContracts(unittest.TestCase):
                     'feature': feature, 'error': row['error'],
                     'missing': len(diff.get('missing', [])), 'unexpected': len(diff.get('unexpected', []))})
                 self.assertIn('not MCP equivalence', json.loads(row['expected_json'])['source'])
+                if feature == contracts.FLOW:
+                    samples = json.loads(row['expected_json'])['samples']
+                    for label, _, _ in contracts.continuation_cases('String', 'Signal', 'Signal.length()', 'Signal.VALUE'):
+                        self.assertIn('continuation-' + label, samples)
+                        self.assertIn('continuation-' + label + ':json', samples)
                 self.assertIn(feature, required_features())
             self.assertEqual(exercise.call_count, 1)
         self.oracle.call.assert_not_called()
