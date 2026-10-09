@@ -2377,7 +2377,7 @@ impl Builder {
         let (owner, value) = self.java_declared_receiver(source, receiver, 0)?;
         // Keep erased Object, primitive and array expression results outside
         // this nominal receiver contract; their previous uncertainty is retained.
-        if matches!(&value, JavaReceiver::Array(_))
+        if matches!(&value, JavaReceiver::Array(_) | JavaReceiver::ArrayOf(_))
             || matches!(&value, JavaReceiver::Type(path) if Self::java_primitive(path)
                 || self.java_lang_type(owner, path).as_deref() == Some("java::lang::Object"))
         {
@@ -2416,6 +2416,10 @@ impl Builder {
                     Some(format!("{path}<{}>", arguments?.join(",")))
                 }
                 JavaReceiver::Array(Some(element)) => Some(format!("{element}[]")),
+                JavaReceiver::ArrayOf(element) => Some(format!(
+                    "{}[]",
+                    spelling(resolver, owner, element, depth + 1)?
+                )),
                 _ => None,
             }
         }
@@ -2766,13 +2770,14 @@ impl Builder {
                             .and_then(|(input, parameter)| {
                                 let (owner, input) =
                                     self.java_invocation_argument(source, input)?;
-                                self.java_invocation_identity(owner, &input, 0)
-                                    .zip(self.java_invocation_identity_at(
+                                self.java_invocation_identity(owner, &input, 0).zip(
+                                    self.java_invocation_identity_at(
                                         target,
                                         parameter,
                                         0,
                                         self.syms[target as usize].java_site,
-                                    ))
+                                    ),
+                                )
                             })
                             .is_some_and(|(input, parameter)| input == parameter)
                     })
@@ -3602,7 +3607,7 @@ impl Builder {
             | JavaReceiver::CollectedMap { .. }
             | JavaReceiver::StreamFactory { .. }
             | JavaReceiver::MethodProjection { .. } => Vec::new(),
-            JavaReceiver::Array(_) => Vec::new(),
+            JavaReceiver::Array(_) | JavaReceiver::ArrayOf(_) => Vec::new(),
             JavaReceiver::Field { receiver, name } => {
                 let targets = self.java_field_targets(source, receiver, name, depth + 1);
                 let [target] = targets.as_slice() else {
@@ -3638,7 +3643,10 @@ impl Builder {
                 }
                 let kind = self.java_collection_kind(source, receiver, depth + 1);
                 if operation == "iterable-element"
-                    && matches!(receiver.as_ref(), JavaReceiver::Array(_))
+                    && matches!(
+                        receiver.as_ref(),
+                        JavaReceiver::Array(_) | JavaReceiver::ArrayOf(_)
+                    )
                 {
                     return self.java_array_element_classes(source, receiver, depth + 1);
                 }
@@ -4190,6 +4198,14 @@ impl Builder {
             return JavaReceiver::Unknown;
         }
         let (path, arguments) = match receiver {
+            JavaReceiver::ArrayOf(element) => {
+                return JavaReceiver::ArrayOf(Box::new(self.java_bind_receiver_site(
+                    owner,
+                    element,
+                    site,
+                    depth + 1,
+                )))
+            }
             JavaReceiver::Type(path) => (path, None),
             JavaReceiver::Parameterized { path, arguments } => (path, Some(arguments)),
             _ => return receiver.clone(),
@@ -4212,8 +4228,9 @@ impl Builder {
                 .collect()
         });
         if let [class] = classes.as_slice() {
-            // Nonlocal canonical names can retain existing generic machinery;
-            // local names require their resolved identity throughout projection.
+            // Qualified nonlocal names retain the existing generic machinery.
+            // Local and default-package names need the resolved identity: a
+            // later lexical declaration can shadow even their canonical name.
             let symbol = &self.syms[*class as usize];
             let local = self.files[symbol.file as usize]
                 .java
@@ -4222,7 +4239,7 @@ impl Builder {
                     java.type_declaration_at(&symbol.qual, symbol.line, symbol.java_site)
                 })
                 .is_some_and(|declaration| declaration.local_scope.is_some());
-            return if local {
+            return if local || !symbol.qual.contains("::") {
                 JavaReceiver::BoundType {
                     class: *class,
                     arguments,
@@ -4386,8 +4403,10 @@ impl Builder {
                     let (owner, mut value) =
                         self.java_declared_receiver(source, element, depth + 1)?;
                     if elements.len() == 1 {
-                        if let JavaReceiver::Array(Some(element)) = value {
-                            value = JavaReceiver::Type(element);
+                        if let Some((_, element)) =
+                            self.java_array_element_receiver(owner, &value, depth + 1)
+                        {
+                            value = element;
                         }
                     }
                     let (owner, ty) = self.java_receiver_invocation_type(owner, &value)?;
@@ -4773,6 +4792,16 @@ impl Builder {
                 receiver,
                 operation,
             } => {
+                if matches!(operation.as_str(), "array-index" | "iterable-element") {
+                    if let Some(element) =
+                        self.java_array_element_receiver(source, receiver, depth + 1)
+                    {
+                        return Some(element);
+                    }
+                    if operation == "array-index" {
+                        return None;
+                    }
+                }
                 let kind = self.java_collection_kind(source, receiver, depth + 1)?;
                 let applicable = match operation.as_str() {
                     "collector-value" | "map-key" | "map-value" => kind == "Map",
@@ -4893,14 +4922,13 @@ impl Builder {
                             first_argument.as_deref()?,
                             depth + 1,
                         )?;
-                        let JavaReceiver::Array(Some(element)) = argument else {
-                            return None;
-                        };
+                        let (owner, element) =
+                            self.java_array_element_receiver(owner, &argument, depth + 1)?;
                         return Some((
                             owner,
                             JavaReceiver::Parameterized {
                                 path: "java::util::stream::Stream".to_owned(),
-                                arguments: vec![Some(JavaReceiver::Type(element))],
+                                arguments: vec![Some(element)],
                             },
                         ));
                     }
@@ -5108,6 +5136,20 @@ impl Builder {
                         .type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
                         .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
                 }
+                if let (Some((context, receiver)), Some(template)) = (
+                    &bound,
+                    java.return_receiver(&symbol.name, symbol.line, symbol.java_site),
+                ) {
+                    if matches!(template, JavaReceiver::ArrayOf(_)) {
+                        return self.java_field_projection(
+                            *context,
+                            receiver,
+                            *target,
+                            template,
+                            depth + 1,
+                        );
+                    }
+                }
                 java.return_receiver(&symbol.name, symbol.line, symbol.java_site)
                     .cloned()
                     .or_else(|| {
@@ -5136,6 +5178,7 @@ impl Builder {
             JavaReceiver::Type(_)
                 | JavaReceiver::Parameterized { .. }
                 | JavaReceiver::Array(_)
+                | JavaReceiver::ArrayOf(_)
                 | JavaReceiver::This
                 | JavaReceiver::Super
                 | JavaReceiver::BoundType { .. }
@@ -5290,7 +5333,28 @@ impl Builder {
             return None;
         }
         match template {
+            JavaReceiver::ArrayOf(element) => {
+                let (context, value) = self.java_class_projection(
+                    source,
+                    receiver,
+                    class,
+                    target,
+                    element,
+                    depth + 1,
+                )?;
+                Some((context, JavaReceiver::ArrayOf(Box::new(value))))
+            }
             JavaReceiver::Parameter(parameter) => {
+                let member = &self.syms[target as usize];
+                if member.kind == "function"
+                    && java
+                        .parameter_index(&member.name, member.line, member.java_site, parameter)
+                        .is_some()
+                {
+                    return java
+                        .type_bound(&member.name, member.line, member.java_site, parameter)
+                        .map(|bound| (target, JavaReceiver::Type(bound.to_owned())));
+                }
                 let index =
                     java.parameter_index(&owner.name, owner.line, owner.java_site, parameter)?;
                 if let Some((context, value)) =
@@ -5355,6 +5419,9 @@ impl Builder {
             return JavaReceiver::Unknown;
         }
         match receiver {
+            JavaReceiver::ArrayOf(element) => JavaReceiver::ArrayOf(Box::new(
+                self.java_qualified_receiver(source, element, depth + 1),
+            )),
             JavaReceiver::Type(path) => {
                 let classes = self.resolve_java_type(source, self.namespace_of(source), path, None);
                 if let [class] = classes.as_slice() {
@@ -5450,6 +5517,11 @@ impl Builder {
         if depth >= 32 {
             return Vec::new();
         }
+        if let Some((owner, element)) =
+            self.java_array_element_receiver(source, receiver, depth + 1)
+        {
+            return self.java_receiver_classes(owner, &element, depth + 1);
+        }
         match receiver {
             JavaReceiver::Array(Some(element)) => {
                 self.resolve_java_type(source, self.namespace_of(source), element, None)
@@ -5494,6 +5566,20 @@ impl Builder {
                     .unwrap_or_default()
             }
             _ => Vec::new(),
+        }
+    }
+
+    fn java_array_element_receiver(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        let (owner, value) = self.java_declared_receiver(source, receiver, depth + 1)?;
+        match value {
+            JavaReceiver::ArrayOf(element) => Some((owner, *element)),
+            JavaReceiver::Array(Some(element)) => Some((owner, JavaReceiver::Type(element))),
+            _ => None,
         }
     }
 
@@ -5547,13 +5633,10 @@ impl Builder {
                 let Some(owner) = self.java_receiver_site_owner(source, site) else {
                     return Vec::new();
                 };
-                self.resolve_java_type_reference(
-                    owner,
-                    self.namespace_of(owner),
-                    &site.path,
-                    None,
-                    Some(TypeReference::Position(site.position)),
-                )
+                // The site binds nominal components, but an array receiver
+                // must retain its dimensions before member lookup.
+                let receiver = self.java_bind_receiver_site(owner, &call.receiver, site, 0);
+                self.java_receiver_classes(owner, &receiver, 0)
             });
             let type_classes = call.reference_type.as_deref().map(|path| {
                 // Tree-sitter represents qualified type references as field

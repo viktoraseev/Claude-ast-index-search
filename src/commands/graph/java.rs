@@ -138,6 +138,8 @@ pub(super) enum JavaReceiver {
         arguments: Vec<Option<JavaReceiver>>,
     },
     Array(Option<String>),
+    /// Each dimension preserves its element's generic and lexical identity.
+    ArrayOf(Box<JavaReceiver>),
     Field {
         receiver: Box<JavaReceiver>,
         name: String,
@@ -347,7 +349,7 @@ fn variable_scopes(
                             field: false,
                             invocation_type: declared_invocation_type(ty, declaration, source),
                             declared: type_name(ty, source),
-                            inferred: generic_receiver(ty, owner, source),
+                            inferred: declared_receiver(ty, declaration, source, false),
                             site: receiver_type_site(ty, source, declarations),
                         });
                 }
@@ -517,10 +519,8 @@ fn variable_scopes(
                     field,
                     invocation_type: declared_invocation_type(declared_type, variable, source),
                     declared,
-                    inferred: generic_receiver(declared_type, declaration, source),
-                    site: (!array_suffix)
-                        .then(|| receiver_type_site(declared_type, source, declarations))
-                        .flatten(),
+                    inferred: declared_receiver(declared_type, variable, source, false),
+                    site: receiver_type_site(declared_type, source, declarations),
                 });
         }
         WalkControl::Continue
@@ -702,23 +702,17 @@ fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
 /// Keep nominal and generic variable types in their declaring lexical scope.
 /// Array projection remains separate evidence.
 fn receiver_type_site(
-    ty: Node<'_>,
+    mut ty: Node<'_>,
     source: &str,
     declarations: &HashMap<usize, InvocationOwner>,
 ) -> Option<ReceiverTypeSite> {
+    while ty.kind() == "array_type" {
+        ty = ty.child_by_field_name("element")?;
+    }
     if !matches!(
         ty.kind(),
         "type_identifier" | "scoped_type_identifier" | "generic_type"
     ) {
-        return None;
-    }
-    if ty.parent().is_some_and(|declaration| {
-        let mut cursor = declaration.walk();
-        declaration.kind() == "spread_parameter"
-            || declaration
-                .named_children(&mut cursor)
-                .any(|node| node.kind() == "dimensions")
-    }) {
         return None;
     }
     let path = type_name(ty, source)?;
@@ -994,14 +988,14 @@ fn generic_receiver_at(
     if node.kind() == "array_type" {
         let element = node
             .child_by_field_name("element")
-            .or_else(|| node.named_child(0));
-        return Some(JavaReceiver::Array(
-            element
-                .and_then(|element| type_name(element, source))
-                .filter(|path| {
-                    !type_parameter(owner, path.split("::").next().unwrap_or_default(), source)
-                }),
-        ));
+            .or_else(|| node.named_child(0))?;
+        let receiver = generic_receiver_at(element, owner, source, depth + 1, preserve_parameters)
+            .or_else(|| type_name(element, source).map(JavaReceiver::Type))
+            .unwrap_or(JavaReceiver::Unknown);
+        let dimensions = node
+            .child_by_field_name("dimensions")
+            .map(array_dimensions)?;
+        return Some(array_receiver(receiver, dimensions));
     }
     if node.kind() != "generic_type" {
         return type_name(node, source)
@@ -1043,6 +1037,41 @@ fn generic_receiver_at(
         })
         .collect();
     Some(JavaReceiver::Parameterized { path, arguments })
+}
+
+fn array_receiver(mut element: JavaReceiver, dimensions: usize) -> JavaReceiver {
+    if dimensions > 16 {
+        return JavaReceiver::Unknown;
+    }
+    for _ in 0..dimensions {
+        element = JavaReceiver::ArrayOf(Box::new(element));
+    }
+    element
+}
+
+fn declared_receiver(
+    ty: Node<'_>,
+    declaration: Node<'_>,
+    source: &str,
+    preserve_parameters: bool,
+) -> Option<JavaReceiver> {
+    let mut cursor = declaration.walk();
+    let dimensions = declaration
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "dimensions")
+        .map(array_dimensions)
+        .sum::<usize>()
+        + usize::from(declaration.kind() == "spread_parameter");
+    let preserve_parameters = preserve_parameters
+        || declaration.kind() == "method_declaration"
+            && (ty.kind() == "array_type" || dimensions > 0);
+    let receiver =
+        generic_receiver_at(ty, declaration, source, 0, preserve_parameters).or_else(|| {
+            (dimensions > 0)
+                .then(|| type_name(ty, source).map(JavaReceiver::Type))
+                .flatten()
+        })?;
+    Some(array_receiver(receiver, dimensions))
 }
 
 fn argument_count(node: Node<'_>) -> Option<usize> {
@@ -2147,10 +2176,30 @@ fn expression_receiver(
             ),
             operation: "array-index".to_owned(),
         },
-        "object_creation_expression" | "cast_expression" => typed(
-            node.child_by_field_name("type")
-                .and_then(|ty| type_name(ty, source)),
-        ),
+        "array_creation_expression" => {
+            let Some(ty) = node.child_by_field_name("type") else {
+                return JavaReceiver::Unknown;
+            };
+            let mut cursor = node.walk();
+            let dimensions = node
+                .named_children(&mut cursor)
+                .map(|child| match child.kind() {
+                    "dimensions_expr" => 1,
+                    "dimensions" => array_dimensions(child),
+                    _ => 0,
+                })
+                .sum();
+            array_receiver(
+                generic_receiver(ty, owner, source).unwrap_or_else(|| typed(type_name(ty, source))),
+                dimensions,
+            )
+        }
+        "object_creation_expression" | "cast_expression" => node
+            .child_by_field_name("type")
+            .map(|ty| {
+                generic_receiver(ty, owner, source).unwrap_or_else(|| typed(type_name(ty, source)))
+            })
+            .unwrap_or(JavaReceiver::Unknown),
         "parenthesized_expression" => node
             .named_child(0)
             .map(|child| expression_receiver(child, owner, source, scopes, depth + 1))
@@ -3139,7 +3188,8 @@ impl JavaSource {
                                     name.start_position().row as i64 + 1,
                                     name.start_byte(),
                                 ),
-                                receiver.clone(),
+                                declared_receiver(ty, variable, source, true)
+                                    .unwrap_or_else(|| receiver.clone()),
                             );
                         }
                     }
@@ -3735,7 +3785,7 @@ impl JavaSource {
                             }
                             if let Some(receiver) = component
                                 .child_by_field_name("type")
-                                .and_then(|ty| generic_receiver(ty, node, source))
+                                .and_then(|ty| declared_receiver(ty, component, source, true))
                             {
                                 result.return_receivers.insert(
                                     (
@@ -3782,7 +3832,7 @@ impl JavaSource {
                 if let Some(name) = node.child_by_field_name("name") {
                     if let Some(receiver) = node
                         .child_by_field_name("type")
-                        .and_then(|ty| generic_receiver(ty, node, source))
+                        .and_then(|ty| declared_receiver(ty, node, source, false))
                     {
                         result.return_receivers.insert(
                             (
@@ -3797,7 +3847,12 @@ impl JavaSource {
                         .child_by_field_name("type")
                         .and_then(|ty| type_name(ty, source))
                         .filter(|parameter| {
-                            !parameter.contains("::") && type_parameter(node, parameter, source)
+                            let mut cursor = node.walk();
+                            !node
+                                .named_children(&mut cursor)
+                                .any(|child| child.kind() == "dimensions")
+                                && !parameter.contains("::")
+                                && type_parameter(node, parameter, source)
                         })
                     {
                         result.return_parameters.insert(

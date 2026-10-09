@@ -797,6 +797,55 @@ fn array_suffix_parameters_cannot_borrow_the_element_classes_method() {
 }
 
 #[test]
+fn default_package_receivers_keep_declaration_identity_after_local_type_shadowing() {
+    // A default-package qualified name is still a simple name. Reusing it at
+    // the call site would bind the later local class instead of the parameter.
+    check_direct_callers(
+        r#"class Item {
+ int leaf(){return 1;}
+}
+class Box<T> { T[] values; }
+class Probe {
+ int nominal(String value){return 0;} int nominal(Item value){
+  class Item { int decoy(){return 2;} }
+  return value.leaf();
+ }
+ int array(Item[] values){class Item {} return values[0].leaf();}
+ int generic(Box<Item> box){class Item {} return box.values[0].leaf();}
+ int shadow(){class Item { int decoy(){return 2;} } Item value=null; return value.leaf();}
+ int unindexed(Item[] values){return values.leaf();}
+}
+"#,
+        "leaf",
+        &[("nominal", 6), ("array", 10), ("generic", 11)],
+    );
+}
+
+#[test]
+fn generic_array_results_preserve_subtype_arguments_and_return_dimensions() {
+    check_direct_callers(
+        r#"class Base {}
+class Item extends Base {
+ int leaf(){return 1;}
+}
+class Box<T extends Base> {
+ T[] values;
+ T[] get(){return null;}
+ T trailing()[]{return null;}
+}
+class Relay<U extends Base> extends Box<U> {}
+class Probe {
+ int field(Relay<Item> b){return b.values[0].leaf();}
+ int result(Relay<Item> b){return b.get()[0].leaf();}
+ int trailing(Relay<Item> b){return b.trailing()[0].leaf();}
+}
+"#,
+        "leaf",
+        &[("field", 12), ("result", 13), ("trailing", 14)],
+    );
+}
+
+#[test]
 fn java_collection_elements_and_stream_lambda_parameters_bind_real_callers() {
     check_direct_callers(
         "import java.util.List;\nclass Item {\n int leaf() { return 1; }\n}\nrecord Box(List<Item> items) {}\nclass Probe {\n int indexed(Box box) { return box.items().get(0).leaf(); }\n void streamed(Box box) { box.items().stream().filter(item -> item.leaf() > 0).forEach(item -> item.leaf()); }\n}\n",
