@@ -60,6 +60,7 @@ import java_receiver_contracts
 import java_exception_scope_contracts
 import java_local_interface_contracts
 import java_colliding_type_contracts
+import java_generic_field_contracts
 import java_local_class_contracts
 import graph_mcp_contracts
 import call_tree_mcp_contracts
@@ -576,6 +577,7 @@ class Fixture:
         self._exception_scope_results = None
         self._local_interface_results = None
         self._colliding_type_results = None
+        self._generic_field_results = None
         self._local_class_results = None
         self._pattern_scope_results = None
         self._type_access_results = None
@@ -1951,6 +1953,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def generic_field_check(self, check: sqlite3.Row):
+        if self._generic_field_results is None:
+            self._generic_field_results = java_generic_field_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._generic_field_results)
+        return {'source': java_generic_field_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def parent_check(self, check: sqlite3.Row):
         if self._parent_results is None:
             self._parent_results = java_parent_contracts.exercise(self.binary, self.database.parent)
@@ -2410,6 +2420,8 @@ class Fixture:
                 handler = self.local_class_check
             if check['feature'] in java_colliding_type_contracts.FEATURES:
                 handler = self.colliding_type_check
+            if check['feature'] in java_generic_field_contracts.FEATURES:
+                handler = self.generic_field_check
             if check['feature'] in java_local_interface_contracts.FEATURES:
                 handler = self.local_interface_check
             if check['feature'] in java_pattern_scope_contracts.FEATURES:
@@ -2596,6 +2608,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_exception_scope_contracts.FEATURES)
     features.update(java_local_interface_contracts.FEATURES)
     features.update(java_colliding_type_contracts.FEATURES)
+    features.update(java_generic_field_contracts.FEATURES)
     features.update(java_local_class_contracts.FEATURES)
     features.update(java_type_binding_contracts.FEATURES)
     features.update(java_type_access_contracts.FEATURES)
@@ -2792,6 +2805,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     java_exception_scope_contracts.plan_scopes(state, root)
     java_local_interface_contracts.plan_interfaces(state, root)
     java_colliding_type_contracts.plan_types(state, root)
+    java_generic_field_contracts.plan_fields(state, root)
     java_local_class_contracts.plan_classes(state, root)
     java_pattern_scope_contracts.plan_scopes(state, root)
     java_type_binding_contracts.plan_types(state, root)

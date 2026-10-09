@@ -3045,7 +3045,7 @@ impl JavaSource {
             }
             if node.kind() == "field_declaration" {
                 if let Some(ty) = node.child_by_field_name("type") {
-                    let receiver = generic_receiver(ty, node, source)
+                    let receiver = generic_receiver_at(ty, node, source, 0, true)
                         .or_else(|| {
                             type_name(ty, source)
                                 .filter(|path| {
@@ -4441,6 +4441,10 @@ impl JavaSource {
         declaration_metadata(&self.type_parameters, name, line, site)?
             .iter()
             .position(|name| name == parameter)
+    }
+
+    pub fn type_parameter_count(&self, name: &str, line: i64, site: Option<usize>) -> usize {
+        declaration_metadata(&self.type_parameters, name, line, site).map_or(0, Vec::len)
     }
 
     pub fn return_parameter(&self, name: &str, line: i64, site: Option<usize>) -> Option<&str> {

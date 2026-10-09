@@ -3136,6 +3136,15 @@ impl Builder {
                         local_scope(candidate).is_some_and(|scope| scope.len() == length)
                     });
                 }
+                // Declarations in this compilation unit retain their identity
+                // when an attached project contains the same qualified name.
+                if !at_import
+                    && declared
+                        .iter()
+                        .any(|&candidate| self.syms[candidate as usize].file == file)
+                {
+                    declared.retain(|&candidate| self.syms[candidate as usize].file == file);
+                }
                 let mut classes = declared;
                 classes
                     .retain(|&candidate| self.java_type_accessible(source, candidate, at_import));
@@ -4718,14 +4727,11 @@ impl Builder {
                     return None;
                 };
                 let symbol = &self.syms[*target as usize];
-                Some((
-                    *target,
-                    self.files[symbol.file as usize]
-                        .java
-                        .as_ref()?
-                        .member_receiver(&symbol.name, symbol.line, symbol.java_site)?
-                        .clone(),
-                ))
+                let template = self.files[symbol.file as usize]
+                    .java
+                    .as_ref()?
+                    .member_receiver(&symbol.name, symbol.line, symbol.java_site)?;
+                self.java_field_projection(source, receiver, *target, template, depth + 1)
             }
             JavaReceiver::Element {
                 receiver,
@@ -5101,6 +5107,92 @@ impl Builder {
             Some((source, receiver.clone()))
         } else {
             None
+        }
+    }
+
+    /// Substitute field parameters at the declaring class's exact syntax site.
+    /// Nested arguments retain their own declaration context after substitution.
+    fn java_field_projection(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        target: u32,
+        template: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        if depth >= 32 {
+            return None;
+        }
+        let class = self.class_scope(target)?;
+        let owner = &self.syms[class as usize];
+        let java = self.files[owner.file as usize].java.as_ref()?;
+        let count = java.type_parameter_count(&owner.name, owner.line, owner.java_site);
+        let (_, value) = self.java_declared_receiver(source, receiver, depth + 1)?;
+        let arguments = match &value {
+            JavaReceiver::Parameterized { arguments, .. }
+            | JavaReceiver::BoundType {
+                arguments: Some(arguments),
+                ..
+            } => Some(arguments),
+            _ => None,
+        };
+        let direct = self.java_receiver_classes(source, receiver, depth + 1) == [class];
+        if direct && arguments.is_some_and(|arguments| arguments.len() != count) {
+            return None;
+        }
+        match template {
+            JavaReceiver::Parameter(parameter) => {
+                let index =
+                    java.parameter_index(&owner.name, owner.line, owner.java_site, parameter)?;
+                // An inherited field's declaring parameters cannot be indexed
+                // into a subclass's unrelated parameter list.
+                if direct {
+                    if let Some(value) =
+                        self.java_argument_receiver(source, receiver, index, depth + 1)
+                    {
+                        return Some(value);
+                    }
+                }
+                java.type_bound(&owner.name, owner.line, owner.java_site, parameter)
+                    .map(|bound| (target, JavaReceiver::Type(bound.to_owned())))
+            }
+            JavaReceiver::Parameterized { path, arguments } => {
+                // A raw generic owner erases a parameterized field to its raw
+                // type. Its element cannot borrow a class parameter's bound.
+                if count > 0
+                    && matches!(
+                        value,
+                        JavaReceiver::Type(_)
+                            | JavaReceiver::BoundType {
+                                arguments: None,
+                                ..
+                            }
+                    )
+                {
+                    return Some((target, JavaReceiver::Type(path.clone())));
+                }
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| {
+                        let (context, value) = self.java_field_projection(
+                            source,
+                            receiver,
+                            target,
+                            argument.as_ref()?,
+                            depth + 1,
+                        )?;
+                        Some(self.java_qualified_receiver(context, &value, depth + 1))
+                    })
+                    .collect();
+                Some((
+                    target,
+                    JavaReceiver::Parameterized {
+                        path: path.clone(),
+                        arguments,
+                    },
+                ))
+            }
+            _ => Some((target, template.clone())),
         }
     }
 
