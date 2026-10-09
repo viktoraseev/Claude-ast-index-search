@@ -677,6 +677,7 @@ pub(crate) struct DependencyMemberType {
     pub result_type: Option<DependencyResultType>,
     pub position: usize,
     pub arity: Option<usize>,
+    pub varargs: bool,
     pub contexts: Vec<String>,
     pub parameters: Option<Vec<Option<String>>>,
     pub is_static: bool,
@@ -716,18 +717,23 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
                     .any(|n| n.kind() == "dimensions")
         })
         .map(|ty| node_text(content, &ty).to_owned());
-    let arity = member
+    let arity = member.child_by_field_name("parameters").map(|parameters| {
+        let mut count = 0;
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            count += usize::from(matches!(
+                parameter.kind(),
+                "formal_parameter" | "spread_parameter"
+            ));
+        }
+        count
+    });
+    let varargs = member
         .child_by_field_name("parameters")
-        .and_then(|parameters| {
-            let mut count = 0;
-            let mut cursor = parameters.walk();
-            for parameter in parameters.named_children(&mut cursor) {
-                if parameter.kind() == "spread_parameter" {
-                    return None;
-                }
-                count += usize::from(parameter.kind() == "formal_parameter");
-            }
-            Some(count)
+        .is_some_and(|parameters| {
+            parameters
+                .named_children(&mut parameters.walk())
+                .any(|p| p.kind() == "spread_parameter")
         });
     let modifiers = member
         .named_children(&mut member.walk())
@@ -743,19 +749,16 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         .is_some_and(|body| matches!(body.kind(), "interface_body" | "annotation_type_body"));
     let parameters = member
         .child_by_field_name("parameters")
-        .and_then(|parameters| {
+        .map(|parameters| {
             let mut result = Vec::new();
             for p in parameters
                 .named_children(&mut parameters.walk())
                 .filter(|p| !p.is_extra())
             {
-                if p.kind() == "spread_parameter" {
-                    return None;
-                }
-                if p.kind() != "formal_parameter" {
+                if !matches!(p.kind(), "formal_parameter" | "spread_parameter") {
                     continue;
                 }
-                result.push(p.child_by_field_name("type").and_then(|ty| {
+                result.push(parameter_type(p).and_then(|ty| {
                     // Inference and parameterized formal conversions are separate
                     // contracts. Never erase them into a guessed overload match.
                     if ty.kind() == "generic_type"
@@ -769,14 +772,22 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
                         .map(|child| node_text(content, &child))
                         .collect::<String>();
                     Some(
-                        format!("{}{dimensions}", node_text(content, &ty))
-                            .chars()
-                            .filter(|c| !c.is_whitespace())
-                            .collect(),
+                        format!(
+                            "{}{dimensions}{}",
+                            node_text(content, &ty),
+                            if p.kind() == "spread_parameter" {
+                                "[]"
+                            } else {
+                                ""
+                            }
+                        )
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect(),
                     )
                 }));
             }
-            Some(result)
+            result
         });
     DependencyMemberType {
         path,
@@ -789,6 +800,7 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
             .and_then(|ty| dependency_result_type(ty, content, package, 0)),
         position: ty.map_or(member.start_byte(), |ty| ty.start_byte()),
         arity,
+        varargs,
         contexts: dependency_contexts(member, content, package),
         parameters,
         is_static: modifier("static"),

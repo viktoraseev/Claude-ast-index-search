@@ -2810,7 +2810,7 @@ impl JavaDependencyLookup<'_> {
         Ok(Some(identity))
     }
 
-    /// Resolve fixed-arity source overloads without hiding a parent's other signatures.
+    /// Resolve source overloads without hiding a parent's other signatures.
     fn method_candidates(
         &self,
         owner: &JavaDependencyType,
@@ -3047,13 +3047,20 @@ impl JavaDependencyLookup<'_> {
     > {
         let mut applicable = Vec::new();
         let candidates = self.method_candidates(&value.owner, name, false, &mut HashSet::new())?;
-        // JLS invocation phases: strict widening must win before any boxing.
-        for loose in [false, true] {
+        // JLS 15.12.2: fixed strict, fixed loose, then variable arity.
+        // A varargs declaration participates in the first phases as an array.
+        for (loose, variable) in [(false, false), (true, false), (true, true)] {
             let mut uncertain = false;
             for (owner, signature) in &candidates {
-                if signature.arity != Some(arguments.len())
-                    || !value.instance && !signature.is_static
-                {
+                let arity_matches = if variable {
+                    signature.varargs
+                        && signature
+                            .arity
+                            .is_some_and(|n| arguments.len() >= n.saturating_sub(1))
+                } else {
+                    signature.arity == Some(arguments.len())
+                };
+                if !arity_matches || !value.instance && !signature.is_static {
                     continue;
                 }
                 let allowed = if signature.private {
@@ -3081,10 +3088,24 @@ impl JavaDependencyLookup<'_> {
                 if !allowed {
                     continue;
                 }
-                let Some(parameters) = self.method_parameters(owner, signature)? else {
+                let Some(mut parameters) = self.method_parameters(owner, signature)? else {
                     uncertain = true;
                     continue;
                 };
+                if variable {
+                    let Some(component) = parameters
+                        .last()
+                        .and_then(|p| p.strip_suffix("[]"))
+                        .map(str::to_owned)
+                    else {
+                        uncertain = true;
+                        continue;
+                    };
+                    parameters.pop();
+                    // Retain one tail slot even for an empty spread: most-
+                    // specific selection must compare String... to Object....
+                    parameters.resize(arguments.len().max(parameters.len() + 1), component);
+                }
                 let mut compatible = true;
                 let mut unknown = false;
                 for (argument, formal) in arguments.iter().zip(&parameters) {
@@ -3118,7 +3139,16 @@ impl JavaDependencyLookup<'_> {
                     continue;
                 }
                 let mut more_specific = true;
-                for (other, current) in other_parameters.iter().zip(parameters) {
+                for position in 0..parameters.len().max(other_parameters.len()) {
+                    // Variable-arity tails repeat beyond the written signature.
+                    let other = other_parameters
+                        .get(position)
+                        .or_else(|| other_parameters.last());
+                    let current = parameters.get(position).or_else(|| parameters.last());
+                    let (Some(other), Some(current)) = (other, current) else {
+                        more_specific = false;
+                        break;
+                    };
                     more_specific &= self.invocation_conversion(other, current, false)?;
                 }
                 if more_specific

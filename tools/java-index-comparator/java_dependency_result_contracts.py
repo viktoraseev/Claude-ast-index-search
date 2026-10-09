@@ -10,7 +10,8 @@ from root_contracts import Runner
 FEATURES = {'unused-deps:java-source-results'}
 REASON = ('independent source/javac/CLI: explicit class generic result substitution, '
           'fields/records/inheritance and initializer-site var chains with access, '
-          'ambiguity and attached classpath guards; not MCP equivalence')
+          'ambiguity, nominal variable-arity invocation phases and attached classpath guards; '
+          'not MCP equivalence')
 
 # Each input has an authored declaring owner. Invalid-Java guards must remain
 # uncredited; VALID_NEGATIVE_CASES separately compile valid ownership controls.
@@ -35,6 +36,26 @@ CASES = {
     'primitive-array-object-result': ('class Box { shared.Child get(Object value){return null;} }', 'Box b, int[] value', 'b.get(value).instance()', True),
     'strict-before-boxing-result': ('class Box { shared.Child get(long value){return null;} Object get(Integer value){return null;} }', 'Box b', 'b.get(0).instance()', True),
     'strict-before-unboxing-result': ('class Box { shared.Child get(Object value){return null;} Object get(int value){return null;} }', 'Box b, Integer value', 'b.get(value).instance()', True),
+    'varargs-empty-result': ('class Box { shared.Child get(String... values){return null;} }', 'Box b', 'b.get().instance()', True),
+    'varargs-single-result': ('class Box { shared.Child get(String... values){return null;} }', 'Box b', 'b.get("x").instance()', True),
+    'varargs-many-result': ('class Box { shared.Child get(String... values){return null;} }', 'Box b', 'b.get("x","y").instance()', True),
+    'varargs-array-result': ('class Box { shared.Child get(String... values){return null;} }', 'Box b, String[] values', 'b.get(values).instance()', True),
+    'varargs-null-result': ('class Box { shared.Child get(String... values){return null;} }', 'Box b', 'b.get(null).instance()', True),
+    'varargs-prefix-result': ('class Box { shared.Child get(int prefix, String... values){return null;} }', 'Box b', 'b.get(0,"x","y").instance()', True),
+    'varargs-boxing-result': ('class Box { shared.Child get(Integer... values){return null;} }', 'Box b', 'b.get(0,1).instance()', True),
+    'varargs-unboxing-result': ('class Box { shared.Child get(long... values){return null;} }', 'Box b, Integer value', 'b.get(value,value).instance()', True),
+    'varargs-specific-result': ('class Box { shared.Child get(String... values){return null;} Object get(Object... values){return null;} }', 'Box b', 'b.get("x","y").instance()', True),
+    'varargs-empty-specific-result': ('class Box { shared.Child get(String... values){return null;} Object get(Object... values){return null;} }', 'Box b', 'b.get().instance()', True),
+    'varargs-inherited-result': ('class Parent { shared.Child get(String... values){return null;} } class Box extends Parent { Object get(int value){return null;} }', 'Box b', 'b.get("x","y").instance()', True),
+    'varargs-inherited-owner': ('', 'shared.Child b', 'b.gather("x","y")', True),
+    'fixed-before-varargs-result': ('class Box { shared.Child get(Object value){return null;} Object get(String... values){return null;} }', 'Box b', 'b.get("x").instance()', True),
+    'loose-before-varargs-result': ('class Box { shared.Child get(Integer value){return null;} Object get(int... values){return null;} }', 'Box b', 'b.get(0).instance()', True),
+    'varargs-capture-result': ('class Box { shared.Child get(String... values){return null;} }', 'Box b', 'var c=b.get("x","y"); return ((java.util.function.IntSupplier)c::instance).getAsInt()', True),
+    'fixed-before-varargs-guard': ('class Box { Object get(Object value){return null;} shared.Child get(String... values){return null;} }', 'Box b', 'b.get("x").instance()', False),
+    'varargs-prefix-guard': ('class Box { shared.Child get(int prefix, String... values){return null;} }', 'Box b', 'b.get().instance()', False),
+    'varargs-type-guard': ('class Box { shared.Child get(String... values){return null;} }', 'Box b', 'b.get(0,1).instance()', False),
+    'varargs-private-guard': ('class Box { private shared.Child get(String... values){return null;} }', 'Box b', 'b.get("x","y").instance()', False),
+    'varargs-ambiguous-guard': ('class Box { shared.Child get(String... values){return null;} shared.Child get(Integer... values){return null;} }', 'Box b', 'b.get().instance()', False),
     'strict-before-boxing-guard': ('class Box { Object get(long value){return null;} shared.Child get(Integer value){return null;} }', 'Box b', 'b.get(0).instance()', False),
     'primitive-array-covariance-guard': ('class Box { shared.Child get(Object[] value){return null;} }', 'Box b, int[] value', 'b.get(value).instance()', False),
     'array-element-boxing-guard': ('class Box { shared.Child get(Integer[] value){return null;} }', 'Box b, int[] value', 'b.get(value).instance()', False),
@@ -123,7 +144,7 @@ def exercise(binary, base):
 
         write('base/build.gradle', 'plugins {}')
         write('lib/build.gradle', 'dependencies { api(project(":base")) }')
-        base_source = write('base/Base.java', 'package shared; public class Base { public int instance(){return 1;} public int choose(String value){return 2;} }')
+        base_source = write('base/Base.java', 'package shared; public class Base { public int instance(){return 1;} public int choose(String value){return 2;} public int gather(String... values){return 4;} }')
         child_source = write('lib/Child.java', 'package shared; public class Child extends Base { public int choose(int value){return 3;} }')
         valid, invalid = [], []
         for label, (declarations, parameter, body, used) in CASES.items():
@@ -171,6 +192,12 @@ def exercise(binary, base):
                 record(label + ':' + str(bool(flags)), want, classifications(label, flags))
             _, text = runner.command('unused-deps', label, '--verbose', '--strict')
             record(label + ':text', True, ('Base' in text) == used)
+            if 'varargs' in label:
+                for flags in (('--no-transitive',), ('--no-xml',), ('--no-resources',),
+                              ('--no-transitive', '--no-xml', '--no-resources')):
+                    record(label + ':options:' + ','.join(flags), want, classifications(label, flags))
+                _, text = runner.command('unused-deps', label, '--verbose')
+                record(label + ':default-text', True, ('Base' in text) == used)
 
         # A provider result is resolved in its own imports, across the selected
         # attached classpath. Colliding primary definitions are a negative
@@ -208,6 +235,20 @@ def exercise(binary, base):
         record('attached:inherited-result', [('attached::base', 'direct', ['Base']),
             ('attached::box', 'direct', ['Box', 'Wrap']), ('attached::lib', 'direct', ['Child'])],
             classifications('consumer', ('--strict',), attached))
+        write('box/Box.java', 'package api; public class Box<T> { public T get(String... values){return null;} }', attached)
+        write('consumer/Use.java', 'package fixture; class Use { int run(api.Wrap<shared.Child> b){var c=b.get("x","y"); return c.instance();} }', attached)
+        with (runner.directory / 'attached.varargs.javac.log').open('wb') as log:
+            result = subprocess.run([javac, '-proc:none', '-d', str(runner.directory / 'attached-classes'),
+                *map(str, sorted(attached.rglob('*.java')))], stdout=log, stderr=log, timeout=30)
+        if result.returncode:
+            raise ToolError('attached varargs source fixture failed javac; see private log')
+        runner.command('update')
+        varargs_want = [('attached::base', 'direct', ['Base']), ('attached::box', 'direct', ['Box', 'Wrap']),
+                        ('attached::lib', 'direct', ['Child'])]
+        for flags in ((), ('--strict',), ('--no-transitive', '--no-xml', '--no-resources')):
+            record('attached:varargs:' + ','.join(flags), varargs_want, classifications('consumer', flags, attached))
+        runner.command('rebuild', '--force', '--max-files', '0')
+        record('attached:varargs:rebuild', varargs_want, classifications('consumer', ('--strict',), attached))
         write('consumer/Use.java', 'package fixture; class Use { int run(api.Box<shared.Child> b){var c=b.get(); return c.instance();} }', attached)
         write('box/Box.java', 'package api; public class Box<T> { public Object get(){return null;} }', attached)
         runner.command('update')

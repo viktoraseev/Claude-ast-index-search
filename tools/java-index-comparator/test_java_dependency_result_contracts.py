@@ -62,6 +62,18 @@ class DependencyResultTests(unittest.TestCase):
         self.assertEqual(contracts.CASES['inherited-overload'][2], 'b.choose("x")')
         self.assertIn('child-overload-control', contracts.VALID_NEGATIVE_CASES)
         self.assertIs(contracts.CASES['child-overload-control'][3], False)
+        # Variable-arity overloads are executable ownership obligations too;
+        # dropping a spread, invocation phase or inherited owner cannot close them.
+        for name in ('varargs-empty-result', 'varargs-single-result', 'varargs-many-result',
+                     'varargs-array-result', 'varargs-null-result', 'varargs-prefix-result',
+                     'varargs-boxing-result', 'varargs-unboxing-result', 'varargs-specific-result',
+                     'varargs-empty-specific-result', 'varargs-inherited-result',
+                     'varargs-inherited-owner', 'fixed-before-varargs-result',
+                     'loose-before-varargs-result', 'varargs-capture-result'):
+            self.assertIs(contracts.CASES[name][3], True)
+        for name in ('fixed-before-varargs-guard', 'varargs-prefix-guard', 'varargs-type-guard',
+                     'varargs-private-guard', 'varargs-ambiguous-guard'):
+            self.assertIs(contracts.CASES[name][3], False)
 
     def test_bad_missing_or_interrupted_results_never_pass_or_close_parents(self):
         self.assertIn(self.feature, required_features())
