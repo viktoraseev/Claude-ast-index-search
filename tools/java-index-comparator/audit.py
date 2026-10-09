@@ -76,6 +76,7 @@ import android_dependency_contracts
 import format_contracts
 import navigation_format_contracts
 import file_view_contracts
+import outline_contracts
 import file_scope_contracts
 import navigation_scope_contracts
 import caller_scope_contracts
@@ -584,6 +585,7 @@ class Fixture:
         self._format_results = None
         self._navigation_format_results = None
         self._file_view_results = None
+        self._outline_span_results = None
         self._file_scope_results = None
         self._navigation_scope_results = None
         self._caller_scope_results = None
@@ -2274,6 +2276,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def outline_span_check(self, check: sqlite3.Row):
+        if self._outline_span_results is None:
+            self._outline_span_results = outline_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._outline_span_results)
+        return {'source': outline_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def file_scope_check(self, check: sqlite3.Row):
         if self._file_scope_results is None:
             self._file_scope_results = file_scope_contracts.exercise(self.binary, self.database.parent)
@@ -2482,6 +2492,8 @@ class Fixture:
                 handler = self.call_tree_mcp_check
             if check['feature'] in file_view_contracts.FEATURES:
                 handler = self.file_view_check
+            if check['feature'] in outline_contracts.FEATURES:
+                handler = self.outline_span_check
             if check['feature'] in file_scope_contracts.FEATURES:
                 handler = self.file_scope_check
             if check['feature'] in navigation_scope_contracts.FEATURES:
@@ -2596,6 +2608,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(format_contracts.FEATURES)
     features.update(navigation_format_contracts.FEATURES)
     features.update(file_view_contracts.FEATURES)
+    features.update(outline_contracts.FEATURES)
     features.update(file_scope_contracts.FEATURES)
     features.update(navigation_scope_contracts.FEATURES)
     features.update(caller_scope_contracts.FEATURES)
@@ -2790,6 +2803,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     android_dependency_contracts.plan_dependencies(state, root, java_only=java_only)
     format_contracts.plan_formats(state, root)
     file_view_contracts.plan_views(state, root)
+    outline_contracts.plan_spans(state, root)
     file_scope_contracts.plan_scope(state, root)
     navigation_scope_contracts.plan_scope(state, root)
     caller_scope_contracts.plan_scope(state, root)
