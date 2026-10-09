@@ -2928,6 +2928,16 @@ impl JavaDependencyLookup<'_> {
         owner: &JavaDependencyType,
         signature: &crate::parsers::treesitter::java::DependencyMemberType,
     ) -> Result<Option<Vec<String>>> {
+        self.method_value_parameters(owner, signature, None)
+    }
+
+    /// Bind class variables at the declaring ancestor, before invocation phases.
+    fn method_value_parameters(
+        &self,
+        owner: &JavaDependencyType,
+        signature: &crate::parsers::treesitter::java::DependencyMemberType,
+        value: Option<&JavaDependencyValue>,
+    ) -> Result<Option<Vec<String>>> {
         let Some(parameters) = &signature.parameters else {
             return Ok(None);
         };
@@ -2937,7 +2947,49 @@ impl JavaDependencyLookup<'_> {
             ..*self
         };
         let mut result = Vec::new();
-        for parameter in parameters {
+        for (index, parameter) in parameters.iter().enumerate() {
+            if let Some(Some((variable, dimensions))) = signature.parameter_variables.get(index) {
+                let Some(value) = value else { return Ok(None) };
+                // A wildcard slot represents a capture, not its upper bound.
+                // Do not manufacture a writable parameter from an unknown slot.
+                if let crate::parsers::treesitter::java::DependencyResultType::Parameter {
+                    owner,
+                    name,
+                } = variable
+                {
+                    if owner != &value.owner.identity {
+                        return Ok(None);
+                    }
+                    let slot = value
+                        .owner
+                        .declaration
+                        .type_parameters
+                        .iter()
+                        .position(|p| p == name);
+                    if slot
+                        .and_then(|index| value.arguments.get(index))
+                        .is_some_and(Option::is_none)
+                    {
+                        return Ok(None);
+                    }
+                }
+                let Some(formal) = binding.result_value(
+                    variable,
+                    usize::MAX,
+                    &owner.declaration.imports,
+                    Some(value),
+                    0,
+                )?
+                else {
+                    return Ok(None);
+                };
+                result.push(format!(
+                    "{}{}",
+                    formal.owner.identity,
+                    "[]".repeat(*dimensions)
+                ));
+                continue;
+            }
             let Some(ty) = parameter else { return Ok(None) };
             let Some(ty) = binding.invocation_identity(
                 ty,
@@ -3088,7 +3140,14 @@ impl JavaDependencyLookup<'_> {
                 if !allowed {
                     continue;
                 }
-                let Some(mut parameters) = self.method_parameters(owner, signature)? else {
+                let substitution = if signature.parameter_variables.iter().any(Option::is_some) {
+                    self.declaring_value(value, &owner.identity, &mut HashSet::new(), 0)?
+                } else {
+                    None
+                };
+                let Some(mut parameters) =
+                    self.method_value_parameters(owner, signature, substitution.as_ref())?
+                else {
                     uncertain = true;
                     continue;
                 };
@@ -3211,7 +3270,24 @@ impl JavaDependencyLookup<'_> {
         {
             return Ok(None);
         }
-        let identity = if path.contains('.') {
+        let scalar = self.invocation_identity(path, position, imports)?;
+        let identity = if scalar.as_deref().is_some_and(|identity| {
+            matches!(
+                identity,
+                "java.lang.String"
+                    | "java.lang.Object"
+                    | "java.lang.Integer"
+                    | "java.lang.Long"
+                    | "java.lang.Boolean"
+                    | "java.lang.Double"
+                    | "java.lang.Float"
+                    | "java.lang.Short"
+                    | "java.lang.Byte"
+                    | "java.lang.Character"
+            )
+        }) {
+            scalar.unwrap()
+        } else if path.contains('.') {
             path.to_owned()
         } else if let Some((import, static_)) = imports
             .iter()
@@ -3244,6 +3320,16 @@ impl JavaDependencyLookup<'_> {
                 vec!["E".to_owned()]
             }
             "java.util.Map" => vec!["K".to_owned(), "V".to_owned()],
+            "java.lang.String"
+            | "java.lang.Object"
+            | "java.lang.Integer"
+            | "java.lang.Long"
+            | "java.lang.Boolean"
+            | "java.lang.Double"
+            | "java.lang.Float"
+            | "java.lang.Short"
+            | "java.lang.Byte"
+            | "java.lang.Character" => Vec::new(),
             _ => return Ok(None),
         };
         Ok(Some(JavaDependencyType {

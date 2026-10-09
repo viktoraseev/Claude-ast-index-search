@@ -115,7 +115,7 @@ CONTRACTS = {
     'java_inherited_import_contracts': ('src/commands/modules.rs',
         'unused-deps Java inherited/member/type/value imports and nominal chains in colliding roots: declaring provenance, lexical/value/record/local-subclass access and hiding guards, options/refresh'),
     'java_dependency_result_contracts': ('src/commands/modules.rs',
-        'unused-deps Java nominal field/return chains across attached modules: declaring identity, private/protected/this/super access, arity/ambiguous/array/static-context guards and option/refresh controls'),
+        'unused-deps Java nominal field/return chains across attached modules: declaring identity, private/protected/this/super access, arity/ambiguous/array/static-context guards, class-variable formals through inheritance/arrays/varargs/boxing and option/refresh controls'),
     'android_dependency_contracts': ('src/commands/android.rs and src/commands/modules.rs',
         'Java resource ownership: same resource names across attached modules, dependency R modes and literal namespace metadata; declaring root and unused-deps positives/negatives; XML-only syntax excluded'),
 }
@@ -261,7 +261,7 @@ RETAINED = (
     ('unused-deps:java-module-binding', 'disposable-java-module-declaration-binding', 151, '2f652ff6f93dc209f858d5994eb79063c391c04cd2fb6ff0e90196b3d941e9c0', '013a9a726cb3e0f837d870fbf532e70af59aa021cf0aac70e6d9fd2e5be402e4', 'java_module_binding_contracts'),
     # Retain the added variable-arity phases, guards, option pages and attached
     # refresh assertions alongside the original source-result population.
-    ('unused-deps:java-source-results', 'disposable-java-source-result-ownership', 376, '0712023ff5fc0c39ec91e71844d684ff06b43e1ebf754717d39f57ab87d6676a', '94b990bba15f047067fa5a85745992dac311bfc9f6d3d900ff58a087bcd56d42', 'java_dependency_result_contracts'),
+    ('unused-deps:java-source-results', 'disposable-java-source-result-ownership', 481, '446e9d85dc1844714e51f3dba756f80f214849b145f5bf8ea28c897304d79ee9', 'de76179437ccf953301f1cffc6f1b3067d07deeae3dc55425f085f20ccac9537', 'java_dependency_result_contracts'),
 )
 
 REVIEWED_SURFACE_SHA256 = 'f5a010676e71d715489eb595292d83e21e93ba4d9e8f2015279f9c55fb34a3df'

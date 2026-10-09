@@ -60,7 +60,9 @@ class DependencyResultTests(unittest.TestCase):
             scope_acceptance.validate_population(samples, criterion)
             for key in ('varargs-many-result:True', 'varargs-ambiguous-guard:True',
                         'fixed-before-varargs-guard:options:--no-transitive',
-                        'attached:varargs:rebuild'):
+                        'attached:varargs:rebuild', 'formal-class-reordered:True',
+                        'formal-class-boxed-array-guard:True', 'formal-class-shadow-array-guard:True',
+                        'attached:formals:rebuild'):
                 with self.subTest(removed_assertion=key):
                     smaller = dict(samples)
                     del smaller[key]
@@ -98,6 +100,15 @@ class DependencyResultTests(unittest.TestCase):
             self.assertIs(contracts.CASES[name][3], True)
         for name in ('fixed-before-varargs-guard', 'varargs-prefix-guard', 'varargs-type-guard',
                      'varargs-private-guard', 'varargs-ambiguous-guard'):
+            self.assertIs(contracts.CASES[name][3], False)
+        for name in ('formal-class-result', 'formal-class-array', 'formal-class-postfix-array',
+                     'formal-class-spread', 'formal-class-empty-spread', 'formal-class-inherited',
+                     'formal-class-reordered', 'formal-class-boxed', 'formal-class-raw-bounded'):
+            self.assertIs(contracts.CASES[name][3], True)
+        for name in ('formal-class-type-guard', 'formal-class-boxed-array-guard',
+                     'formal-class-shadow-guard', 'formal-class-shadow-array-guard',
+                     'formal-class-strict-phase-guard',
+                     'formal-class-local-wrapper-guard'):
             self.assertIs(contracts.CASES[name][3], False)
 
     def test_bad_missing_or_interrupted_results_never_pass_or_close_parents(self):

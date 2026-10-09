@@ -680,6 +680,7 @@ pub(crate) struct DependencyMemberType {
     pub varargs: bool,
     pub contexts: Vec<String>,
     pub parameters: Option<Vec<Option<String>>>,
+    pub parameter_variables: Vec<Option<(DependencyResultType, usize)>>,
     pub is_static: bool,
     pub public: bool,
     pub private: bool,
@@ -747,48 +748,68 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
     let interface_member = member
         .parent()
         .is_some_and(|body| matches!(body.kind(), "interface_body" | "annotation_type_body"));
-    let parameters = member
-        .child_by_field_name("parameters")
-        .map(|parameters| {
-            let mut result = Vec::new();
-            for p in parameters
-                .named_children(&mut parameters.walk())
-                .filter(|p| !p.is_extra())
-            {
-                if !matches!(p.kind(), "formal_parameter" | "spread_parameter") {
-                    continue;
-                }
-                result.push(parameter_type(p).and_then(|ty| {
-                    // Inference and parameterized formal conversions are separate
-                    // contracts. Never erase them into a guessed overload match.
-                    if ty.kind() == "generic_type"
-                        || parameter(ty, node_text(content, &ty), content)
-                    {
-                        return None;
-                    }
-                    let dimensions = p
-                        .named_children(&mut p.walk())
-                        .filter(|child| child.kind() == "dimensions")
-                        .map(|child| node_text(content, &child))
-                        .collect::<String>();
-                    Some(
-                        format!(
-                            "{}{dimensions}{}",
-                            node_text(content, &ty),
-                            if p.kind() == "spread_parameter" {
-                                "[]"
-                            } else {
-                                ""
-                            }
-                        )
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .collect(),
-                    )
-                }));
+    let mut parameter_variables = Vec::new();
+    let parameters = member.child_by_field_name("parameters").map(|parameters| {
+        let mut result = Vec::new();
+        for p in parameters
+            .named_children(&mut parameters.walk())
+            .filter(|p| !p.is_extra())
+        {
+            if !matches!(p.kind(), "formal_parameter" | "spread_parameter") {
+                continue;
             }
-            result
-        });
+            parameter_variables.push(parameter_type(p).and_then(|mut ty| {
+                let mut dimensions = usize::from(p.kind() == "spread_parameter");
+                for child in p.named_children(&mut p.walk()) {
+                    if child.kind() == "dimensions" {
+                        dimensions += node_text(content, &child).matches('[').count();
+                    }
+                }
+                while ty.kind() == "array_type" {
+                    dimensions += ty
+                        .child_by_field_name("dimensions")
+                        .map_or(0, |node| node_text(content, &node).matches('[').count());
+                    ty = ty.child_by_field_name("element")?;
+                }
+                let variable = dependency_result_type(ty, content, package, 0)?;
+                matches!(variable, DependencyResultType::Parameter { .. })
+                    .then_some((variable, dimensions))
+            }));
+            result.push(parameter_type(p).and_then(|ty| {
+                // Inference and parameterized formal conversions are separate
+                // contracts. Never erase them into a guessed overload match.
+                let mut element = ty;
+                while element.kind() == "array_type" {
+                    element = element.child_by_field_name("element")?;
+                }
+                if element.kind() == "generic_type"
+                    || parameter(element, node_text(content, &element), content)
+                {
+                    return None;
+                }
+                let dimensions = p
+                    .named_children(&mut p.walk())
+                    .filter(|child| child.kind() == "dimensions")
+                    .map(|child| node_text(content, &child))
+                    .collect::<String>();
+                Some(
+                    format!(
+                        "{}{dimensions}{}",
+                        node_text(content, &ty),
+                        if p.kind() == "spread_parameter" {
+                            "[]"
+                        } else {
+                            ""
+                        }
+                    )
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect(),
+                )
+            }));
+        }
+        result
+    });
     DependencyMemberType {
         path,
         result_type: ty
@@ -803,6 +824,7 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         varargs,
         contexts: dependency_contexts(member, content, package),
         parameters,
+        parameter_variables,
         is_static: modifier("static"),
         public: modifier("public") || interface_member && !modifier("private"),
         private: modifier("private"),
@@ -3154,6 +3176,34 @@ class Peer { Guarded field; int value=SECRET+secret(); }
                 .result_type
                 .is_none());
         }
+    }
+
+    #[test]
+    fn dependency_class_formals_keep_variable_owners_and_array_dimensions() {
+        let source = r#"package fixture;
+        class Box<T> {
+            T direct(T value) { return value; }
+            T array(T[][] value) { return null; }
+            T postfix(T value[]) { return null; }
+            T spread(T... values) { return null; }
+            <T> Object shadow(T value) { return value; }
+            <T extends String> Object shadowArray(T[] value) { return value; }
+        }"#;
+        let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
+            .unwrap()
+            .unwrap();
+        for (method, dimensions) in [("direct", 0), ("array", 2), ("postfix", 1), ("spread", 1)] {
+            let signature = &declaration.value_types[&(method.into(), true)][0];
+            assert!(matches!(&signature.parameter_variables[0],
+                Some((DependencyResultType::Parameter { owner, name }, count))
+                    if owner == "fixture.Box" && name == "T" && *count == dimensions));
+        }
+        let shadow = &declaration.value_types[&("shadow".into(), true)][0];
+        assert!(shadow.parameter_variables[0].is_none());
+        assert!(shadow.parameters.as_ref().unwrap()[0].is_none());
+        let shadow_array = &declaration.value_types[&("shadowArray".into(), true)][0];
+        assert!(shadow_array.parameter_variables[0].is_none());
+        assert!(shadow_array.parameters.as_ref().unwrap()[0].is_none());
     }
 
     #[test]

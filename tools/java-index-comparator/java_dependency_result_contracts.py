@@ -10,12 +10,45 @@ from root_contracts import Runner
 FEATURES = {'unused-deps:java-source-results'}
 REASON = ('independent source/javac/CLI: explicit class generic result substitution, '
           'fields/records/inheritance and initializer-site var chains with access, '
-          'ambiguity, nominal variable-arity invocation phases and attached classpath guards; '
+          'ambiguity, class-variable formals/arrays/boxing, nominal variable-arity '
+          'invocation phases and attached classpath guards; '
           'not MCP equivalence')
 
 # Each input has an authored declaring owner. Invalid-Java guards must remain
 # uncredited; VALID_NEGATIVE_CASES separately compile valid ownership controls.
 CASES = {
+    'formal-class-bounded': ('class Box<T extends shared.Child> { T get(T value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-raw-bounded': ('class Box<T extends shared.Child> { T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-overridden': ('class Parent<T> { T get(T value){return value;} } class Box extends Parent<shared.Child> { shared.Child get(shared.Child value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-boxed': ('class Box<T> { shared.Child get(T value){return null;} }', 'Box<Integer> b', 'b.get(0).instance()', True),
+    'formal-class-boxed-array': ('class Box<T> { shared.Child get(T[] value){return null;} }', 'Box<Integer> b, Integer[] c', 'b.get(c).instance()', True),
+    'formal-class-boxed-spread': ('class Box<T> { shared.Child get(T... value){return null;} }', 'Box<Integer> b', 'b.get(0,1).instance()', True),
+    'formal-class-platform-string': ('class Box<T> { shared.Child get(T value){return null;} }', 'Box<String> b', 'b.get("x").instance()', True),
+    'formal-class-platform-object': ('class Box<T> { shared.Child get(T value){return null;} }', 'Box<Object> b', 'b.get("x").instance()', True),
+    'formal-class-boxed-type-guard': ('class Box<T> { shared.Child get(T value){return null;} }', 'Box<Integer> b', 'b.get("x").instance()', False),
+    'formal-class-boxed-array-guard': ('class Box<T> { shared.Child get(T[] value){return null;} }', 'Box<Integer> b, int[] c', 'b.get(c).instance()', False),
+    'formal-class-strict-phase-guard': ('class Box<T> { shared.Child get(T value){return null;} Object get(long value){return null;} }', 'Box<Integer> b', 'b.get(0).instance()', False),
+    'formal-class-local-wrapper-guard': ('class Integer {} class Box<T> { shared.Child get(T value){return null;} }', 'Box<Integer> b', 'b.get(0).instance()', False),
+    'formal-class-result': ('class Box<T> { T get(T value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-null': ('class Box<T> { T get(T value){return value;} }', 'Box<shared.Child> b', 'b.get(null).instance()', True),
+    'formal-class-array': ('class Box<T> { T get(T[] value){return null;} }', 'Box<shared.Child> b, shared.Child[] c', 'b.get(c).instance()', True),
+    'formal-class-postfix-array': ('class Box<T> { T get(T value[]){return null;} }', 'Box<shared.Child> b, shared.Child[] c', 'b.get(c).instance()', True),
+    'formal-class-spread': ('class Box<T> { T get(T... value){return null;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c,c).instance()', True),
+    'formal-class-empty-spread': ('class Box<T> { T get(T... value){return null;} }', 'Box<shared.Child> b', 'b.get().instance()', True),
+    'formal-class-fixed-spread': ('class Box<T> { T get(T... value){return null;} }', 'Box<shared.Child> b, shared.Child[] c', 'b.get(c).instance()', True),
+    'formal-class-inherited': ('class Parent<T> { T get(T value){return value;} } class Box<U> extends Parent<U> {}', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-reordered': ('class Other {} class Parent<A,B> { B get(A ignored,B value){return value;} } class Box<U,V> extends Parent<V,U> {}', 'Box<shared.Child,Other> b, Other a, shared.Child c', 'b.get(a,c).instance()', True),
+    'formal-class-other-slot': ('class Box<A,B> { B get(B value){return value;} }', 'Box<String,shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-specific': ('class Box<T extends shared.Child> { T get(T value){return value;} Object get(Object value){return null;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
+    'formal-class-type-guard': ('class Box<T> { T get(T value){return value;} }', 'Box<shared.Child> b', 'b.get("x").instance()', False),
+    'formal-class-array-guard': ('class Box<T> { T get(T[] value){return null;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', False),
+    'formal-class-spread-guard': ('class Box<T> { T get(T... value){return null;} }', 'Box<shared.Child> b', 'b.get("x").instance()', False),
+    'formal-class-private-guard': ('class Box<T> { private T get(T value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', False),
+    'formal-class-shadow-guard': ('class Box<T> { <T> Object get(T value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', False),
+    'formal-class-shadow-array-guard': ('class T extends shared.Child {} class Box<T> { <T extends String> shared.Child get(T[] value){return null;} }', 'Box<shared.Child> b, T[] c', 'b.get(c).instance()', False),
+    'formal-class-wildcard-guard': ('class Box<T> { T get(T value){return value;} }', 'Box<?> b, shared.Child c', 'b.get(c).instance()', False),
+    'formal-class-raw-guard': ('class Box<T> { T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', False),
+    'formal-class-arity-guard': ('class Box<T> { T get(T value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c,c).instance()', False),
     'generic': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'b.get().instance()', True),
     'inferred': ('class Box { shared.Child get(){return null;} }', 'Box b', 'var c=b.get(); return c.instance()', True),
     'generic-var': ('class Box<T> { T get(){return null;} }', 'Box<shared.Child> b', 'var c=b.get(); return c.instance()', True),
@@ -254,4 +287,27 @@ def exercise(binary, base):
         runner.command('update')
         record('attached:changed-result', [('attached::base', 'unused', []), ('attached::box', 'direct', ['Box']), ('attached::lib', 'direct', ['Child'])],
                classifications('consumer', ('--strict',), attached))
+        # Class formals bind in the declaring provider, including inherited
+        # parameter reordering. Keep primary/attached ownership distinct.
+        write('box/Box.java', 'package api; public class Box<T> { public T get(T... values){return null;} }', attached)
+        write('consumer/Use.java', 'package fixture; class Use { int run(api.Wrap<shared.Child> b, shared.Child c){var value=b.get(c,c); return value.instance();} }', attached)
+        with (runner.directory / 'attached.formals.javac.log').open('wb') as log:
+            result = subprocess.run([javac, '-proc:none', '-d', str(runner.directory / 'attached-formal-classes'),
+                *map(str, sorted(attached.rglob('*.java')))], stdout=log, stderr=log, timeout=30)
+        if result.returncode:
+            raise ToolError('attached generic formal fixture failed javac; see private log')
+        runner.command('update')
+        formal_want = [('attached::base', 'direct', ['Base']), ('attached::box', 'direct', ['Box', 'Wrap']),
+                       ('attached::lib', 'direct', ['Child'])]
+        for flags in ((), ('--strict',), ('--no-transitive',), ('--no-xml',), ('--no-resources',),
+                      ('--no-transitive', '--no-xml', '--no-resources')):
+            record('attached:formals:' + ','.join(flags), formal_want, classifications('consumer', flags, attached))
+        _, text = runner.command('unused-deps', 'consumer', '--verbose', '--strict', cwd=attached)
+        record('attached:formals:text', True, 'Base' in text)
+        runner.command('rebuild', '--force', '--max-files', '0')
+        record('attached:formals:rebuild', formal_want, classifications('consumer', ('--strict',), attached))
+        write('box/Box.java', 'package api; public class Box<T> { public Object get(T... values){return null;} }', attached)
+        runner.command('update')
+        record('attached:formals:changed-result', [('attached::base', 'unused', []), ('attached::box', 'direct', ['Box', 'Wrap']),
+            ('attached::lib', 'direct', ['Child'])], classifications('consumer', ('--strict',), attached))
         return expected, actual
