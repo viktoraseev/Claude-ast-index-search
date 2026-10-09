@@ -259,7 +259,9 @@ RETAINED = (
     ('unused-deps:java-android-ownership', 'disposable-java-android-dependency-ownership', 12, '8b3c7b819e98ed2f073d975f0d1f70cbcd7b652d0ae5e83e508e3b58fe468c2e', '5488cf2683acdeda0d432040b2de75e3a0608ab6a8cbaa87d8ddc10db94cca90', 'android_dependency_contracts'),
     ('unused-deps:java-inherited-imports', 'disposable-java-inherited-import-ownership', 3440, '307cc200bf538c16d8c19713a7884705119f38ccc9644072e5fc5c6c8d49bd16', '75fdb58f3f730581c4d2582f2a4ea973fd719525b42fd8d9255fd0c673c6d70e', 'java_inherited_import_contracts'),
     ('unused-deps:java-module-binding', 'disposable-java-module-declaration-binding', 151, '2f652ff6f93dc209f858d5994eb79063c391c04cd2fb6ff0e90196b3d941e9c0', '013a9a726cb3e0f837d870fbf532e70af59aa021cf0aac70e6d9fd2e5be402e4', 'java_module_binding_contracts'),
-    ('unused-deps:java-source-results', 'disposable-java-source-result-ownership', 212, '6ba4a2c1cdc92f3d20164711fe7f97a0d9848e3153af6adc914182a32df7947e', '2187ccd13280f1f9d36cb07edaac5822d9b053a0e3582e7537cc986e9f87685a', 'java_dependency_result_contracts'),
+    # Retain the added variable-arity phases, guards, option pages and attached
+    # refresh assertions alongside the original source-result population.
+    ('unused-deps:java-source-results', 'disposable-java-source-result-ownership', 376, '0712023ff5fc0c39ec91e71844d684ff06b43e1ebf754717d39f57ab87d6676a', '94b990bba15f047067fa5a85745992dac311bfc9f6d3d900ff58a087bcd56d42', 'java_dependency_result_contracts'),
 )
 
 REVIEWED_SURFACE_SHA256 = 'f5a010676e71d715489eb595292d83e21e93ba4d9e8f2015279f9c55fb34a3df'

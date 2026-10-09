@@ -7,8 +7,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from audit import Fixture, SCHEMA, plan, required_features
-from common import ToolError, connect, adapter_digest
+from common import ToolError, connect, adapter_digest, stable_id
 import java_dependency_result_contracts as contracts
+import scope_acceptance
+import scope_acceptance_spec
 
 
 class DependencyResultTests(unittest.TestCase):
@@ -47,6 +49,29 @@ class DependencyResultTests(unittest.TestCase):
                 'missing': len(diff.get('missing', [])), 'unexpected': len(diff.get('unexpected', []))})
             self.assertIn('not MCP equivalence', json.loads(row['expected_json'])['source'])
             self.assertEqual(exercise.call_count, 1)
+            # The scope parent must retain the whole executed ownership family,
+            # including later invocation-phase guards and attached refreshes.
+            samples = json.loads(row['expected_json'])['samples']
+            criterion = next(item for item in scope_acceptance.specification()['criteria']
+                             if item['feature'] == self.feature)
+            self.assertEqual(len(samples), criterion['samples_count'])
+            self.assertEqual(stable_id(scope_acceptance_spec.assertion_keys(samples, self.feature)),
+                             criterion['sample_keys_sha256'])
+            scope_acceptance.validate_population(samples, criterion)
+            for key in ('varargs-many-result:True', 'varargs-ambiguous-guard:True',
+                        'fixed-before-varargs-guard:options:--no-transitive',
+                        'attached:varargs:rebuild'):
+                with self.subTest(removed_assertion=key):
+                    smaller = dict(samples)
+                    del smaller[key]
+                    with self.assertRaises(scope_acceptance.AcceptancePending):
+                        scope_acceptance.validate_population(smaller, criterion)
+            smaller = json.loads(json.dumps(samples))
+            smaller['varargs-many-result:True'][0][2] = []
+            # Keeping every outer key cannot conceal loss of declaring-owner
+            # evidence inside a newly retained positive assertion.
+            with self.assertRaises(scope_acceptance.AcceptancePending):
+                scope_acceptance.validate_population(smaller, criterion)
         self.oracle.call.assert_not_called()
         self.assertFalse(self.fixture.database.exists())
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['Foreign.kt', 'Sentinel.java'])
