@@ -568,6 +568,7 @@ impl DropReason {
 
 struct FileNode {
     path: String,
+    root_path: String,
     stem: String,
     family: &'static str,
     /// An installed package ([`db::is_third_party_path`]): neither the source
@@ -775,6 +776,7 @@ impl Builder {
                 vendor,
                 test: is_test_path(&row.path),
                 path: row.path,
+                root_path: row.root_path,
                 has_ranges: false,
                 symbols: Vec::new(),
                 imports,
@@ -3145,6 +3147,16 @@ impl Builder {
                 {
                     declared.retain(|&candidate| self.syms[candidate as usize].file == file);
                 }
+                // Independent attached Java source roots may contain the same
+                // canonical type. Prefer this compilation's root before using
+                // declarations from a different registered project.
+                let same_root = |candidate: u32| {
+                    self.files[self.syms[candidate as usize].file as usize].root_path
+                        == self.files[file as usize].root_path
+                };
+                if declared.iter().any(|&candidate| same_root(candidate)) {
+                    declared.retain(|&candidate| same_root(candidate));
+                }
                 let mut classes = declared;
                 classes
                     .retain(|&candidate| self.java_type_accessible(source, candidate, at_import));
@@ -3586,6 +3598,7 @@ impl Builder {
             | JavaReceiver::Parameter(_)
             | JavaReceiver::Callback { .. }
             | JavaReceiver::CapturedField { .. }
+            | JavaReceiver::LexicalName { .. }
             | JavaReceiver::CollectedMap { .. }
             | JavaReceiver::StreamFactory { .. }
             | JavaReceiver::MethodProjection { .. } => Vec::new(),
@@ -4066,7 +4079,10 @@ impl Builder {
     }
 
     fn java_is_factory(&self, source: u32, receiver: &JavaReceiver, qualified: &str) -> bool {
-        let JavaReceiver::Type(path) = receiver else {
+        let Some((source, receiver)) = self.java_declared_receiver(source, receiver, 0) else {
+            return false;
+        };
+        let JavaReceiver::Type(path) = &receiver else {
             return false;
         };
         if !self
@@ -4461,16 +4477,23 @@ impl Builder {
                 {
                     return None;
                 }
-                let JavaReceiver::Type(path) = collector.as_ref() else {
+                let (collector_owner, collector) =
+                    self.java_declared_receiver(source, collector, depth + 1)?;
+                let JavaReceiver::Type(path) = &collector else {
                     return None;
                 };
                 if !self
-                    .resolve_java_type(source, self.namespace_of(source), path, None)
+                    .resolve_java_type(
+                        collector_owner,
+                        self.namespace_of(collector_owner),
+                        path,
+                        None,
+                    )
                     .is_empty()
                 {
                     return None;
                 }
-                let java = self.files[self.syms[source as usize].file as usize]
+                let java = self.files[self.syms[collector_owner as usize].file as usize]
                     .java
                     .as_ref()?;
                 let imported = java
@@ -4695,6 +4718,14 @@ impl Builder {
                 }
                 Some(result)
             }
+            JavaReceiver::LexicalName { name, boundary } => {
+                let receiver = JavaReceiver::CapturedField {
+                    value: Box::new(JavaReceiver::Type(name.clone())),
+                    name: name.clone(),
+                    boundary: boundary.clone(),
+                };
+                self.java_value_receiver(source, &receiver, depth + 1)
+            }
             JavaReceiver::CapturedField {
                 value,
                 name,
@@ -4713,12 +4744,17 @@ impl Builder {
                         return None;
                     };
                     let symbol = &self.syms[*target as usize];
-                    self.files[symbol.file as usize]
+                    let template = self.files[symbol.file as usize]
                         .java
                         .as_ref()?
-                        .member_receiver(&symbol.name, symbol.line, symbol.java_site)
-                        .cloned()
-                        .map(|value| (*target, value))
+                        .member_receiver(&symbol.name, symbol.line, symbol.java_site)?;
+                    self.java_field_projection(
+                        source,
+                        &JavaReceiver::Type(boundary.clone()),
+                        *target,
+                        template,
+                        depth + 1,
+                    )
                 }
             }
             JavaReceiver::Field { receiver, name } => {
@@ -5124,6 +5160,120 @@ impl Builder {
             return None;
         }
         let class = self.class_scope(target)?;
+        let (context, value) =
+            self.java_ancestor_receiver(source, receiver, class, depth + 1, &mut HashSet::new())?;
+        self.java_class_projection(context, &value, class, target, template, depth + 1)
+    }
+
+    /// Carry class arguments along proven parent identities, never by ordinal
+    /// position in a subclass's unrelated parameter list.
+    fn java_ancestor_receiver(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        ancestor: u32,
+        depth: usize,
+        visiting: &mut HashSet<u32>,
+    ) -> Option<(u32, JavaReceiver)> {
+        if depth >= 32 {
+            return None;
+        }
+        if matches!(receiver, JavaReceiver::Super) {
+            // `super` retains the current class's substituted superclass;
+            // treating it as the parent's raw name erases concrete arguments.
+            let class = self.class_scope(source)?;
+            return self.java_ancestor_receiver(
+                source,
+                &JavaReceiver::BoundType {
+                    class,
+                    arguments: None,
+                },
+                ancestor,
+                depth + 1,
+                visiting,
+            );
+        }
+        let (context, value) = self.java_declared_receiver(source, receiver, depth + 1)?;
+        let classes = self.java_receiver_classes(context, &value, depth + 1);
+        let [class] = classes.as_slice() else {
+            return None;
+        };
+        let class = *class;
+        if class == ancestor {
+            return Some((context, value));
+        }
+        if !visiting.insert(class) {
+            return None;
+        }
+        let symbol = &self.syms[class as usize];
+        let java = self.files[symbol.file as usize].java.as_ref()?;
+        let mut found = None;
+        for (template, site) in java.parent_receivers(symbol.java_site) {
+            let parents = self.resolve_java_type_reference(
+                class,
+                self.namespace_of(class),
+                &site.path,
+                Some(class),
+                Some(TypeReference::Position(site.position)),
+            );
+            let [parent] = parents.as_slice() else {
+                continue;
+            };
+            if !self
+                .parents_of(class)
+                .is_some_and(|parents| parents.contains(parent))
+            {
+                continue;
+            }
+            let (owner, projected) =
+                self.java_class_projection(context, &value, class, class, template, depth + 1)?;
+            let arguments = match projected {
+                JavaReceiver::Parameterized { arguments, .. } => Some(
+                    arguments
+                        .into_iter()
+                        .map(|argument| {
+                            argument.map(|argument| {
+                                self.java_bind_receiver_site(owner, &argument, site, depth + 1)
+                            })
+                        })
+                        .collect(),
+                ),
+                JavaReceiver::Type(_) => None,
+                _ => continue,
+            };
+            let parent_value = JavaReceiver::BoundType {
+                class: *parent,
+                arguments,
+            };
+            if let Some(candidate) =
+                self.java_ancestor_receiver(owner, &parent_value, ancestor, depth + 1, visiting)
+            {
+                if found
+                    .as_ref()
+                    .is_some_and(|previous| previous != &candidate)
+                {
+                    visiting.remove(&class);
+                    return None;
+                }
+                found = Some(candidate);
+            }
+        }
+        visiting.remove(&class);
+        found
+    }
+
+    fn java_class_projection(
+        &self,
+        source: u32,
+        receiver: &JavaReceiver,
+        class: u32,
+        target: u32,
+        template: &JavaReceiver,
+        depth: usize,
+    ) -> Option<(u32, JavaReceiver)> {
+        if depth >= 32 {
+            return None;
+        }
         let owner = &self.syms[class as usize];
         let java = self.files[owner.file as usize].java.as_ref()?;
         let count = java.type_parameter_count(&owner.name, owner.line, owner.java_site);
@@ -5136,22 +5286,20 @@ impl Builder {
             } => Some(arguments),
             _ => None,
         };
-        let direct = self.java_receiver_classes(source, receiver, depth + 1) == [class];
-        if direct && arguments.is_some_and(|arguments| arguments.len() != count) {
+        if arguments.is_some_and(|arguments| arguments.len() != count) {
             return None;
         }
         match template {
             JavaReceiver::Parameter(parameter) => {
                 let index =
                     java.parameter_index(&owner.name, owner.line, owner.java_site, parameter)?;
-                // An inherited field's declaring parameters cannot be indexed
-                // into a subclass's unrelated parameter list.
-                if direct {
-                    if let Some(value) =
-                        self.java_argument_receiver(source, receiver, index, depth + 1)
-                    {
-                        return Some(value);
-                    }
+                if let Some((context, value)) =
+                    self.java_argument_receiver(source, receiver, index, depth + 1)
+                {
+                    return Some((
+                        context,
+                        self.java_qualified_receiver(context, &value, depth + 1),
+                    ));
                 }
                 java.type_bound(&owner.name, owner.line, owner.java_site, parameter)
                     .map(|bound| (target, JavaReceiver::Type(bound.to_owned())))
@@ -5174,9 +5322,10 @@ impl Builder {
                 let arguments = arguments
                     .iter()
                     .map(|argument| {
-                        let (context, value) = self.java_field_projection(
+                        let (context, value) = self.java_class_projection(
                             source,
                             receiver,
+                            class,
                             target,
                             argument.as_ref()?,
                             depth + 1,
@@ -5348,6 +5497,26 @@ impl Builder {
         }
     }
 
+    /// A lexical name stays a type candidate until an inherited field is proven.
+    fn java_value_receiver_at(&self, file: u32, source: u32, line: i64, name: &str) -> bool {
+        self.files[file as usize].java.as_ref().is_some_and(|java| {
+            java.value_receiver(line, name)
+                || java
+                    .lexical_receiver_boundaries(line, name)
+                    .iter()
+                    .any(|boundary| {
+                        !self
+                            .java_field_targets(
+                                source,
+                                &JavaReceiver::Type(boundary.clone()),
+                                name,
+                                0,
+                            )
+                            .is_empty()
+                    })
+        })
+    }
+
     fn resolve_java_expression_call(
         &self,
         file: u32,
@@ -5414,8 +5583,21 @@ impl Builder {
                 if call.arguments.is_none() {
                     return None;
                 }
-                let JavaReceiver::Type(path) = &call.receiver else {
-                    return None;
+                let path = match &call.receiver {
+                    JavaReceiver::Type(path) => path,
+                    JavaReceiver::LexicalName { name, boundary }
+                        if self
+                            .java_field_targets(
+                                source,
+                                &JavaReceiver::Type(boundary.clone()),
+                                name,
+                                0,
+                            )
+                            .is_empty() =>
+                    {
+                        name
+                    }
+                    _ => return None,
                 };
                 // Only syntax-confirmed type qualifiers use the call site.
                 // A variable's declared type belongs to its declaration site.
@@ -5848,7 +6030,7 @@ impl Builder {
         if let Some(binding) = node
             .java
             .as_ref()
-            .filter(|java| !java.value_receiver(line, name))
+            .filter(|_| !self.java_value_receiver_at(file, source, line, name))
             .and_then(|java| java.type_reference(line, name))
         {
             let Some(path) = binding else {
@@ -5934,11 +6116,7 @@ impl Builder {
             // Callable dependencies require invocation/reference syntax.
             // A component field read must not invent a call to its getter.
             cands.retain(|&candidate| self.syms[candidate as usize].kind != "function");
-            if node
-                .java
-                .as_ref()
-                .is_some_and(|java| java.value_receiver(line, name))
-            {
+            if self.java_value_receiver_at(file, source, line, name) {
                 cands.retain(|&candidate| !is_container_kind(&self.syms[candidate as usize].kind));
             }
         }

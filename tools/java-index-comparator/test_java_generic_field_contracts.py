@@ -20,10 +20,41 @@ class GenericFieldContracts(unittest.TestCase):
         self.binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
 
     def test_production_generic_fields(self):
+        # Retain the reviewed population even if a source/fixture edit removes
+        # the corresponding body or expectation. Later cases may be added.
+        self.assertTrue(set('direct ordered nested sourceNested subtype rawBound captured reference '
+                            'colliding wildcardBound wildcardNested'.split()) <= fields.ORIGINAL_CALLS.keys())
+        self.assertTrue(set('inherited reordered relayed nestedParent inheritedBound inheritedRaw '
+                            'rawSubclass inheritedWildcard inheritedNested inheritedCaptured '
+                            'inheritedReference inheritedHiding inheritedLocal crossFile'.split())
+                        <= fields.INHERITED_CALLS.keys())
+        self.assertTrue(set('inheritedBare inheritedThis inheritedSuper inheritedLambda'.split())
+                        <= fields.LEXICAL_CALLS.keys())
         expected, actual = fields.exercise(self.binary, self.directory)
         differences = {feature: [key for key, want in expected[feature].items()
                                  if actual[feature].get(key) != want] for feature in sorted(fields.FEATURES)}
         self.assertEqual(differences, {feature: [] for feature in sorted(fields.FEATURES)})
+        # Every inherited field obligation executes each graph page and a path,
+        # in both roots. The original population remains a separate full pass.
+        for prefix in ('', 'extra/'):
+            for phase, calls in (('inherited/', fields.INHERITED_CALLS), ('lexical/', fields.LEXICAL_CALLS)):
+                for name, targets in calls.items():
+                    for limit in (0, 1, 100):
+                        for ambiguous in (False, True):
+                            key = f'{phase}{prefix}{name}:{limit}:{ambiguous}'
+                            self.assertIn(key, expected[fields.GRAPH])
+                    for target in targets:
+                        self.assertIn(f'{phase}{prefix}{name}:path:{target[2]}', expected[fields.GRAPH])
+            for target in ('fieldAlpha', 'fieldBeta'):
+                for phase in ('', 'inherited/', 'lexical/'):
+                    key = phase + prefix + target + ':callers'
+                    self.assertIn(key, expected[fields.EXPLORE])
+                    self.assertLessEqual(len(expected[fields.EXPLORE][key]), 10)
+        for guard in ('inherited-raw', 'inherited-wildcard', 'inherited-arity',
+                      'inherited-raw-nested', 'inherited-hidden', 'inherited-local-shadow',
+                      'inherited-static-bare', 'inherited-static-this', 'inherited-static-super'):
+            for ambiguous in (False, True):
+                self.assertEqual(expected[fields.GRAPH][guard + ':guard:' + str(ambiguous)], [])
 
     def test_incomplete_inventory_cannot_skip_an_applicable_contract(self):
         inventory = fields.mobile_contracts.inventory

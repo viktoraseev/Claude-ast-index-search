@@ -78,6 +78,7 @@ pub(super) struct JavaSource {
     member_containers: HashMap<(String, i64), Option<(String, i64)>>,
     type_positions: HashMap<(i64, String), Vec<usize>>,
     value_receivers: HashSet<(i64, String)>,
+    lexical_receivers: HashMap<(i64, String), Vec<String>>,
     /// Reference rows carry a line and name, not a byte position. Colliding
     /// paths or value/type uses on one line remain explicit negative evidence.
     types: HashMap<(i64, String), Option<String>>,
@@ -85,6 +86,7 @@ pub(super) struct JavaSource {
     /// Graph binding needs the full syntax path; legacy inheritance rows may
     /// contain only its short name.
     parents: HashMap<usize, Vec<String>>,
+    parent_receivers: HashMap<usize, Vec<(JavaReceiver, ReceiverTypeSite)>>,
     /// Callable identity, reference line and name; None means colliding or
     /// unsupported invocations. Never confidently choose the first on a line.
     invocations: HashMap<(String, i64, i64, String), Option<ParameterCall>>,
@@ -183,6 +185,12 @@ pub(super) enum JavaReceiver {
     },
     CapturedField {
         value: Box<JavaReceiver>,
+        name: String,
+        boundary: String,
+    },
+    /// An undeclared syntax name may be an inherited field or a type qualifier.
+    /// Only graph binding can prove the field exists.
+    LexicalName {
         name: String,
         boundary: String,
     },
@@ -1631,6 +1639,35 @@ fn captured_field(
     None
 }
 
+fn is_static(node: Node<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let found = node.named_children(&mut cursor).any(|child| {
+        child.kind() == "modifiers"
+            && text(child, source)
+                .split_whitespace()
+                .any(|word| word == "static")
+    });
+    found
+}
+
+fn instance_context(mut node: Node<'_>, source: &str) -> bool {
+    loop {
+        if node.kind() == "static_initializer"
+            || matches!(node.kind(), "method_declaration" | "field_declaration")
+                && is_static(node, source)
+        {
+            return false;
+        }
+        if matches!(node.kind(), "class_body" | "interface_body" | "enum_body") {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
 fn expression_receiver(
     node: Node<'_>,
     owner: Node<'_>,
@@ -1653,8 +1690,20 @@ fn expression_receiver(
         .unwrap_or(JavaReceiver::Unknown)
     };
     match node.kind() {
-        "this" => JavaReceiver::This,
-        "super" => JavaReceiver::Super,
+        "this" => {
+            if instance_context(node, source) {
+                JavaReceiver::This
+            } else {
+                JavaReceiver::Unknown
+            }
+        }
+        "super" => {
+            if instance_context(node, source) {
+                JavaReceiver::Super
+            } else {
+                JavaReceiver::Unknown
+            }
+        }
         "identifier" => {
             let mut ancestor = node.parent();
             while let Some(scope) = ancestor {
@@ -2020,7 +2069,28 @@ fn expression_receiver(
             }
             match variable_type(node, text(node, source), false, scopes, source) {
                 Some(binding) => typed(binding.map(str::to_owned)),
-                None => typed(Some(text(node, source).to_owned())),
+                None => {
+                    let fallback = typed(Some(text(node, source).to_owned()));
+                    if !instance_context(node, source) {
+                        return fallback;
+                    }
+                    let mut ancestor = node.parent();
+                    while let Some(class) = ancestor {
+                        if matches!(
+                            class.kind(),
+                            "class_declaration" | "enum_declaration" | "record_declaration"
+                        ) {
+                            if let Some(name) = class.child_by_field_name("name") {
+                                return JavaReceiver::LexicalName {
+                                    name: text(node, source).to_owned(),
+                                    boundary: text(name, source).to_owned(),
+                                };
+                            }
+                        }
+                        ancestor = class.parent();
+                    }
+                    fallback
+                }
             }
         }
         "type_identifier" | "scoped_type_identifier" | "generic_type" => {
@@ -2031,6 +2101,9 @@ fn expression_receiver(
                 .child_by_field_name("object")
                 .is_some_and(|base| base.kind() == "this") =>
         {
+            if !instance_context(node, source) {
+                return JavaReceiver::Unknown;
+            }
             if let Some(receiver) = node.child_by_field_name("field").and_then(|field| {
                 variable_receiver(node, text(field, source), true, scopes, source)
             }) {
@@ -2038,9 +2111,17 @@ fn expression_receiver(
             }
             let binding = node
                 .child_by_field_name("field")
-                .and_then(|field| variable_type(node, text(field, source), true, scopes, source))
-                .flatten();
-            typed(binding.map(str::to_owned))
+                .and_then(|field| variable_type(node, text(field, source), true, scopes, source));
+            match binding {
+                Some(binding) => typed(binding.map(str::to_owned)),
+                None => JavaReceiver::Field {
+                    receiver: Box::new(JavaReceiver::This),
+                    name: node
+                        .child_by_field_name("field")
+                        .map(|field| text(field, source).to_owned())
+                        .unwrap_or_default(),
+                },
+            }
         }
         "field_access" => match (
             node.child_by_field_name("object"),
@@ -2086,7 +2167,12 @@ fn expression_receiver(
                     node.child_by_field_name("arguments"),
                 ) {
                     let qualifier = expression_receiver(object, owner, source, scopes, depth + 1);
-                    if matches!(&qualifier, JavaReceiver::Type(path)
+                    let nominal = match &qualifier {
+                        JavaReceiver::CapturedField { value, .. } => value.as_ref(),
+                        value => value,
+                    };
+                    if matches!(nominal, JavaReceiver::Type(path)
+                        | JavaReceiver::LexicalName { name: path, .. }
                         if path == "Stream" || path == "java::util::stream::Stream")
                     {
                         let mut cursor = values.walk();
@@ -2365,16 +2451,7 @@ pub(crate) fn dependency_value_members(
                 .collect(),
         )
     }
-    fn is_static(node: Node<'_>, source: &str) -> bool {
-        let mut cursor = node.walk();
-        let found = node.named_children(&mut cursor).any(|child| {
-            child.kind() == "modifiers"
-                && text(child, source)
-                    .split_whitespace()
-                    .any(|word| word == "static")
-        });
-        found
-    }
+
     fn available(call: Node<'_>, ty: Node<'_>, source: &str) -> bool {
         let mut declaration = Some(ty);
         while let Some(node) = declaration {
@@ -2415,23 +2492,7 @@ pub(crate) fn dependency_value_members(
         }
         true
     }
-    fn instance_context(mut node: Node<'_>, source: &str) -> bool {
-        loop {
-            if node.kind() == "static_initializer"
-                || matches!(node.kind(), "method_declaration" | "field_declaration")
-                    && is_static(node, source)
-            {
-                return false;
-            }
-            if matches!(node.kind(), "class_body" | "interface_body" | "enum_body") {
-                return true;
-            }
-            let Some(parent) = node.parent() else {
-                return false;
-            };
-            node = parent;
-        }
-    }
+
     fn parameter_receiver(
         node: Node<'_>,
         source: &str,
@@ -3221,6 +3282,7 @@ impl JavaSource {
                                     )),
                         });
                     let mut parents = Vec::new();
+                    let mut parent_receivers = Vec::new();
                     let mut cursor = node.walk();
                     for branch in node.named_children(&mut cursor) {
                         if matches!(
@@ -3233,7 +3295,23 @@ impl JavaSource {
                                     "type_identifier" | "scoped_type_identifier" | "generic_type"
                                 ) {
                                     if let Some(path) = type_name(parent, source) {
-                                        parents.push(path);
+                                        parents.push(path.clone());
+                                        let receiver =
+                                            generic_receiver_at(parent, node, source, 0, true)
+                                                .unwrap_or_else(|| {
+                                                    JavaReceiver::Type(path.clone())
+                                                });
+                                        parent_receivers.push((
+                                            receiver,
+                                            ReceiverTypeSite {
+                                                path,
+                                                position: parent.start_byte(),
+                                                owner: text(name, source).to_owned(),
+                                                owner_line: name.start_position().row as i64 + 1,
+                                                owner_site: name.start_byte(),
+                                                owner_ordinal: None,
+                                            },
+                                        ));
                                     }
                                     return WalkControl::SkipChildren;
                                 }
@@ -3242,6 +3320,9 @@ impl JavaSource {
                         }
                     }
                     result.parents.insert(name.start_byte(), parents);
+                    result
+                        .parent_receivers
+                        .insert(name.start_byte(), parent_receivers);
                 }
             }
             if matches!(
@@ -3405,8 +3486,20 @@ impl JavaSource {
             let type_receiver = invocation_receiver
                 && variable_type(node, text(node, source), false, &scopes, source).is_none()
                 && callable(node).is_some_and(|owner| {
-                    matches!(expression_receiver(node, owner, source, &scopes, 0),
-                        JavaReceiver::Type(path) if path == text(node, source))
+                    let receiver = expression_receiver(node, owner, source, &scopes, 0);
+                    if let JavaReceiver::LexicalName { boundary, .. } = &receiver {
+                        result
+                            .lexical_receivers
+                            .entry((
+                                node.start_position().row as i64 + 1,
+                                text(node, source).to_owned(),
+                            ))
+                            .or_default()
+                            .push(boundary.clone());
+                    }
+                    matches!(receiver,
+                        JavaReceiver::Type(path) | JavaReceiver::LexicalName { name: path, .. }
+                        if path == text(node, source))
                 });
             let typed = node.kind() == "type_identifier" || annotation || invocation_receiver;
             let key = (
@@ -4447,6 +4540,12 @@ impl JavaSource {
         declaration_metadata(&self.type_parameters, name, line, site).map_or(0, Vec::len)
     }
 
+    pub fn parent_receivers(&self, site: Option<usize>) -> &[(JavaReceiver, ReceiverTypeSite)] {
+        site.and_then(|site| self.parent_receivers.get(&site))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     pub fn return_parameter(&self, name: &str, line: i64, site: Option<usize>) -> Option<&str> {
         declaration_metadata(&self.return_parameters, name, line, site).map(String::as_str)
     }
@@ -4568,6 +4667,12 @@ impl JavaSource {
 
     pub fn value_receiver(&self, line: i64, name: &str) -> bool {
         self.value_receivers.contains(&(line, name.to_owned()))
+    }
+
+    pub fn lexical_receiver_boundaries(&self, line: i64, name: &str) -> &[String] {
+        self.lexical_receivers
+            .get(&(line, name.to_owned()))
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn type_reference_owner(&self, line: i64, name: &str) -> Option<&Option<(String, i64)>> {
@@ -4800,6 +4905,26 @@ mod tests {
             None,
             Some(TypeReference::Occurrences(2, "Leaf"))
         ));
+    }
+
+    #[test]
+    fn unresolved_lexical_qualifiers_remain_type_candidates() {
+        let java = JavaSource::parse(
+            r#"class Probe extends Base {
+ int typeCall() { return Leaf.marker(); }
+ int valueCall(Object Leaf) { return Leaf.hashCode(); }
+}
+"#,
+        )
+        .unwrap();
+        assert!(!java.value_receiver(2, "Leaf"));
+        assert_eq!(
+            java.type_reference(2, "Leaf"),
+            Some(&Some("Leaf".to_owned()))
+        );
+        assert_eq!(java.lexical_receiver_boundaries(2, "Leaf"), &["Probe"]);
+        assert!(java.value_receiver(3, "Leaf"));
+        assert!(java.lexical_receiver_boundaries(3, "Leaf").is_empty());
     }
 
     #[test]

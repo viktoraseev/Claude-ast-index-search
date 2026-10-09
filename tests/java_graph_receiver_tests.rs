@@ -7,6 +7,104 @@ use std::process::{Command, Output};
 use serde_json::Value;
 
 #[test]
+fn lexical_type_qualifiers_survive_inherited_field_lookup() {
+    let artifacts = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+    fs::create_dir_all(&artifacts).unwrap();
+    let project = tempfile::tempdir_in(&artifacts).unwrap();
+    let cache = tempfile::tempdir_in(&artifacts).unwrap();
+    fs::create_dir(project.path().join(".git")).unwrap();
+    for (file, source) in [
+        (
+            "Leaf.java",
+            "class Leaf {\n static int marker() { return 1; }\n}\n",
+        ),
+        (
+            "Value.java",
+            "class Value {\n int marker() { return 2; }\n}\n",
+        ),
+        ("Base.java", "class Base {\n Value Leaf;\n}\n"),
+        (
+            "Probe.java",
+            r#"class Other {}
+class Plain {
+ int plain() { return Leaf.marker(); }
+}
+class Unshadowed extends Other {
+ int before() {
+  Leaf.marker();
+  class Leaf { static int marker() { return 3; } }
+  return Leaf.marker();
+ }
+ int outside() { return Leaf.marker(); }
+}
+class Shadowed extends Base {
+ int field() { return Leaf.marker(); }
+}
+"#,
+        ),
+    ] {
+        fs::write(project.path().join(file), source).unwrap();
+    }
+    run(project.path(), cache.path(), &["rebuild", "--force"]);
+    run(project.path(), cache.path(), &["graph", "build"]);
+    for (seed, expected) in [
+        (
+            "Plain.plain",
+            vec![("Leaf.java", 1, "Leaf"), ("Leaf.java", 2, "marker")],
+        ),
+        (
+            "Unshadowed.before",
+            vec![
+                ("Leaf.java", 1, "Leaf"),
+                ("Leaf.java", 2, "marker"),
+                ("Probe.java", 8, "Leaf"),
+                ("Probe.java", 8, "marker"),
+            ],
+        ),
+        (
+            "Unshadowed.outside",
+            vec![("Leaf.java", 1, "Leaf"), ("Leaf.java", 2, "marker")],
+        ),
+        (
+            "Shadowed.field",
+            vec![("Base.java", 2, "Leaf"), ("Value.java", 2, "marker")],
+        ),
+    ] {
+        let output = run(
+            project.path(),
+            cache.path(),
+            &[
+                "--format",
+                "json",
+                "graph",
+                "dependencies",
+                seed,
+                "--include-ambiguous",
+                "--limit",
+                "100",
+            ],
+        );
+        let doc: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let mut observed: Vec<_> = doc["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| {
+                let symbol = &edge["other"];
+                (
+                    symbol["path"].as_str().unwrap(),
+                    symbol["line"].as_u64().unwrap(),
+                    symbol["name"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        observed.sort();
+        assert_eq!(observed, expected, "{seed}");
+        assert_eq!(doc["pagination"]["total"], expected.len());
+    }
+}
+
+#[test]
 fn invocation_formals_are_bound_before_same_name_body_local_types() {
     for middle in [
         "void step(String unused) {} void step(Target input) { class Target {} new Marker().leaf(); }",
