@@ -2246,6 +2246,7 @@ struct JavaDependencyValue {
     owner: JavaDependencyType,
     arguments: Vec<Option<JavaDependencyValue>>,
     instance: bool,
+    array_dimensions: usize,
 }
 
 struct JavaDependencyInvocation<'a> {
@@ -2293,6 +2294,14 @@ fn java_invocation_signature(
     if depth >= 16 || ty.contains('?') {
         return None;
     }
+    let base = ty.trim_end_matches("[]");
+    let rank = (ty.len() - base.len()) / 2;
+    if rank > 0 {
+        return Some(DependencyResultType::Array(
+            Box::new(java_invocation_signature(base, depth + 1)?),
+            rank,
+        ));
+    }
     let (name, arguments) = if ty.contains('<') {
         java_generic_parts(ty)?
     } else {
@@ -2313,12 +2322,13 @@ impl JavaDependencyValue {
             owner,
             arguments: Vec::new(),
             instance,
+            array_dimensions: 0,
         }
     }
 
     fn signature(&self) -> String {
         format!(
-            "{}<{}>",
+            "{}<{}>{}",
             self.owner.identity,
             self.arguments
                 .iter()
@@ -2328,20 +2338,30 @@ impl JavaDependencyValue {
                         .map_or_else(|| "?".to_owned(), Self::signature)
                 })
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(","),
+            "[]".repeat(self.array_dimensions),
         )
     }
 
     fn invocation_type(&self) -> Option<String> {
         if self.arguments.is_empty() {
-            return Some(self.owner.identity.clone());
+            return Some(format!(
+                "{}{}",
+                self.owner.identity,
+                "[]".repeat(self.array_dimensions)
+            ));
         }
         let arguments = self
             .arguments
             .iter()
             .map(|argument| argument.as_ref()?.invocation_type())
             .collect::<Option<Vec<_>>>()?;
-        Some(format!("{}<{}>", self.owner.identity, arguments.join(",")))
+        Some(format!(
+            "{}<{}>{}",
+            self.owner.identity,
+            arguments.join(","),
+            "[]".repeat(self.array_dimensions)
+        ))
     }
 }
 
@@ -3058,6 +3078,7 @@ impl JavaDependencyLookup<'_> {
         ) -> bool {
             use crate::parsers::treesitter::java::DependencyResultType;
             match ty {
+                DependencyResultType::Array(element, _) => captured(element, value),
                 DependencyResultType::Parameter { owner, name } => {
                     owner != &value.owner.identity
                         || value
@@ -3231,6 +3252,9 @@ impl JavaDependencyLookup<'_> {
             return Ok(None);
         }
         match signature {
+            DependencyResultType::Array(element, rank) => Ok(self
+                .signature_identity(element, imports, substitution, depth + 1)?
+                .map(|element| format!("{element}{}", "[]".repeat(*rank)))),
             DependencyResultType::Parameter { .. } => Ok(self
                 .result_value(signature, usize::MAX, imports, substitution, depth)?
                 .and_then(|value| value.invocation_type())),
@@ -3272,6 +3296,16 @@ impl JavaDependencyLookup<'_> {
             return Ok((false, true));
         }
         match formal {
+            DependencyResultType::Array(element, rank) => {
+                let mut argument = argument;
+                for _ in 0..*rank {
+                    let Some(inner) = argument.strip_suffix("[]") else {
+                        return Ok((false, false));
+                    };
+                    argument = inner;
+                }
+                self.infer_method_parameter(element, argument, bindings, imports, depth + 1)
+            }
             DependencyResultType::Parameter { owner, name } if owner == "@method" => {
                 let mut ty = Self::boxed_type(argument).unwrap_or(argument).to_owned();
                 if let Some(prior) = bindings.get(name) {
@@ -3414,6 +3448,10 @@ impl JavaDependencyLookup<'_> {
             bindings: &std::collections::HashMap<String, String>,
         ) -> Option<DependencyResultType> {
             match ty {
+                DependencyResultType::Array(element, rank) => Some(DependencyResultType::Array(
+                    Box::new(substitute(element, bindings)?),
+                    *rank,
+                )),
                 DependencyResultType::Parameter { owner, name } if owner == "@method" => bindings
                     .get(name)
                     .and_then(|name| java_invocation_signature(name, 0)),
@@ -3498,6 +3536,9 @@ impl JavaDependencyLookup<'_> {
             crate::parsers::treesitter::java::DependencyMemberType,
         )>,
     > {
+        if value.array_dimensions != 0 {
+            return Ok(None);
+        }
         let mut applicable = Vec::new();
         let invocation = JavaDependencyInvocation {
             arguments,
@@ -3770,6 +3811,35 @@ impl JavaDependencyLookup<'_> {
             return Ok(None);
         }
         match signature {
+            DependencyResultType::Array(element, rank) => {
+                // Primitive leaves are valid generic array slots, never source
+                // declarations or standalone project receiver owners.
+                let primitive = match element.as_ref() {
+                    DependencyResultType::Named(name, arguments)
+                        if arguments.is_empty() && Self::boxed_type(name).is_some() =>
+                    {
+                        Some(JavaDependencyValue::nominal(
+                            JavaDependencyType {
+                                identity: name.clone(),
+                                declaration: Default::default(),
+                                platform: true,
+                            },
+                            true,
+                        ))
+                    }
+                    _ => None,
+                };
+                let value = match primitive {
+                    Some(value) => Some(value),
+                    None => {
+                        self.result_value(element, position, imports, substitution, depth + 1)?
+                    }
+                };
+                Ok(value.map(|mut value| {
+                    value.array_dimensions += rank;
+                    value
+                }))
+            }
             DependencyResultType::Parameter { owner, name } => {
                 if let Some(value) = substitution
                     .filter(|value| &value.owner.identity == owner)
@@ -3830,6 +3900,7 @@ impl JavaDependencyLookup<'_> {
                     owner,
                     arguments: bound,
                     instance: true,
+                    array_dimensions: 0,
                 }))
             }
         }
@@ -4027,6 +4098,9 @@ impl JavaDependencyLookup<'_> {
                     else {
                         return Ok(None);
                     };
+                    if value.array_dimensions != 0 {
+                        return Ok(None);
+                    }
                     if value.owner.platform {
                         if !value.instance {
                             return Ok(None);
@@ -4597,6 +4671,9 @@ fn count_symbols_used_in_module(
                 if let Some(value) =
                     accessing.value_receiver(chain, &syntax.imports, &mut identities, 0)?
                 {
+                    if value.array_dimensions != 0 {
+                        continue;
+                    }
                     let key = (member.name.clone(), member.method);
                     let identity = if let Some(arguments) = &member.arguments {
                         accessing

@@ -616,6 +616,7 @@ pub(crate) struct DependencyImportDeclaration {
 pub(crate) enum DependencyResultType {
     Named(String, Vec<Option<DependencyResultType>>),
     Parameter { owner: String, name: String },
+    Array(Box<DependencyResultType>, usize),
 }
 
 pub(crate) fn dependency_result_type(
@@ -626,6 +627,20 @@ pub(crate) fn dependency_result_type(
 ) -> Option<DependencyResultType> {
     if depth >= 16 || ty.has_error() {
         return None;
+    }
+    if ty.kind() == "array_type" {
+        let rank = node_text(content, &ty.child_by_field_name("dimensions")?)
+            .matches('[')
+            .count();
+        return Some(DependencyResultType::Array(
+            Box::new(dependency_result_type(
+                ty.child_by_field_name("element")?,
+                content,
+                package,
+                depth + 1,
+            )?),
+            rank,
+        ));
     }
     if ty.kind() == "generic_type" {
         let name = ty.named_child(0)?;
@@ -642,7 +657,14 @@ pub(crate) fn dependency_result_type(
                 .collect(),
         ));
     }
-    if !matches!(ty.kind(), "type_identifier" | "scoped_type_identifier") {
+    if !matches!(
+        ty.kind(),
+        "type_identifier"
+            | "scoped_type_identifier"
+            | "integral_type"
+            | "floating_point_type"
+            | "boolean_type"
+    ) {
         return None;
     }
     let name = node_text(content, &ty);
@@ -706,6 +728,21 @@ fn dependency_method_result_type(
 ) -> Option<DependencyResultType> {
     if depth >= 16 || ty.has_error() {
         return None;
+    }
+    if ty.kind() == "array_type" {
+        let rank = node_text(content, &ty.child_by_field_name("dimensions")?)
+            .matches('[')
+            .count();
+        return Some(DependencyResultType::Array(
+            Box::new(dependency_method_result_type(
+                ty.child_by_field_name("element")?,
+                content,
+                package,
+                names,
+                depth + 1,
+            )?),
+            rank,
+        ));
     }
     if ty.kind() == "generic_type" {
         let arguments = ty.named_child(1)?;
@@ -789,10 +826,11 @@ fn dependency_method_signature(
         .collect();
     let result = member
         .child_by_field_name("type")
-        .filter(|_| {
-            !member
-                .named_children(&mut member.walk())
-                .any(|n| n.kind() == "dimensions")
+        .filter(|ty| {
+            ty.kind() != "array_type"
+                && !member
+                    .named_children(&mut member.walk())
+                    .any(|n| n.kind() == "dimensions")
         })
         .and_then(|ty| dependency_method_result_type(ty, content, package, &names, 0));
     Some(DependencyMethodSignature {
@@ -929,10 +967,13 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
     DependencyMemberType {
         path,
         result_type: ty
-            .filter(|_| {
-                !member
-                    .named_children(&mut member.walk())
-                    .any(|n| n.kind() == "dimensions")
+            .filter(|ty| {
+                // Array endpoints are a separate receiver contract. Retain
+                // nested array slots without erasing a top-level array result.
+                ty.kind() != "array_type"
+                    && !member
+                        .named_children(&mut member.walk())
+                        .any(|n| n.kind() == "dimensions")
             })
             .and_then(|ty| dependency_result_type(ty, content, package, 0)),
         position: ty.map_or(member.start_byte(), |ty| ty.start_byte()),
@@ -3261,6 +3302,42 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             .protected_names
             .contains(&("SECRET".into(), false)));
         assert!(!declaration.static_names.contains(&("SECRET".into(), false)));
+    }
+
+    #[test]
+    fn nested_array_slots_retain_rank_and_method_variable_ownership() {
+        let source = r#"package fixture;
+        class Carrier<T> {}
+        class Box<T> {
+            T fixed(Carrier<T[][]> value) { return null; }
+            <T> T inferred(Carrier<Carrier<T[]>> value) { return null; }
+            shared.Child primitive(Carrier<int[]> value) { return null; }
+        }"#;
+        let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
+            .unwrap()
+            .unwrap();
+        let fixed = &declaration.value_types[&("fixed".into(), true)][0];
+        assert!(matches!(&fixed.parameter_variables[0],
+            Some((DependencyResultType::Named(owner, arguments), 0)) if owner == "Carrier"
+            && matches!(&arguments[0], Some(DependencyResultType::Array(element, 2))
+                if matches!(element.as_ref(), DependencyResultType::Parameter {owner, name}
+                    if owner == "fixture.Box" && name == "T"))));
+        let method = declaration.value_types[&("inferred".into(), true)][0]
+            .method_signature
+            .as_ref()
+            .unwrap();
+        assert!(matches!(&method.parameters[0],
+            Some((DependencyResultType::Named(_, arguments), 0))
+            if matches!(&arguments[0], Some(DependencyResultType::Named(_, slots))
+                if matches!(&slots[0], Some(DependencyResultType::Array(element, 1))
+                    if matches!(element.as_ref(), DependencyResultType::Parameter {owner, name}
+                        if owner == "@method" && name == "T")))));
+        let primitive = &declaration.value_types[&("primitive".into(), true)][0];
+        assert!(matches!(&primitive.parameter_variables[0],
+            Some((DependencyResultType::Named(_, arguments), 0))
+            if matches!(&arguments[0], Some(DependencyResultType::Array(element, 1))
+                if matches!(element.as_ref(), DependencyResultType::Named(name, slots)
+                    if name == "int" && slots.is_empty()))));
     }
 
     #[test]
