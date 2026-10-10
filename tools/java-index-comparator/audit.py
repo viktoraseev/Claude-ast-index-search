@@ -76,6 +76,7 @@ import unused_dep_contracts
 import java_dependency_contracts
 import java_dependency_result_contracts
 import java_nested_array_contracts
+import java_array_result_contracts
 import java_on_demand_contracts
 import android_dependency_contracts
 import format_contracts
@@ -2273,6 +2274,14 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
+    def java_array_result_check(self, check: sqlite3.Row):
+        if getattr(self, '_java_array_result_results', None) is None:
+            self._java_array_result_results = java_array_result_contracts.exercise(self.binary, self.database.parent)
+        expected, actual = (section[check['feature']] for section in self._java_array_result_results)
+        return {'source': java_array_result_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def java_inherited_import_check(self, check: sqlite3.Row):
         if self._java_inherited_import_results is None:
             self._java_inherited_import_results = java_inherited_import_contracts.exercise(self.binary, self.database.parent)
@@ -2538,6 +2547,8 @@ class Fixture:
                 handler = self.java_dependency_result_check
             if check['feature'] in java_nested_array_contracts.FEATURES:
                 handler = self.java_nested_array_check
+            if check['feature'] in java_array_result_contracts.FEATURES:
+                handler = self.java_array_result_check
             if check['feature'] in java_inherited_import_contracts.FEATURES:
                 handler = self.java_inherited_import_check
             if check['feature'] in module_alias_contracts.FEATURES:
@@ -2672,6 +2683,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_dependency_contracts.FEATURES)
     features.update(java_dependency_result_contracts.FEATURES)
     features.update(java_nested_array_contracts.FEATURES)
+    features.update(java_array_result_contracts.FEATURES)
     features.update(java_on_demand_contracts.FEATURES)
     features.update(android_dependency_contracts.FEATURES | android_dependency_contracts.JAVA_FEATURES)
     features.update(format_contracts.FEATURES)
@@ -2908,6 +2920,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     java_module_binding_contracts.plan_binding(state, root)
     java_dependency_result_contracts.plan_results(state, root)
     java_nested_array_contracts.plan_slots(state, root)
+    java_array_result_contracts.plan_results(state, root)
     java_inherited_import_contracts.plan_imports(state, root)
     selector_error_contracts.plan_errors(state, root)
     operation_error_contracts.plan_errors(state, root)

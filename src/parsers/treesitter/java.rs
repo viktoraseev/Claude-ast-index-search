@@ -697,6 +697,7 @@ pub(crate) fn dependency_result_type(
 pub(crate) struct DependencyMemberType {
     pub path: Option<String>,
     pub result_type: Option<DependencyResultType>,
+    pub array_result_type: Option<DependencyResultType>,
     pub position: usize,
     pub arity: Option<usize>,
     pub varargs: bool,
@@ -716,6 +717,7 @@ pub(crate) struct DependencyMethodSignature {
     pub variables: Vec<(String, Option<DependencyResultType>)>,
     pub parameters: Vec<Option<(DependencyResultType, usize)>>,
     pub result: Option<DependencyResultType>,
+    pub array_result: Option<DependencyResultType>,
 }
 
 /// Retain method variables separately from the class substitution contract.
@@ -833,11 +835,37 @@ fn dependency_method_signature(
                     .any(|n| n.kind() == "dimensions")
         })
         .and_then(|ty| dependency_method_result_type(ty, content, package, &names, 0));
+    let array_result = member
+        .child_by_field_name("type")
+        .and_then(|ty| dependency_method_result_type(ty, content, package, &names, 0))
+        .and_then(|ty| dependency_array_result(ty, member, content));
     Some(DependencyMethodSignature {
         variables,
         parameters,
         result,
+        array_result,
     })
+}
+
+/// Keep array endpoints separate from the legacy scalar result contract.
+fn dependency_array_result(
+    result: DependencyResultType,
+    declaration: Node<'_>,
+    content: &str,
+) -> Option<DependencyResultType> {
+    let rank = declaration
+        .named_children(&mut declaration.walk())
+        .filter(|node| node.kind() == "dimensions")
+        .map(|node| node_text(content, &node).matches('[').count())
+        .sum::<usize>()
+        + usize::from(declaration.kind() == "spread_parameter");
+    if rank > 0 {
+        Some(DependencyResultType::Array(Box::new(result), rank))
+    } else if matches!(result, DependencyResultType::Array(_, _)) {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> DependencyMemberType {
@@ -966,6 +994,14 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
     });
     DependencyMemberType {
         path,
+        array_result_type: ty
+            .or_else(|| {
+                (member.kind() == "spread_parameter")
+                    .then(|| parameter_type(member))
+                    .flatten()
+            })
+            .and_then(|ty| dependency_result_type(ty, content, package, 0))
+            .and_then(|ty| dependency_array_result(ty, member, content)),
         result_type: ty
             .filter(|ty| {
                 // Array endpoints are a separate receiver contract. Retain
@@ -1234,6 +1270,11 @@ fn dependency_declarations(
                                 .any(|n| n.kind() == "dimensions")
                             {
                                 value.path = None;
+                                value.array_result_type = value
+                                    .array_result_type
+                                    .take()
+                                    .or_else(|| value.result_type.take())
+                                    .and_then(|ty| dependency_array_result(ty, variable, content));
                                 value.result_type = None;
                             }
                             value_types.entry(key).or_default().push(value);
@@ -3338,6 +3379,66 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             if matches!(&arguments[0], Some(DependencyResultType::Array(element, 1))
                 if matches!(element.as_ref(), DependencyResultType::Named(name, slots)
                     if name == "int" && slots.is_empty()))));
+    }
+
+    #[test]
+    fn dependency_array_results_keep_rank_and_separate_scalar_metadata() {
+        let source = r#"package fixture;
+        class Box<T> {
+            T[] generic(){return null;}
+            shared.Child nominal()[][]{return null;}
+            T[] left[], right;
+            <U> U[] inferred(U value){return null;}
+        }
+        record Spread(shared.Child... values) {}"#;
+        let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
+            .unwrap()
+            .unwrap();
+        for name in ["generic", "nominal", "inferred"] {
+            let method = &declaration.value_types[&(name.into(), true)][0];
+            assert!(method.result_type.is_none());
+            assert!(method.path.is_none());
+        }
+        assert!(
+            matches!(&declaration.value_types[&("generic".into(), true)][0].array_result_type,
+            Some(DependencyResultType::Array(element, 1))
+                if matches!(element.as_ref(), DependencyResultType::Parameter { owner, name }
+                    if owner == "fixture.Box" && name == "T"))
+        );
+        assert!(
+            matches!(&declaration.value_types[&("nominal".into(), true)][0].array_result_type,
+            Some(DependencyResultType::Array(element, 2))
+                if matches!(element.as_ref(), DependencyResultType::Named(name, _) if name == "shared.Child"))
+        );
+        assert!(
+            matches!(&declaration.value_types[&("left".into(), false)][0].array_result_type,
+            Some(DependencyResultType::Array(element, 1)) if matches!(element.as_ref(), DependencyResultType::Array(_, 1)))
+        );
+        assert!(matches!(
+            &declaration.value_types[&("right".into(), false)][0].array_result_type,
+            Some(DependencyResultType::Array(_, 1))
+        ));
+        let method = declaration.value_types[&("inferred".into(), true)][0]
+            .method_signature
+            .as_ref()
+            .unwrap();
+        assert!(method.result.is_none());
+        assert!(
+            matches!(&method.array_result, Some(DependencyResultType::Array(element, 1))
+            if matches!(element.as_ref(), DependencyResultType::Parameter { owner, name }
+                if owner == "@method" && name == "U"))
+        );
+        let spread = dependency_import_declaration(source, "fixture.Spread", "fixture")
+            .unwrap()
+            .unwrap();
+        for method in [false, true] {
+            let value = &spread.value_types[&("values".into(), method)][0];
+            assert!(value.result_type.is_none());
+            assert!(matches!(
+                value.array_result_type,
+                Some(DependencyResultType::Array(_, 1))
+            ));
+        }
     }
 
     #[test]

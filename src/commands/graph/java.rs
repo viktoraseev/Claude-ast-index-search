@@ -329,10 +329,15 @@ fn variable_scopes(
                 }
             }
         }
-        if declaration.kind() == "formal_parameter" {
+        if matches!(declaration.kind(), "formal_parameter" | "spread_parameter") {
             if let (Some(name), Some(ty), Some(owner)) = (
-                declaration.child_by_field_name("name"),
-                declaration.child_by_field_name("type"),
+                declaration.child_by_field_name("name").or_else(|| {
+                    declaration
+                        .named_children(&mut declaration.walk())
+                        .find(|node| node.kind() == "variable_declarator")
+                        .and_then(|node| node.child_by_field_name("name"))
+                }),
+                parameter_type(declaration),
                 declaration
                     .parent()
                     .and_then(|parameters| parameters.parent()),
@@ -2504,6 +2509,11 @@ pub(crate) enum DependencyValueReceiver {
         receiver: Box<DependencyValueReceiver>,
         contexts: Vec<String>,
     },
+    ArrayIndex {
+        receiver: Box<DependencyValueReceiver>,
+        index: DependencyInvocationArgument,
+        index_receiver: Option<Box<DependencyValueReceiver>>,
+    },
     Member {
         receiver: Box<DependencyValueReceiver>,
         name: String,
@@ -2518,6 +2528,27 @@ pub(crate) fn dependency_value_members(
     package: &str,
 ) -> Result<Vec<DependencyValueMember>> {
     use crate::parsers::treesitter::java::{dependency_contexts, dependency_instances};
+    fn argument(
+        node: Node<'_>,
+        source: &str,
+        scopes: &VariableScopes,
+        tree: &tree_sitter::Tree,
+        declarations: &HashMap<usize, InvocationOwner>,
+        package: &str,
+    ) -> DependencyInvocationArgument {
+        let position = expression_receiver_site(node, source, scopes, declarations)
+            .map_or(node.start_byte(), |site| site.position);
+        let binding = tree
+            .root_node()
+            .descendant_for_byte_range(position, position + 1)
+            .unwrap_or(node);
+        DependencyInvocationArgument {
+            ty: invocation_argument_type(node, callable(node).unwrap_or(node), source, scopes, 0),
+            position,
+            contexts: dependency_contexts(binding, source, package),
+        }
+    }
+
     fn type_arguments(
         node: Node<'_>,
         source: &str,
@@ -2544,24 +2575,11 @@ pub(crate) fn dependency_value_members(
         declarations: &HashMap<usize, InvocationOwner>,
         package: &str,
     ) -> Option<Vec<DependencyInvocationArgument>> {
-        let owner = callable(node).unwrap_or(node);
         Some(
             node.child_by_field_name("arguments")?
                 .named_children(&mut node.child_by_field_name("arguments")?.walk())
                 .filter(|child| !child.is_extra())
-                .map(|argument| {
-                    let position = expression_receiver_site(argument, source, scopes, declarations)
-                        .map_or(argument.start_byte(), |site| site.position);
-                    let binding = tree
-                        .root_node()
-                        .descendant_for_byte_range(position, position + 1)
-                        .unwrap_or(argument);
-                    DependencyInvocationArgument {
-                        ty: invocation_argument_type(argument, owner, source, scopes, 0),
-                        position,
-                        contexts: dependency_contexts(binding, source, package),
-                    }
-                })
+                .map(|node| argument(node, source, scopes, tree, declarations, package))
                 .collect(),
         )
     }
@@ -2622,23 +2640,40 @@ pub(crate) fn dependency_value_members(
             _ => return None,
         };
         let binding = variable_binding(node, name, fields_only, scopes, source)?;
-        if binding.site.is_some() || binding.declared.is_none() {
+        if binding.site.is_some() {
             return None;
         }
         let name = tree
             .root_node()
             .descendant_for_byte_range(binding.position, binding.position + 1)?;
-        let declaration = name.parent()?;
+        let variable = name.parent()?;
+        let declaration = variable;
         let declaration = if declaration.kind() == "variable_declarator" {
             declaration.parent()?
         } else {
             declaration
         };
-        let ty = declaration.child_by_field_name("type")?;
-        let signature =
+        let ty = parameter_type(declaration)?;
+        let mut signature =
             crate::parsers::treesitter::java::dependency_result_type(ty, source, package, 0)?;
+        let rank = variable
+            .named_children(&mut variable.walk())
+            .filter(|node| node.kind() == "dimensions")
+            .map(array_dimensions)
+            .sum::<usize>()
+            + usize::from(declaration.kind() == "spread_parameter");
+        if rank > 0 {
+            signature = crate::parsers::treesitter::java::DependencyResultType::Array(
+                Box::new(signature),
+                rank,
+            );
+        }
+        let mut leaf = &signature;
+        while let crate::parsers::treesitter::java::DependencyResultType::Array(element, _) = leaf {
+            leaf = element;
+        }
         if !matches!(
-            signature,
+            leaf,
             crate::parsers::treesitter::java::DependencyResultType::Parameter { .. }
         ) || !available(node, ty, source)
         {
@@ -2669,19 +2704,28 @@ pub(crate) fn dependency_value_members(
         let owner = callable(node).unwrap_or(node);
         let inferred = expression_receiver(node, owner, source, scopes, 0);
         let site = expression_receiver_site(node, source, scopes, declarations);
-        let nominal = match &inferred {
-            JavaReceiver::Declared { receiver, site } => match receiver.as_ref() {
+        fn nominal_site<'a>(
+            receiver: &'a JavaReceiver,
+            site: Option<&ReceiverTypeSite>,
+            rank: usize,
+        ) -> Option<(&'a str, usize, usize)> {
+            if rank > 16 {
+                return None;
+            }
+            match receiver {
+                JavaReceiver::Declared { receiver, site } => {
+                    nominal_site(receiver, Some(site), rank)
+                }
+                JavaReceiver::ArrayOf(element) => nominal_site(element, site, rank + 1),
                 JavaReceiver::Type(path)
                 | JavaReceiver::Parameterized { path, .. }
-                | JavaReceiver::Parameter(path) => Some((path, site.position)),
+                | JavaReceiver::Parameter(path) => {
+                    site.map(|site| (path.as_str(), site.position, rank))
+                }
                 _ => None,
-            },
-            JavaReceiver::Type(path)
-            | JavaReceiver::Parameterized { path, .. }
-            | JavaReceiver::Parameter(path) => site.as_ref().map(|site| (path, site.position)),
-            _ => None,
-        };
-        if let Some((_, position)) = nominal {
+            }
+        }
+        if let Some((_, position, rank)) = nominal_site(&inferred, site.as_ref(), 0) {
             let mut ty = tree
                 .root_node()
                 .descendant_for_byte_range(position, position + 1)?;
@@ -2691,8 +2735,14 @@ pub(crate) fn dependency_value_members(
             }) {
                 ty = parent;
             }
-            let signature =
+            let mut signature =
                 crate::parsers::treesitter::java::dependency_result_type(ty, source, package, 0)?;
+            if rank > 0 {
+                signature = crate::parsers::treesitter::java::DependencyResultType::Array(
+                    Box::new(signature),
+                    rank,
+                );
+            }
             return available(node, ty, source).then(|| DependencyValueReceiver::Nominal {
                 signature,
                 position,
@@ -2717,6 +2767,41 @@ pub(crate) fn dependency_value_members(
         }
         match node.kind() {
             "parenthesized_expression" => nested(node.named_child(0)?),
+            "array_access" => Some(DependencyValueReceiver::ArrayIndex {
+                receiver: Box::new(nested(node.child_by_field_name("array")?)?),
+                index_receiver: nested(node.child_by_field_name("index")?).map(Box::new),
+                index: argument(
+                    node.child_by_field_name("index")?,
+                    source,
+                    scopes,
+                    tree,
+                    declarations,
+                    package,
+                ),
+            }),
+            "array_creation_expression" => {
+                let ty = node.child_by_field_name("type")?;
+                let signature = crate::parsers::treesitter::java::dependency_result_type(
+                    ty, source, package, 0,
+                )?;
+                let rank = node
+                    .named_children(&mut node.walk())
+                    .map(|child| match child.kind() {
+                        "dimensions_expr" => 1,
+                        "dimensions" => array_dimensions(child),
+                        _ => 0,
+                    })
+                    .sum();
+                Some(DependencyValueReceiver::Nominal {
+                    signature: crate::parsers::treesitter::java::DependencyResultType::Array(
+                        Box::new(signature),
+                        rank,
+                    ),
+                    position: ty.start_byte(),
+                    contexts: dependency_contexts(ty, source, package),
+                    instance: true,
+                })
+            }
             "this" => instance_context(node, source).then(|| DependencyValueReceiver::Lexical {
                 instances: dependency_instances(node, source, package),
                 explicit: true,
@@ -2843,7 +2928,11 @@ pub(crate) fn dependency_value_members(
         } else if let Some(chain) = parameter.or_else(|| {
             (matches!(
                 object.kind(),
-                "method_invocation" | "field_access" | "parenthesized_expression"
+                "method_invocation"
+                    | "field_access"
+                    | "parenthesized_expression"
+                    | "array_access"
+                    | "array_creation_expression"
             ) || inferred_local)
                 .then(|| chain_receiver(object, source, &tree, &scopes, &declarations, package, 0))
                 .flatten()

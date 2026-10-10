@@ -116,6 +116,8 @@ CONTRACTS = {
         'unused-deps Java inherited/member/type/value imports and nominal chains in colliding roots: declaring provenance, lexical/value/record/local-subclass access and hiding guards, options/refresh'),
     'java_nested_array_contracts': ('src/commands/modules.rs and src/parsers/treesitter/java.rs',
         'unused-deps nested Java array signature slots: fixed/class/method variables, invariant rank and primitive guards, ancestor projection and attached provider ownership after refresh; unresolved semantic parents remain pending'),
+    'java_array_result_contracts': ('src/commands/graph/java.rs, src/commands/modules.rs and src/parsers/treesitter/java.rs',
+        'unused-deps Java indexed array results: nominal/class/method variables, fields/records/inheritance, declaration and initializer sites, captures/references, rank/integral-index/access guards and attached provider ownership, JSON/text/options/update/rebuild; semantic parent remains pending'),
     'java_dependency_result_contracts': ('src/commands/modules.rs',
         'unused-deps Java nominal field/return chains across attached modules: declaring identity, private/protected/this/super access, arity/ambiguous/array/static-context guards, class-variable formals through inheritance/arrays/varargs/boxing, scalar and invariant parameterized method-variable inference and explicit witnesses with separate bounds/shadowing/overload guards and option/refresh controls'),
     'android_dependency_contracts': ('src/commands/android.rs and src/commands/modules.rs',
@@ -212,12 +214,14 @@ EXTRA_FEATURES = (
     'unused-deps:java-inherited-imports',
     'unused-deps:java-module-binding',
     'unused-deps:java-nested-array-slots',
+    'unused-deps:java-array-results',
     'unused-deps:java-source-results',
 )
 
 # Original finite authored populations, including every positive and negative.
 RETAINED = (
     ('unused-deps:java-nested-array-slots', 'disposable-java-nested-array-slots-v1', 115, 'b2ba9f302d1de814c2b8bc6c565523f435a3be18a43aa2256485b4bb7f106158', '23ec1b8949bc8a53f8a1dae7a345b63ef48e92e2fec80f80ec0868b308521789', 'java_nested_array_contracts'),
+    ('unused-deps:java-array-results', 'disposable-java-array-results-v1', 170, '9e170da3e65aae87e0ec0d5f87e8e3d2cc675430d4a714a649f420981bd048d1', '405b660778f4b5b4fa9b64768267f2e85a7a93c5a030e8e30138fbf0dcaab0ae', 'java_array_result_contracts'),
     ('global:scope:java-resources', 'disposable-java-resource-scope', 382, '290846ebc42579b01b99cb543985a637a51798dfefa4cd8aa5457cae8f22a3bc', 'da6f373dae87def8a0d146a24f01231f352dc94ccdb56f9edca8fea7988fa82b', 'java_resource_scope_contracts'),
     ('add-root', 'disposable-fixture', 6, 'ed3704dc590443853bd083846eaa529cc0ad56e2228a02107fb66fabf2e82192', '65e62e8e7e63290b58be557d95cc336bab0ff28598343e525fbbfaf890dbea64', 'root_contracts'),
     ('changed', 'disposable-java-git', 9, 'f0364c003ad6079ba6f94a432c15a28084850c1592ec088ea1ae549ac5286f2f', 'b48235c334440f3db428e1d26054fcfcd5fa1147c14b0448d83d72fb71764e47', 'vcs_contracts'),

@@ -3520,6 +3520,10 @@ impl JavaDependencyLookup<'_> {
             .result
             .as_ref()
             .and_then(|ty| substitute(ty, &bindings));
+        bound.array_result_type = method
+            .array_result
+            .as_ref()
+            .and_then(|ty| substitute(ty, &bindings));
         Ok((Some(bound), false))
     }
 
@@ -3875,6 +3879,18 @@ impl JavaDependencyLookup<'_> {
                 )
             }
             DependencyResultType::Named(path, arguments) => {
+                if arguments.is_empty() && Self::boxed_type(path).is_some() {
+                    // Scalar primitive results may be array indexes. They
+                    // remain platform values and never project declarations.
+                    return Ok(Some(JavaDependencyValue::nominal(
+                        JavaDependencyType {
+                            identity: path.clone(),
+                            declaration: Default::default(),
+                            platform: true,
+                        },
+                        true,
+                    )));
+                }
                 let owner = match self.value_type(path, position, imports)? {
                     Some(owner) => Some(owner),
                     None => self.platform_result_owner(path, position, imports)?,
@@ -4005,6 +4021,40 @@ impl JavaDependencyLookup<'_> {
                     identities,
                     depth + 1,
                 )
+            }
+            DependencyValueReceiver::ArrayIndex {
+                receiver,
+                index,
+                index_receiver,
+            } => {
+                let index = match self.invocation_argument(index, imports)? {
+                    Some(index) => Some(index),
+                    None => match index_receiver {
+                        Some(receiver) => self
+                            .value_receiver(receiver, imports, identities, depth + 1)?
+                            .filter(|value| value.array_dimensions == 0)
+                            .map(|value| value.owner.identity),
+                        None => None,
+                    },
+                };
+                let Some(index) = index else {
+                    return Ok(None);
+                };
+                // Java permits unary integral promotion and unboxing to int,
+                // never narrowing a long (or borrowing a same-named wrapper).
+                if !self.invocation_conversion(&index, "int", true)? {
+                    return Ok(None);
+                }
+                let Some(mut value) =
+                    self.value_receiver(receiver, imports, identities, depth + 1)?
+                else {
+                    return Ok(None);
+                };
+                if value.array_dimensions == 0 {
+                    return Ok(None);
+                }
+                value.array_dimensions -= 1;
+                Ok(Some(value))
             }
             DependencyValueReceiver::Lexical { instances, .. } => Ok(match self.contexts.first() {
                 Some(context) => self
@@ -4177,7 +4227,11 @@ impl JavaDependencyLookup<'_> {
                         signature.clone()
                     }
                 };
-                let Some(result_type) = &signature.result_type else {
+                let Some(result_type) = signature
+                    .result_type
+                    .as_ref()
+                    .or(signature.array_result_type.as_ref())
+                else {
                     return Ok(None);
                 };
                 let substitution = match receiver_value {
