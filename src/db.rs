@@ -8245,6 +8245,40 @@ pub fn find_symbol_id_by_kind(
         .optional()?)
 }
 
+/// A Java search seed represents every same-line overload of its qualified
+/// declaration, but excludes other owners and same-name record properties.
+pub fn find_java_seed_ids(
+    conn: &Connection,
+    root_path: Option<&str>,
+    path: &str,
+    line: i64,
+    name: &str,
+    kind: &str,
+    qualified_name: Option<&str>,
+) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare_cached(concat!(
+        "SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+         WHERE f.path = ?1 AND s.line = ?2 AND s.name = ?3 AND s.kind = ?5
+         AND s.qualified_name IS ?6 AND ",
+        file_under_root_sql!("?4"),
+        " ORDER BY s.id"
+    ))?;
+    let ids = stmt
+        .query_map(
+            params![
+                path,
+                line,
+                name,
+                root_path.unwrap_or(""),
+                kind,
+                qualified_name
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
 /// A definition's name, kind and line range.
 #[derive(Debug, Clone)]
 pub struct SymbolSpan {

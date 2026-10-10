@@ -606,29 +606,38 @@ fn resolved_dependents_filtered(
     if !state.built || state.stale {
         return Ok(None);
     }
-    let ids: Vec<Option<i64>> = seeds
+    let ids: Vec<Vec<i64>> = seeds
         .iter()
         .map(|seed| {
             if seed.path.ends_with(".java") {
-                return db::find_symbol_id_by_kind(
+                return db::find_java_seed_ids(
                     conn,
                     seed.root_path.as_deref(),
                     &seed.path,
                     seed.line,
                     &seed.name,
                     &seed.kind,
+                    seed.qualified_name.as_deref(),
                 );
             }
-            db::find_symbol_id(
+            Ok(db::find_symbol_id(
                 conn,
                 seed.root_path.as_deref(),
                 &seed.path,
                 seed.line,
                 &seed.name,
-            )
+            )?
+            .into_iter()
+            .collect())
         })
         .collect::<Result<_>>()?;
-    let known: Vec<i64> = ids.iter().flatten().copied().collect();
+    let known: Vec<i64> = ids
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let edges = db::load_symbol_edges_to(
         conn,
         &known,
@@ -655,7 +664,7 @@ fn resolved_dependents_filtered(
             }
         }
     }
-    let mut by_target: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut by_target: HashMap<i64, Vec<(u8, i64)>> = HashMap::new();
     for edge in &edges {
         // The CLI unions every declaration with this name. An unresolved
         // overload still establishes a name-level caller only when its entire
@@ -672,19 +681,30 @@ fn resolved_dependents_filtered(
             by_target
                 .entry(edge.target_id)
                 .or_default()
-                .push(edge.source_id);
+                .push((edge.confidence, edge.source_id));
         }
     }
     let needed: HashSet<i64> = edges.iter().map(|edge| edge.source_id).collect();
     let infos = infos_for(conn, &needed)?;
     let result = ids
         .iter()
-        .map(|id| {
-            let sources = id
-                .and_then(|id| by_target.get(&id))
-                .map_or(&[][..], Vec::as_slice);
+        .zip(seeds)
+        .map(|(ids, seed)| {
+            let mut seen = HashSet::new();
+            let mut sources: Vec<_> = ids
+                .iter()
+                .filter_map(|id| by_target.get(id))
+                .flatten()
+                .copied()
+                .collect();
+            if seed.path.ends_with(".java") {
+                // Match transient pages before deduplication and the scope cap.
+                sources.sort_unstable();
+            }
             sources
                 .iter()
+                .map(|(_, source)| source)
+                .filter(|source| seen.insert(**source))
                 .filter_map(|source| infos.get(source))
                 .filter(|info| keep(info))
                 .take(limit)
@@ -2327,6 +2347,63 @@ pub fn cmd_graph_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_seed_union_keeps_owners_kinds_scope_and_limits() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        std::fs::write(root.path().join("Probe.java"), r#"class Selected { int ping; void ping(int value) {} void ping(String value) {} } class Decoy { void ping(int value) {} }
+class Use {
+ void first(Selected value) { value.ping(1); }
+ void second(Selected value) { value.ping(""); }
+ void foreign(Decoy value) { value.ping(1); }
+ int field(Selected value) { return value.ping; }
+ void both(Selected value) {
+  value.ping(1);
+  value.ping("");
+ }
+}
+"#).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        crate::indexer::index_directory(&mut conn, root.path(), false, false).unwrap();
+        let seed = db::get_file_symbols(&conn, root.path().to_str(), "Probe.java")
+            .unwrap()
+            .into_iter()
+            .find(|symbol| {
+                symbol.kind == "function"
+                    && symbol.qualified_name.as_deref() == Some("Selected.ping")
+            })
+            .unwrap();
+        for built in [false, true] {
+            if built {
+                resolve::build_symbol_graph(&mut conn, root.path(), false).unwrap();
+            }
+            for cap in [0, 1, 10] {
+                let keep = |symbol: &GraphSymbolInfo| symbol.name != "first";
+                let seeds = [seed.clone()];
+                let pages = if built {
+                    resolved_dependents_of_filtered(&conn, &seeds, cap, keep)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    transient_java_dependents(&conn, root.path(), &seeds, cap, keep).unwrap()
+                };
+                let mut names: Vec<_> =
+                    pages[0].iter().map(|symbol| symbol.name.as_str()).collect();
+                names.sort_unstable();
+                assert_eq!(names.len(), cap.min(2));
+                assert!(
+                    names.iter().all(|name| ["both", "second"].contains(name)),
+                    "{names:?}"
+                );
+                if cap == 10 {
+                    assert_eq!(names, ["both", "second"]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn short_name_strips_qualifiers_and_markers() {

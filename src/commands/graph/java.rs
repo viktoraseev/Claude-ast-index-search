@@ -97,6 +97,7 @@ pub(super) struct JavaSource {
     parameters: HashMap<(String, i64), Option<(usize, bool)>>,
     returns: HashMap<(String, i64, usize), Option<String>>,
     return_receivers: HashMap<(String, i64, usize), JavaReceiver>,
+    method_result_templates: HashMap<(String, i64, usize), JavaReceiver>,
     member_receivers: HashMap<(String, i64, usize), JavaReceiver>,
     member_invocation_types: HashMap<(String, i64, usize), Option<String>>,
     getter_receivers: HashMap<(String, i64, String), Option<(i64, JavaReceiver)>>,
@@ -114,6 +115,7 @@ pub(super) struct JavaSource {
     canonical_types: HashMap<String, Vec<String>>,
     creation_types: HashMap<CallKey, Vec<Option<String>>>,
     invocation_types: HashMap<CallKey, Option<InvocationArguments>>,
+    invocation_witnesses: HashMap<CallKey, Option<Vec<String>>>,
     invocation_parameters: HashMap<(String, i64), Vec<Option<String>>>,
     /// Declaration order distinguishes overloads with the same name and line.
     invocation_signatures: HashMap<(String, i64), Vec<InvocationSignature>>,
@@ -4012,6 +4014,21 @@ impl JavaSource {
                 "method_declaration" | "constructor_declaration"
             ) {
                 if let Some(name) = node.child_by_field_name("name") {
+                    if node.child_by_field_name("type_parameters").is_some() {
+                        if let Some(template) = node
+                            .child_by_field_name("type")
+                            .and_then(|ty| declared_receiver(ty, node, source, true))
+                        {
+                            result.method_result_templates.insert(
+                                (
+                                    text(name, source).to_owned(),
+                                    name.start_position().row as i64 + 1,
+                                    name.start_byte(),
+                                ),
+                                template,
+                            );
+                        }
+                    }
                     if let Some(receiver) = node
                         .child_by_field_name("type")
                         .and_then(|ty| declared_receiver(ty, node, source, false))
@@ -4374,6 +4391,27 @@ impl JavaSource {
                 return WalkControl::Continue;
             }
             let argument_types = invocation_argument_types(node, owner, source, &scopes);
+            let witnesses = node.child_by_field_name("type_arguments").map_or_else(
+                || Some(Vec::new()),
+                |arguments| {
+                    let mut cursor = arguments.walk();
+                    let values = arguments
+                        .named_children(&mut cursor)
+                        .filter(|argument| !argument.is_extra())
+                        .map(|argument| invocation_type(argument, source))
+                        .collect();
+                    values
+                },
+            );
+            result
+                .invocation_witnesses
+                .entry(key.clone())
+                .and_modify(|previous| {
+                    if *previous != witnesses {
+                        *previous = None;
+                    }
+                })
+                .or_insert(witnesses);
             result
                 .invocation_types
                 .entry(key.clone())
@@ -4765,6 +4803,15 @@ impl JavaSource {
         declaration_metadata(&self.return_receivers, name, line, site)
     }
 
+    pub fn method_result_template(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+    ) -> Option<&JavaReceiver> {
+        declaration_metadata(&self.method_result_templates, name, line, site)
+    }
+
     pub fn member_receiver(
         &self,
         name: &str,
@@ -5018,6 +5065,25 @@ impl JavaSource {
         self.invocation_types
             .get(&self.call_key(owner, owner_line, owner_site, line, name)?)?
             .as_deref()
+    }
+
+    pub fn invocation_witnesses(
+        &self,
+        owner: &str,
+        owner_line: i64,
+        owner_site: Option<usize>,
+        line: i64,
+        name: &str,
+    ) -> Option<&[String]> {
+        self.invocation_witnesses
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)?
+            .as_deref()
+    }
+
+    pub fn method_type_parameters(&self, name: &str, line: i64, site: Option<usize>) -> &[String] {
+        declaration_metadata(&self.type_parameters, name, line, site)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn member_invocation_type(

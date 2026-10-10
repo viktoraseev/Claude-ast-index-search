@@ -31,6 +31,12 @@ use crate::db::{self, SymbolEdgeRow};
 const MAX_ANCESTOR_DEPTH: usize = 8;
 
 type JavaValueCache = HashMap<(u32, JavaReceiver, usize), Option<(u32, JavaReceiver)>>;
+
+struct JavaResultBindings {
+    types: HashMap<String, String>,
+    explicit: bool,
+}
+
 thread_local! {
     // Cleared for each reference; repeated unsuccessful chain projections
     // otherwise expand exponentially even with a recursion depth bound.
@@ -2514,6 +2520,242 @@ impl Builder {
             },
             0,
         )
+    }
+
+    fn java_has_method_variable(&self, target: u32, template: &JavaReceiver) -> bool {
+        match template {
+            JavaReceiver::Parameter(parameter) => {
+                let symbol = &self.syms[target as usize];
+                self.files[symbol.file as usize]
+                    .java
+                    .as_ref()
+                    .is_some_and(|java| {
+                        java.parameter_index(&symbol.name, symbol.line, symbol.java_site, parameter)
+                            .is_some()
+                    })
+            }
+            JavaReceiver::ArrayOf(element) => self.java_has_method_variable(target, element),
+            JavaReceiver::Parameterized { arguments, .. } => arguments
+                .iter()
+                .flatten()
+                .any(|argument| self.java_has_method_variable(target, argument)),
+            _ => false,
+        }
+    }
+
+    /// Bind invariant slots recursively. Unknown/raw inputs and conflicting
+    /// witnesses cannot supply a result type merely from its declared bound.
+    fn java_match_result_slot(
+        &self,
+        target: u32,
+        template: &JavaReceiver,
+        input: &str,
+        bindings: &mut JavaResultBindings,
+        invariant: bool,
+        depth: usize,
+    ) -> Option<()> {
+        if depth >= 16 {
+            return None;
+        }
+        let symbol = &self.syms[target as usize];
+        let java = self.files[symbol.file as usize].java.as_ref()?;
+        match template {
+            JavaReceiver::ArrayOf(element) => self.java_match_result_slot(
+                target,
+                element,
+                input.strip_suffix("[]")?,
+                bindings,
+                invariant,
+                depth + 1,
+            ),
+            JavaReceiver::Parameter(parameter) => {
+                java.parameter_index(&symbol.name, symbol.line, symbol.java_site, parameter)?;
+                if !self.java_result_bound_accepts(target, parameter, input) {
+                    return None;
+                }
+                if let Some(previous) = bindings.types.get(parameter) {
+                    return (previous == input
+                        || bindings.explicit
+                            && !invariant
+                            && self.java_invocation_conversion_at(
+                                (target, input, None),
+                                (target, previous, None),
+                                false,
+                                0,
+                            ) == Some(true))
+                    .then_some(());
+                }
+                bindings.types.insert(parameter.clone(), input.to_owned());
+                Some(())
+            }
+            JavaReceiver::Parameterized { path, arguments } => {
+                let values = Self::java_invariant_arguments(input)?;
+                if values.len() != arguments.len()
+                    || self.java_invocation_identity(target, path, 0)? != input.split('<').next()?
+                {
+                    return None;
+                }
+                for (formal, value) in arguments.iter().zip(values) {
+                    self.java_match_result_slot(
+                        target,
+                        formal.as_ref()?,
+                        value,
+                        bindings,
+                        true,
+                        depth + 1,
+                    )?;
+                }
+                Some(())
+            }
+            JavaReceiver::Type(path) => {
+                (self.java_invocation_identity(target, path, 0)? == input).then_some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn java_result_bound_accepts(&self, target: u32, parameter: &str, input: &str) -> bool {
+        if Self::java_primitive(input) {
+            return false;
+        }
+        let symbol = &self.syms[target as usize];
+        let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
+            return false;
+        };
+        java.type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
+            .is_none_or(|bound| {
+                self.java_invocation_conversion_at(
+                    (target, input, None),
+                    (target, bound, symbol.java_site),
+                    false,
+                    0,
+                ) == Some(true)
+            })
+    }
+
+    fn java_receiver_from_signature(ty: &str, depth: usize) -> Option<JavaReceiver> {
+        if depth >= 16 {
+            return None;
+        }
+        if let Some(element) = ty.strip_suffix("[]") {
+            return Some(JavaReceiver::ArrayOf(Box::new(
+                Self::java_receiver_from_signature(element, depth + 1)?,
+            )));
+        }
+        if let Some(values) = Self::java_invariant_arguments(ty) {
+            let arguments = values
+                .into_iter()
+                .map(|value| Self::java_receiver_from_signature(value, depth + 1).map(Some))
+                .collect::<Option<_>>()?;
+            return Some(JavaReceiver::Parameterized {
+                path: ty.split('<').next()?.to_owned(),
+                arguments,
+            });
+        }
+        Some(JavaReceiver::Type(ty.to_owned()))
+    }
+
+    fn java_substitute_result_slots(
+        &self,
+        target: u32,
+        template: &JavaReceiver,
+        bindings: &HashMap<String, String>,
+        depth: usize,
+    ) -> Option<JavaReceiver> {
+        if depth >= 16 {
+            return None;
+        }
+        match template {
+            JavaReceiver::Parameter(parameter) => {
+                if let Some(ty) = bindings.get(parameter) {
+                    return Self::java_receiver_from_signature(ty, depth + 1);
+                }
+                let symbol = &self.syms[target as usize];
+                let bound = self.files[symbol.file as usize].java.as_ref()?.type_bound(
+                    &symbol.name,
+                    symbol.line,
+                    symbol.java_site,
+                    parameter,
+                )?;
+                Self::java_receiver_from_signature(
+                    &self.java_invocation_identity(target, bound, 0)?,
+                    depth + 1,
+                )
+            }
+            JavaReceiver::ArrayOf(element) => Some(JavaReceiver::ArrayOf(Box::new(
+                self.java_substitute_result_slots(target, element, bindings, depth + 1)?,
+            ))),
+            JavaReceiver::Parameterized { path, arguments } => Some(JavaReceiver::Parameterized {
+                path: self.java_invocation_identity(target, path, 0)?,
+                arguments: arguments
+                    .iter()
+                    .map(|argument| {
+                        self.java_substitute_result_slots(
+                            target,
+                            argument.as_ref()?,
+                            bindings,
+                            depth + 1,
+                        )
+                        .map(Some)
+                    })
+                    .collect::<Option<_>>()?,
+            }),
+            JavaReceiver::Type(path) => Some(JavaReceiver::Type(
+                self.java_invocation_identity(target, path, 0)?,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Infer array/container results only from a unique fixed-arity invocation
+    /// whose complete formal slots and declared bounds have been verified.
+    fn java_inferred_result_slots(
+        &self,
+        source: u32,
+        target: u32,
+        line: i64,
+        name: &str,
+        template: &JavaReceiver,
+    ) -> Option<JavaReceiver> {
+        let symbol = &self.syms[target as usize];
+        let java = self.files[symbol.file as usize].java.as_ref()?;
+        let (formals, variadic) =
+            java.invocation_signature_at(&symbol.name, symbol.line, symbol.java_callable_ordinal)?;
+        let owner = &self.syms[source as usize];
+        let call_java = self.files[owner.file as usize].java.as_ref()?;
+        let witnesses =
+            call_java.invocation_witnesses(&owner.name, owner.line, owner.java_site, line, name)?;
+        let inputs =
+            call_java.invocation_arguments(&owner.name, owner.line, owner.java_site, line, name)?;
+        if variadic || formals.len() != inputs.len() {
+            return None;
+        }
+        let mut bindings = JavaResultBindings {
+            types: HashMap::new(),
+            explicit: !witnesses.is_empty(),
+        };
+        if bindings.explicit {
+            let variables =
+                java.method_type_parameters(&symbol.name, symbol.line, symbol.java_site);
+            if variables.len() != witnesses.len() {
+                return None;
+            }
+            for (parameter, witness) in variables.iter().zip(witnesses) {
+                let identity = self.java_invocation_identity(source, witness, 0)?;
+                if !self.java_result_bound_accepts(target, parameter, &identity) {
+                    return None;
+                }
+                bindings.types.insert(parameter.clone(), identity);
+            }
+        }
+        for (index, input) in inputs.iter().enumerate() {
+            let formal =
+                java.reference_parameter(&symbol.name, symbol.line, symbol.java_site, index)?;
+            let (context, ty) = self.java_invocation_argument(source, input.as_ref()?)?;
+            let identity = self.java_invocation_identity(context, &ty, 0)?;
+            self.java_match_result_slot(target, formal, &identity, &mut bindings, false, 0)?;
+        }
+        self.java_substitute_result_slots(target, template, &bindings.types, 0)
     }
 
     /// Substitute class parameters only through that exact declaring receiver.
@@ -5142,6 +5384,23 @@ impl Builder {
                 };
                 let symbol = &self.syms[*target as usize];
                 let java = self.files[symbol.file as usize].java.as_ref()?;
+                if let Some(template) = java
+                    .method_result_template(&symbol.name, symbol.line, symbol.java_site)
+                    .filter(|template| {
+                        matches!(
+                            template,
+                            JavaReceiver::ArrayOf(_) | JavaReceiver::Parameterized { .. }
+                        ) && self.java_has_method_variable(*target, template)
+                    })
+                {
+                    // Failure is authoritative: fallback through erased return
+                    // metadata would turn an invalid bound into a caller.
+                    return Some((
+                        *target,
+                        self.java_inferred_result_slots(source, *target, *line, name, template)
+                            .unwrap_or(JavaReceiver::Unknown),
+                    ));
+                }
                 if let Some(parameter) =
                     java.return_parameter(&symbol.name, symbol.line, symbol.java_site)
                 {
@@ -7039,13 +7298,14 @@ pub(crate) fn transient_java_dependents(
         .enumerate()
         .filter(|(_, seed)| seed.path.ends_with(".java"))
     {
-        if let Some(id) = db::find_symbol_id_by_kind(
+        for id in db::find_java_seed_ids(
             conn,
             seed.root_path.as_deref(),
             &seed.path,
             seed.line,
             &seed.name,
             &seed.kind,
+            seed.qualified_name.as_deref(),
         )? {
             targets.entry(id).or_default().push(index);
         }
