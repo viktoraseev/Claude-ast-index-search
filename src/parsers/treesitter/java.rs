@@ -615,8 +615,24 @@ pub(crate) struct DependencyImportDeclaration {
 #[derive(Clone)]
 pub(crate) enum DependencyResultType {
     Named(String, Vec<Option<DependencyResultType>>),
-    Parameter { owner: String, name: String },
+    Parameter {
+        owner: String,
+        name: String,
+    },
     Array(Box<DependencyResultType>, usize),
+    /// A read bound is not an invariant or writable type argument.
+    UpperBound(Box<DependencyResultType>),
+}
+
+fn dependency_wildcard_bound(ty: Node<'_>) -> Option<Node<'_>> {
+    if ty.kind() != "wildcard"
+        || !ty
+            .children(&mut ty.walk())
+            .any(|child| child.kind() == "extends")
+    {
+        return None;
+    }
+    ty.named_children(&mut ty.walk()).last()
 }
 
 pub(crate) fn dependency_result_type(
@@ -627,6 +643,11 @@ pub(crate) fn dependency_result_type(
 ) -> Option<DependencyResultType> {
     if depth >= 16 || ty.has_error() {
         return None;
+    }
+    if ty.kind() == "wildcard" {
+        return Some(DependencyResultType::UpperBound(Box::new(
+            dependency_result_type(dependency_wildcard_bound(ty)?, content, package, depth + 1)?,
+        )));
     }
     if ty.kind() == "array_type" {
         let rank = node_text(content, &ty.child_by_field_name("dimensions")?)
@@ -730,6 +751,17 @@ fn dependency_method_result_type(
 ) -> Option<DependencyResultType> {
     if depth >= 16 || ty.has_error() {
         return None;
+    }
+    if ty.kind() == "wildcard" {
+        return Some(DependencyResultType::UpperBound(Box::new(
+            dependency_method_result_type(
+                dependency_wildcard_bound(ty)?,
+                content,
+                package,
+                names,
+                depth + 1,
+            )?,
+        )));
     }
     if ty.kind() == "array_type" {
         let rank = node_text(content, &ty.child_by_field_name("dimensions")?)
@@ -3379,6 +3411,55 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             if matches!(&arguments[0], Some(DependencyResultType::Array(element, 1))
                 if matches!(element.as_ref(), DependencyResultType::Named(name, slots)
                     if name == "int" && slots.is_empty()))));
+    }
+
+    #[test]
+    fn dependency_wildcard_results_keep_read_bounds_and_method_variables() {
+        let source = r#"package fixture;
+class Box<T> {
+    Box<? extends T> upper;
+    Box<? super T> lower;
+    Box<?> unknown;
+    Box<? extends T[]> array;
+    <U> Box<? extends U> get(U value) { return null; }
+}
+"#;
+        let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
+            .unwrap()
+            .unwrap();
+        let result = |name: &str| {
+            declaration.value_types[&(name.into(), false)][0]
+                .result_type
+                .as_ref()
+                .unwrap()
+        };
+        assert!(
+            matches!(result("upper"), DependencyResultType::Named(_, arguments)
+            if matches!(&arguments[0], Some(DependencyResultType::UpperBound(bound))
+                if matches!(bound.as_ref(), DependencyResultType::Parameter { owner, name }
+                    if owner == "fixture.Box" && name == "T")))
+        );
+        for name in ["lower", "unknown"] {
+            assert!(
+                matches!(result(name), DependencyResultType::Named(_, arguments)
+                if arguments[0].is_none())
+            );
+        }
+        assert!(
+            matches!(result("array"), DependencyResultType::Named(_, arguments)
+            if matches!(&arguments[0], Some(DependencyResultType::UpperBound(bound))
+                if matches!(bound.as_ref(), DependencyResultType::Array(_, 1))))
+        );
+        let method = declaration.value_types[&("get".into(), true)][0]
+            .method_signature
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(&method.result, Some(DependencyResultType::Named(_, arguments))
+            if matches!(&arguments[0], Some(DependencyResultType::UpperBound(bound))
+                if matches!(bound.as_ref(), DependencyResultType::Parameter { owner, name }
+                    if owner == "@method" && name == "U")))
+        );
     }
 
     #[test]

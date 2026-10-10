@@ -143,6 +143,8 @@ COMMAND_GROUPS = {
     'vcs_contracts': 'changed hotspots',
     'project_format_contracts': 'agrep',
 }
+CONTRACTS['java_wildcard_result_contracts'] = ('src/parsers/treesitter/java.rs and src/commands/modules.rs',
+    'upper-bounded source/JDK field/method/record/inherited/array results, initializer-site captures and capture write/invariant/access/rank guards; attached provider imports with JSON/text/strict/option products and update/rebuild ownership')
 CONTRACTS['vcs_contracts'] = ('src/commands/grep.rs',
     'changed/hotspots disposable Java Git history: cwd/path/exclude-test selectors, primary-only history and rejected subtree guards; exact file ownership')
 CONTRACTS['project_format_contracts'] = ('src/commands/grep.rs',
@@ -215,11 +217,13 @@ EXTRA_FEATURES = (
     'unused-deps:java-module-binding',
     'unused-deps:java-nested-array-slots',
     'unused-deps:java-array-results',
+    'unused-deps:java-wildcard-results',
     'unused-deps:java-source-results',
 )
 
 # Original finite authored populations, including every positive and negative.
 RETAINED = (
+    ('unused-deps:java-wildcard-results', 'disposable-java-wildcard-results-v1', 115, 'ac92d3b213059d1e0bab300d3f210b7016c47d88c3efa46b287aa396a871c016', '64b89e18ed4aa08d20e9b21225a6c5d4764823911f281c6b3a93d522cf3829e2', 'java_wildcard_result_contracts'),
     ('unused-deps:java-nested-array-slots', 'disposable-java-nested-array-slots-v1', 115, 'b2ba9f302d1de814c2b8bc6c565523f435a3be18a43aa2256485b4bb7f106158', '23ec1b8949bc8a53f8a1dae7a345b63ef48e92e2fec80f80ec0868b308521789', 'java_nested_array_contracts'),
     ('unused-deps:java-array-results', 'disposable-java-array-results-v1', 170, '9e170da3e65aae87e0ec0d5f87e8e3d2cc675430d4a714a649f420981bd048d1', '405b660778f4b5b4fa9b64768267f2e85a7a93c5a030e8e30138fbf0dcaab0ae', 'java_array_result_contracts'),
     ('global:scope:java-resources', 'disposable-java-resource-scope', 382, '290846ebc42579b01b99cb543985a637a51798dfefa4cd8aa5457cae8f22a3bc', 'da6f373dae87def8a0d146a24f01231f352dc94ccdb56f9edca8fea7988fa82b', 'java_resource_scope_contracts'),

@@ -2247,6 +2247,9 @@ struct JavaDependencyValue {
     arguments: Vec<Option<JavaDependencyValue>>,
     instance: bool,
     array_dimensions: usize,
+    /// Rank of a captured upper bound. An enclosing T[] is still indexable;
+    /// CAP extends Child[] itself is not an array expression in Java.
+    capture_rank: Option<usize>,
 }
 
 struct JavaDependencyInvocation<'a> {
@@ -2323,12 +2326,13 @@ impl JavaDependencyValue {
             arguments: Vec::new(),
             instance,
             array_dimensions: 0,
+            capture_rank: None,
         }
     }
 
     fn signature(&self) -> String {
         format!(
-            "{}<{}>{}",
+            "{}<{}>{}{:?}",
             self.owner.identity,
             self.arguments
                 .iter()
@@ -2340,10 +2344,14 @@ impl JavaDependencyValue {
                 .collect::<Vec<_>>()
                 .join(","),
             "[]".repeat(self.array_dimensions),
+            self.capture_rank,
         )
     }
 
     fn invocation_type(&self) -> Option<String> {
+        if self.capture_rank.is_some() {
+            return None;
+        }
         if self.arguments.is_empty() {
             return Some(format!(
                 "{}{}",
@@ -3078,6 +3086,7 @@ impl JavaDependencyLookup<'_> {
         ) -> bool {
             use crate::parsers::treesitter::java::DependencyResultType;
             match ty {
+                DependencyResultType::UpperBound(_) => true,
                 DependencyResultType::Array(element, _) => captured(element, value),
                 DependencyResultType::Parameter { owner, name } => {
                     owner != &value.owner.identity
@@ -3088,7 +3097,11 @@ impl JavaDependencyLookup<'_> {
                             .iter()
                             .position(|parameter| parameter == name)
                             .and_then(|index| value.arguments.get(index))
-                            .is_some_and(Option::is_none)
+                            .is_some_and(|argument| {
+                                argument
+                                    .as_ref()
+                                    .is_none_or(|value| value.capture_rank.is_some())
+                            })
                 }
                 DependencyResultType::Named(_, arguments) => arguments
                     .iter()
@@ -3252,6 +3265,7 @@ impl JavaDependencyLookup<'_> {
             return Ok(None);
         }
         match signature {
+            DependencyResultType::UpperBound(_) => Ok(None),
             DependencyResultType::Array(element, rank) => Ok(self
                 .signature_identity(element, imports, substitution, depth + 1)?
                 .map(|element| format!("{element}{}", "[]".repeat(*rank)))),
@@ -3448,6 +3462,9 @@ impl JavaDependencyLookup<'_> {
             bindings: &std::collections::HashMap<String, String>,
         ) -> Option<DependencyResultType> {
             match ty {
+                DependencyResultType::UpperBound(bound) => Some(DependencyResultType::UpperBound(
+                    Box::new(substitute(bound, bindings)?),
+                )),
                 DependencyResultType::Array(element, rank) => Some(DependencyResultType::Array(
                     Box::new(substitute(element, bindings)?),
                     *rank,
@@ -3815,6 +3832,12 @@ impl JavaDependencyLookup<'_> {
             return Ok(None);
         }
         match signature {
+            DependencyResultType::UpperBound(bound) => Ok(self
+                .result_value(bound, position, imports, substitution, depth + 1)?
+                .map(|mut value| {
+                    value.capture_rank = Some(value.array_dimensions);
+                    value
+                })),
             DependencyResultType::Array(element, rank) => {
                 // Primitive leaves are valid generic array slots, never source
                 // declarations or standalone project receiver owners.
@@ -3845,7 +3868,7 @@ impl JavaDependencyLookup<'_> {
                 }))
             }
             DependencyResultType::Parameter { owner, name } => {
-                if let Some(value) = substitution
+                if let Some(mut value) = substitution
                     .filter(|value| &value.owner.identity == owner)
                     .and_then(|value| {
                         value
@@ -3858,6 +3881,40 @@ impl JavaDependencyLookup<'_> {
                             .and_then(Clone::clone)
                     })
                 {
+                    // Capture conversion retains the declared variable bound:
+                    // Box<T extends Child> with <? extends Object> reads Child.
+                    // Non-comparable intersection bounds remain a separate
+                    // obligation; never erase the capture for writable formals.
+                    if value.capture_rank == Some(0) {
+                        if let Some(declaration) = self.raw(owner)? {
+                            if let Some(bound) =
+                                declaration.declaration.type_parameter_bounds.get(name)
+                            {
+                                let binding = JavaDependencyLookup {
+                                    package: &declaration.declaration.package,
+                                    ..*self
+                                };
+                                if let Some(mut bound) = binding.result_value(
+                                    bound,
+                                    position,
+                                    &declaration.declaration.imports,
+                                    substitution,
+                                    depth + 1,
+                                )? {
+                                    if bound.array_dimensions == 0
+                                        && self.invocation_conversion(
+                                            &bound.owner.identity,
+                                            &value.owner.identity,
+                                            false,
+                                        )?
+                                    {
+                                        bound.capture_rank = Some(0);
+                                        value = bound;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return Ok(Some(value));
                 }
                 let Some(declaration) = self.raw(owner)? else {
@@ -3917,6 +3974,7 @@ impl JavaDependencyLookup<'_> {
                     arguments: bound,
                     instance: true,
                     array_dimensions: 0,
+                    capture_rank: None,
                 }))
             }
         }
@@ -4050,7 +4108,11 @@ impl JavaDependencyLookup<'_> {
                 else {
                     return Ok(None);
                 };
-                if value.array_dimensions == 0 {
+                if value.array_dimensions == 0
+                    || value
+                        .capture_rank
+                        .is_some_and(|rank| rank == value.array_dimensions)
+                {
                     return Ok(None);
                 }
                 value.array_dimensions -= 1;

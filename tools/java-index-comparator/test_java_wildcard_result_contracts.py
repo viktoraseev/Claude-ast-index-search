@@ -1,0 +1,108 @@
+"""Production wildcard read results and fail-closed audit evidence on disposable Java."""
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+
+from audit import Fixture, SCHEMA, plan, required_features
+from common import ToolError, adapter_digest, connect
+import java_wildcard_result_contracts as contracts
+import scope_acceptance
+
+
+class WildcardResultContracts(unittest.TestCase):
+    def setUp(self):
+        base = Path(__file__).resolve().parents[2] / '.artifacts/tests'
+        base.mkdir(parents=True, exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=base)
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name).resolve()
+        self.root = self.directory / 'target'
+        self.root.mkdir()
+        (self.root / 'Sentinel.java').write_text('class Sentinel {}\n')
+        (self.root / 'Foreign.kt').write_text('// inventory sentinel\n')
+        self.state = connect(self.directory / 'evidence.sqlite')
+        self.addCleanup(self.state.close)
+        self.state.executescript(SCHEMA)
+        self.binary = Path(os.environ.get('AST_INDEX_TEST_BINARY', 'target/release/ast-index')).resolve()
+        self.oracle = Mock()
+        self.oracle.call.side_effect = AssertionError('independent source fixture has no MCP oracle')
+        self.fixture = Fixture(self.root, self.binary, self.directory / 'target.sqlite', self.state, self.oracle)
+        plan(self.state, [{'path': 'Sentinel.java'}], '  class  Classes\n  symbol  Symbols\n  file  Files',
+             root=self.root, java_only=True)
+        self.feature = next(iter(contracts.FEATURES))
+
+    def evaluate(self):
+        check = self.state.execute('SELECT * FROM checks WHERE feature=?', (self.feature,)).fetchone()
+        self.assertIsNotNone(check)
+        self.fixture.evaluate(check)
+        return self.state.execute('SELECT * FROM checks WHERE id=?', (check['id'],)).fetchone()
+
+    def test_production_family_and_complete_acceptance_population(self):
+        with patch.object(contracts, 'exercise', wraps=contracts.exercise) as exercise:
+            row = self.evaluate()
+            diff = json.loads(row['diff_json'] or '{}')
+            self.assertEqual(row['verdict'], 'pass', {'error': row['error'],
+                'missing': len(diff.get('missing', [])), 'unexpected': len(diff.get('unexpected', []))})
+            self.assertEqual(exercise.call_count, 1)
+            self.assertIn('not MCP equivalence', json.loads(row['expected_json'])['source'])
+            samples = json.loads(row['expected_json'])['samples']
+            criterion = next(item for item in scope_acceptance.specification()['criteria']
+                             if item['feature'] == self.feature)
+            scope_acceptance.validate_population(samples, criterion)
+            for label in contracts.CASES:
+                self.assertIn(label + ':True', samples)
+                self.assertIn(label + ':text', samples)
+            for key in ('inventory', 'javac-positive', 'attached:javac', 'attached:update',
+                        'attached:rebuild', 'attached:changed-result', 'write-guard:True',
+                        'array-write-guard:True', 'invariant-witness-guard:True',
+                        'capture-reference:True', 'method-variable-result:True', 'declared-bound:True'):
+                smaller = dict(samples)
+                del smaller[key]
+                with self.assertRaises(scope_acceptance.AcceptancePending):
+                    scope_acceptance.validate_population(smaller, criterion)
+            smaller = json.loads(json.dumps(samples))
+            smaller['method:True'][0][3] = []
+            with self.assertRaises(scope_acceptance.AcceptancePending):
+                scope_acceptance.validate_population(smaller, criterion)
+        self.oracle.call.assert_not_called()
+        self.assertFalse(self.fixture.database.exists())
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['Foreign.kt', 'Sentinel.java'])
+        self.assertEqual((self.root / 'Sentinel.java').read_text(), 'class Sentinel {}\n')
+        self.assertEqual(self.state.execute("SELECT status FROM coverage WHERE feature='unused-deps:semantic-resolution'").fetchone()[0], 'pending')
+
+    def test_wrong_missing_inapplicable_and_interrupted_proofs_stay_unresolved(self):
+        self.assertIn(self.feature, required_features())
+        before = [tuple(r) for r in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')]
+        contracts.plan_results(self.state, self.root)
+        self.assertEqual(before, [tuple(r) for r in self.state.execute('SELECT id,feature,subject FROM checks ORDER BY id')])
+        for got in ({}, {'capture': []}, {'capture': 'inapplicable'}, {'capture': 'wrong-owner'}):
+            self.fixture._java_wildcard_result_results = None
+            with patch.object(contracts, 'exercise', return_value=({self.feature: {'capture': ['Base']}}, {self.feature: got})):
+                self.assertEqual(self.evaluate()['verdict'], 'fail')
+        self.fixture._java_wildcard_result_results = None
+        with patch.object(contracts, 'exercise', side_effect=ToolError('interrupted fixture')):
+            self.assertEqual(self.evaluate()['verdict'], 'error')
+        self.assertEqual(self.state.execute("SELECT status FROM coverage WHERE feature='unused-deps:semantic-resolution'").fetchone()[0], 'pending')
+        self.assertEqual(self.state.execute("SELECT status FROM coverage WHERE feature='extensions'").fetchone()[0], 'out-of-scope')
+
+    def test_boundaries_fingerprint_and_incomplete_mixed_inventory(self):
+        with self.assertRaisesRegex(ToolError, 'inside repository'):
+            contracts.exercise(self.binary, Path('/private/tmp'))
+        original, read = adapter_digest(), Path.read_bytes
+        with patch.object(Path, 'read_bytes', lambda p: read(p) + (
+                b'\n# changed contract\n' if p.name == 'java_wildcard_result_contracts.py' else b'')):
+            self.assertNotEqual(adapter_digest(), original)
+        inventory = contracts.mobile_contracts.inventory
+        def incomplete(state, root):
+            inventory(state, root)
+            state.execute("DELETE FROM file_inventory WHERE extension='.xml'")
+        with patch.object(contracts.mobile_contracts, 'inventory', side_effect=incomplete):
+            with self.assertRaisesRegex(ToolError, 'full inventory incomplete'):
+                contracts.exercise(self.binary, self.directory)
+
+
+if __name__ == '__main__':
+    unittest.main()
