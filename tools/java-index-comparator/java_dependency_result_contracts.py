@@ -11,13 +11,51 @@ FEATURES = {'unused-deps:java-source-results'}
 REASON = ('independent source/javac/CLI: explicit class generic result substitution, '
           'fields/records/inheritance and initializer-site var chains with access, '
           'ambiguity, class-variable formals/arrays/boxing, nominal variable-arity '
-          'invocation phases, scalar method-variable inference, explicit witnesses, '
-          'bounds, shadowing, array/spread formals and attached classpath guards; '
+          'invocation phases, scalar and invariant parameterized method-variable inference, explicit witnesses, '
+          'bounds, shadowing, fixed/class-generic slots, array/spread formals and attached classpath guards; '
           'not MCP equivalence')
 
 # Each input has an authored declaring owner. Invalid-Java guards must remain
 # uncredited; VALID_NEGATIVE_CASES separately compile valid ownership controls.
 CASES = {
+    'formal-generic-fixed': ('class Carrier<U> {} class Box { shared.Child get(Carrier<shared.Child> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'formal-generic-class': ('class Carrier<U> {} class Box<T> { T get(Carrier<T> value){return null;} }', 'Box<shared.Child> b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'formal-generic-class-inherited': ('class Carrier<U> {} class Parent<T> { T get(Carrier<T> value){return null;} } class Box<A,B> extends Parent<B> {}', 'Box<String,shared.Child> b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'formal-generic-class-spread': ('class Carrier<U> {} class Box<T> { T get(Carrier<T>... value){return null;} }', 'Box<shared.Child> b, Carrier<shared.Child> c', 'b.get(c,c).instance()', True),
+    'formal-generic-class-array': ('class Carrier<U> {} class Box<T> { T get(Carrier<T>[] value){return null;} }', 'Box<shared.Child> b, Carrier<shared.Child>[] c', 'b.get(c).instance()', True),
+    'formal-generic-fixed-guard': ('class Carrier<U> {} class Box { shared.Child get(Carrier<shared.Child> value){return null;} }', 'Box b, Carrier<String> c', 'b.get(c).instance()', False),
+    'formal-generic-class-guard': ('class Carrier<U> {} class Box<T> { T get(Carrier<T> value){return null;} }', 'Box<shared.Child> b, Carrier<String> c', 'b.get(c).instance()', False),
+    'formal-generic-class-capture-guard': ('class Carrier<U> {} class Box<T extends shared.Child> { T get(Carrier<T> value){return null;} }', 'Box<?> b, Carrier<shared.Child> c', 'b.get(c).instance()', False),
+    'parameterized-formal': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-nested': ('class Carrier<U> {} class Box { <T> T get(Carrier<Carrier<T>> value){return null;} }', 'Box b, Carrier<Carrier<shared.Child>> c', 'b.get(c).instance()', True),
+    'parameterized-list': ('class Box { <T> T get(java.util.List<T> value){return null;} }', 'Box b, java.util.List<shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-inherited': ('class Carrier<U> {} class Derived<A,B> extends Carrier<B> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Derived<String,shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-inherited-method': ('class Carrier<U> {} class Parent { <T> T get(Carrier<T> value){return null;} } class Box extends Parent {}', 'Box b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-array': ('class Carrier<U> {} class Box { <T> T get(Carrier<T>[] value){return null;} }', 'Box b, Carrier<shared.Child>[] c', 'b.get(c).instance()', True),
+    'parameterized-postfix': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value[]){return null;} }', 'Box b, Carrier<shared.Child>[] c', 'b.get(c).instance()', True),
+    'parameterized-spread': ('class Carrier<U> {} class Box { <T> T get(Carrier<T>... value){return null;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c,c).instance()', True),
+    'parameterized-fixed-spread': ('class Carrier<U> {} class Box { <T> T get(Carrier<T>... value){return null;} }', 'Box b, Carrier<shared.Child>[] c', 'b.get(c).instance()', True),
+    'parameterized-bounded': ('class Carrier<U> {} class Box { <T extends shared.Child> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-shadow': ('class Carrier<U> {} class Box<T> { <T> T get(Carrier<T> value){return null;} }', 'Box<String> b, Carrier<shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-capture': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'var value=b.get(c); return ((java.util.function.IntSupplier)value::instance).getAsInt()', True),
+    'parameterized-new': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b', 'b.get(new Carrier<shared.Child>()).instance()', True),
+    'parameterized-site': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'class Carrier<U> {} return b.get(c).instance()', True),
+    'parameterized-scalar-result': ('class Carrier<U> { U value(){return null;} } class Box { <T> T get(T value){return value;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).value().instance()', True),
+    'parameterized-witness': ('class Carrier<U> { U value(){return null;} } class Box { <T> T get(){return null;} }', 'Box b', 'b.<Carrier<shared.Child>>get().value().instance()', True),
+    'parameterized-cast': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Object c', 'b.get((Carrier<shared.Child>)c).instance()', True),
+    'parameterized-empty-spread': ('class Carrier<U> {} class Box { <T extends shared.Child> T get(Carrier<T>... value){return null;} }', 'Box b', 'b.get().instance()', True),
+    'parameterized-class-slot': ('class Carrier<A,B> {} class Box<T> { <U> U get(Carrier<T,U> value){return null;} }', 'Box<String> b, Carrier<String,shared.Child> c', 'b.get(c).instance()', True),
+    'parameterized-bound-result': ('class Carrier<U> { U value(){return null;} } class Box { <T extends Carrier<shared.Child>> T get(T value){return value;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).value().instance()', True),
+    'parameterized-class-slot-guard': ('class Carrier<A,B> {} class Box<T> { <U> U get(Carrier<T,U> value){return null;} }', 'Box<String> b, Carrier<Integer,shared.Child> c', 'b.get(c).instance()', False),
+    'parameterized-wildcard-guard': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<?> c', 'b.get(c).instance()', False),
+    'parameterized-fixed-slot-guard': ('class Carrier<A,B> {} class Box { <T> T get(Carrier<String,T> value){return null;} }', 'Box b, Carrier<Integer,shared.Child> c', 'b.get(c).instance()', False),
+    'parameterized-type-guard': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<String> c', 'b.<shared.Child>get(c).instance()', False),
+    'parameterized-bound-guard': ('class Carrier<U> {} class Box { <T extends String> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).instance()', False),
+    'parameterized-conflict-guard': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> a,Carrier<T> b){return null;} }', 'Box b, Carrier<shared.Child> c, Carrier<String> d', 'b.get(c,d).instance()', False),
+    'parameterized-private-guard': ('class Carrier<U> {} class Box { private <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier<shared.Child> c', 'b.get(c).instance()', False),
+    'parameterized-rank-guard': ('class Carrier<U> {} class Box { <T> T get(Carrier<T>[][] value){return null;} }', 'Box b, Carrier<shared.Child>[] c', 'b.get(c).instance()', False),
+    'parameterized-raw-guard': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} }', 'Box b, Carrier c', 'b.get(c).instance()', False),
+    'parameterized-overload-guard': ('class Carrier<U> {} class Box { <T> T get(Carrier<T> value){return null;} Object get(Object value){return null;} }', 'Box b, String c', 'b.get(c).instance()', False),
     'method-inferred': ('class Box { <T> T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
     'method-bounded': ('class Box { <T extends shared.Child> T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
     'method-null-bound': ('class Box { <T extends shared.Child> T get(T value){return value;} }', 'Box b', 'b.get(null).instance()', True),
@@ -192,6 +230,17 @@ def plan_results(state, root):
                 'independent source/javac/CLI, not MCP equivalence')
         state.execute("UPDATE coverage SET reason=reason || ? WHERE feature='unused-deps:semantic-resolution' "
                       "AND status='pending' AND instr(reason,'executed scalar method-variable checklist')=0", (note,))
+        parameterized_note = ('; executed invariant parameterized method checklist covers source/List '
+            'and nested formals, fixed/class-generic slots, source ancestor projections/reordering, scalar generic results and '
+            'witnesses, bounds/class slots/shadows, array/postfix/spread invocation phases, captures, '
+            'new/cast/declaration sites, access/invariant/type/raw/arity/overload guards and attached '
+            'provider imports with JSON/text/options/update/rebuild; target-dependent inference, '
+            'wildcard capture/nested array slots, intersection/common-bound inference, generic '
+            'override erasure, raw unchecked formals and classpath-order ownership remain pending; independent '
+            'source/javac/CLI, not MCP equivalence')
+        state.execute("UPDATE coverage SET reason=reason || ? WHERE feature='unused-deps:semantic-resolution' "
+                      "AND status='pending' AND instr(reason,'executed invariant parameterized method checklist')=0",
+                      (parameterized_note,))
 
 
 def exercise(binary, base):
@@ -255,7 +304,7 @@ def exercise(binary, base):
         for label, (declarations, parameter, body, used) in CASES.items():
             # Even a guard has the explicitly written Child type as a direct
             # dependency. Its downstream Base must never be inferred by name.
-            child = ['Child'] if 'Child' in parameter + declarations + (body if label.startswith('method-') else '') else []
+            child = ['Child'] if 'Child' in parameter + declarations + (body if label.startswith(('method-', 'parameterized-')) else '') else []
             want = [('base', 'direct' if used else 'unused', ['Base'] if used else []),
                     ('lib', 'direct' if child else 'unused', child)]
             for flags in ((), ('--strict',)):
@@ -349,6 +398,7 @@ def exercise(binary, base):
             ('attached::lib', 'direct', ['Child'])], classifications('consumer', ('--strict',), attached))
         # Method variables bind from consumer arguments, while provider bounds
         # bind in provider imports. Neither may borrow Box's class parameter.
+        write('box/Carrier.java', 'package api; public class Carrier<T> { public T value(){return null;} }', attached)
         method_cases = (
             ('inferred', '<U> U get(U value){return value;}', 'shared.Child c', 'b.get(c)'),
             ('shadow', '<T> T get(T value){return value;}', 'shared.Child c', 'b.get(c)'),
@@ -356,28 +406,49 @@ def exercise(binary, base):
             ('bounded', '<U extends Child> U get(){return null;}', 'shared.Child c', 'b.get()'),
             ('array', '<U> U get(U[] value){return null;}', 'shared.Child[] c', 'b.get(c)'),
             ('spread', '<U> U get(U... value){return null;}', 'shared.Child c', 'b.get(c,c)'),
+            ('parameterized', '<U> U get(Carrier<U> value){return null;}', 'api.Carrier<shared.Child> c', 'b.get(c)'),
+            ('parameterized-nested', '<U> U get(Carrier<Carrier<U>> value){return null;}', 'api.Carrier<api.Carrier<shared.Child>> c', 'b.get(c)'),
+            ('parameterized-list', '<U> U get(java.util.List<U> value){return null;}', 'java.util.List<shared.Child> c', 'b.get(c)'),
+            ('parameterized-array', '<U> U get(Carrier<U>[] value){return null;}', 'api.Carrier<shared.Child>[] c', 'b.get(c)'),
+            ('parameterized-spread', '<U> U get(Carrier<U>... value){return null;}', 'api.Carrier<shared.Child> c', 'b.get(c,c)'),
+            ('parameterized-scalar', '<U> U get(U value){return value;}', 'api.Carrier<shared.Child> c', 'b.get(c).value()'),
+            ('parameterized-witness', '<U> U get(){return null;}', 'api.Carrier<shared.Child> c', 'b.<api.Carrier<shared.Child>>get().value()'),
+            ('class-parameterized', 'T get(Carrier<T> value){return null;}', 'api.Carrier<shared.Child> c', 'b.get(c)'),
+            ('fixed-parameterized', 'Child get(Carrier<Child> value){return null;}', 'api.Carrier<shared.Child> c', 'b.get(c)'),
         )
         for label, declaration, parameter, expression in method_cases:
             write('box/Box.java', 'package api; import shared.Child; public class Box<T> { public ' + declaration + ' }', attached)
             write('box/build.gradle', 'dependencies { api(project(":lib")) }', attached)
-            write('consumer/Use.java', 'package fixture; class Use { int run(api.Wrap<String> b, ' + parameter + '){var value=' + expression + '; return value.instance();} }', attached)
+            receiver = 'api.Wrap<shared.Child>' if label == 'class-parameterized' else 'api.Wrap<String>'
+            write('consumer/Use.java', 'package fixture; class Use { int run(' + receiver + ' b, ' + parameter + '){var value=' + expression + '; return value.instance();} }', attached)
             with (runner.directory / ('attached.method-' + label + '.javac.log')).open('wb') as log:
                 result = subprocess.run([javac, '-proc:none', '-d', str(runner.directory / 'attached-method-classes'),
                     *map(str, sorted(attached.rglob('*.java')))], stdout=log, stderr=log, timeout=30)
             if result.returncode:
                 raise ToolError('attached method-variable fixture failed javac; see private log')
             runner.command('update')
+            method_want = [('attached::base', 'direct', ['Base']),
+                           ('attached::box', 'direct', ['Box', 'Carrier', 'Wrap'] if 'api.Carrier' in parameter else ['Box', 'Wrap']),
+                           ('attached::lib', 'direct', ['Child'])]
             for flags in ((), ('--strict',), ('--no-transitive',), ('--no-xml',), ('--no-resources',),
                           ('--no-transitive', '--no-xml', '--no-resources')):
-                record('attached:method-' + label + ':' + ','.join(flags), formal_want,
+                record('attached:method-' + label + ':' + ','.join(flags), method_want,
                        classifications('consumer', flags, attached))
             _, text = runner.command('unused-deps', 'consumer', '--verbose', '--strict', cwd=attached)
             record('attached:method-' + label + ':text', True, 'Base' in text)
             runner.command('rebuild', '--force', '--max-files', '0')
-            record('attached:method-' + label + ':rebuild', formal_want,
+            record('attached:method-' + label + ':rebuild', method_want,
                    classifications('consumer', ('--strict',), attached))
+        write('consumer/Use.java', 'package fixture; class Use { int run(api.Wrap<String> b, shared.Child c){var value=b.get(c,c); return value.instance();} }', attached)
         write('box/Box.java', 'package api; public class Box<T> { public <U> Object get(U... value){return null;} }', attached)
         runner.command('update')
         record('attached:method:changed-result', [('attached::base', 'unused', []), ('attached::box', 'direct', ['Box', 'Wrap']),
             ('attached::lib', 'direct', ['Child'])], classifications('consumer', ('--strict',), attached))
+        # Changed parameterized provider results cannot retain stale Base credits.
+        write('consumer/Use.java', 'package fixture; class Use { int run(api.Wrap<String> b, api.Carrier<shared.Child> c){return b.get(c).hashCode();} }', attached)
+        write('box/Box.java', 'package api; public class Box<T> { public <U> Object get(Carrier<U> value){return null;} }', attached)
+        runner.command('update')
+        record('attached:parameterized:changed-result', [('attached::base', 'unused', []),
+            ('attached::box', 'direct', ['Box', 'Carrier', 'Wrap']), ('attached::lib', 'direct', ['Child'])],
+            classifications('consumer', ('--strict',), attached))
         return expected, actual

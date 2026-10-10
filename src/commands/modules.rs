@@ -2254,6 +2254,59 @@ struct JavaDependencyInvocation<'a> {
     imports: &'a [(String, bool)],
 }
 
+/// Split only complete, bounded generic signatures; uncertainty is not erasure.
+fn java_generic_parts(ty: &str) -> Option<(&str, Vec<&str>)> {
+    let start = ty.find('<')?;
+    let body = ty.get(start + 1..ty.len().checked_sub(1)?)?;
+    if !ty.ends_with('>') || body.is_empty() {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut previous = 0;
+    let mut arguments = Vec::new();
+    for (position, character) in body.char_indices() {
+        match character {
+            '<' => {
+                depth += 1;
+                if depth >= 16 {
+                    return None;
+                }
+            }
+            '>' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => {
+                arguments.push(body[previous..position].trim());
+                previous = position + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(body[previous..].trim());
+    (depth == 0 && arguments.iter().all(|argument| !argument.is_empty()))
+        .then_some((ty[..start].trim(), arguments))
+}
+
+fn java_invocation_signature(
+    ty: &str,
+    depth: usize,
+) -> Option<crate::parsers::treesitter::java::DependencyResultType> {
+    use crate::parsers::treesitter::java::DependencyResultType;
+    if depth >= 16 || ty.contains('?') {
+        return None;
+    }
+    let (name, arguments) = if ty.contains('<') {
+        java_generic_parts(ty)?
+    } else {
+        (ty, Vec::new())
+    };
+    Some(DependencyResultType::Named(
+        name.to_owned(),
+        arguments
+            .into_iter()
+            .map(|argument| java_invocation_signature(argument, depth + 1).map(Some))
+            .collect::<Option<_>>()?,
+    ))
+}
+
 impl JavaDependencyValue {
     fn nominal(owner: JavaDependencyType, instance: bool) -> Self {
         Self {
@@ -2277,6 +2330,18 @@ impl JavaDependencyValue {
                 .collect::<Vec<_>>()
                 .join(",")
         )
+    }
+
+    fn invocation_type(&self) -> Option<String> {
+        if self.arguments.is_empty() {
+            return Some(self.owner.identity.clone());
+        }
+        let arguments = self
+            .arguments
+            .iter()
+            .map(|argument| argument.as_ref()?.invocation_type())
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("{}<{}>", self.owner.identity, arguments.join(",")))
     }
 }
 
@@ -2875,16 +2940,59 @@ impl JavaDependencyLookup<'_> {
         Ok(result)
     }
 
-    /// Bind nominal invocation types, retaining uncertainty for generic formals.
+    /// Bind explicit invocation types without inventing wildcard captures.
     fn invocation_identity(
         &self,
         ty: &str,
         position: usize,
         imports: &[(String, bool)],
     ) -> Result<Option<String>> {
+        self.invocation_identity_depth(ty, position, imports, 0)
+    }
+
+    fn invocation_identity_depth(
+        &self,
+        ty: &str,
+        position: usize,
+        imports: &[(String, bool)],
+        depth: usize,
+    ) -> Result<Option<String>> {
+        if depth >= 16 {
+            return Ok(None);
+        }
         let ty = ty.replace("::", ".");
         let base = ty.trim_end_matches("[]");
         let suffix = &ty[base.len()..];
+        if base.contains('<') {
+            let Some((name, arguments)) = java_generic_parts(base) else {
+                return Ok(None);
+            };
+            let owner = match self.value_type(name, position, imports)? {
+                Some(owner) => Some(owner),
+                None => self.platform_result_owner(name, position, imports)?,
+            };
+            let Some(owner) = owner else { return Ok(None) };
+            if owner.declaration.type_parameters.len() != arguments.len() {
+                return Ok(None);
+            }
+            let mut bound = Vec::new();
+            for argument in arguments {
+                let Some(argument) =
+                    self.invocation_identity_depth(argument, position, imports, depth + 1)?
+                else {
+                    return Ok(None);
+                };
+                if Self::boxed_type(&argument).is_some() || argument == "null" {
+                    return Ok(None);
+                }
+                bound.push(argument);
+            }
+            return Ok(Some(format!(
+                "{}<{}>{suffix}",
+                owner.identity,
+                bound.join(",")
+            )));
+        }
         if base.contains(['<', '?']) {
             return Ok(None);
         }
@@ -2944,6 +3052,28 @@ impl JavaDependencyLookup<'_> {
         signature: &crate::parsers::treesitter::java::DependencyMemberType,
         value: Option<&JavaDependencyValue>,
     ) -> Result<Option<Vec<String>>> {
+        fn captured(
+            ty: &crate::parsers::treesitter::java::DependencyResultType,
+            value: &JavaDependencyValue,
+        ) -> bool {
+            use crate::parsers::treesitter::java::DependencyResultType;
+            match ty {
+                DependencyResultType::Parameter { owner, name } => {
+                    owner != &value.owner.identity
+                        || value
+                            .owner
+                            .declaration
+                            .type_parameters
+                            .iter()
+                            .position(|parameter| parameter == name)
+                            .and_then(|index| value.arguments.get(index))
+                            .is_some_and(Option::is_none)
+                }
+                DependencyResultType::Named(_, arguments) => arguments
+                    .iter()
+                    .any(|argument| argument.as_ref().is_none_or(|ty| captured(ty, value))),
+            }
+        }
         let Some(parameters) = &signature.parameters else {
             return Ok(None);
         };
@@ -2958,30 +3088,11 @@ impl JavaDependencyLookup<'_> {
                 let Some(value) = value else { return Ok(None) };
                 // A wildcard slot represents a capture, not its upper bound.
                 // Do not manufacture a writable parameter from an unknown slot.
-                if let crate::parsers::treesitter::java::DependencyResultType::Parameter {
-                    owner,
-                    name,
-                } = variable
-                {
-                    if owner != &value.owner.identity {
-                        return Ok(None);
-                    }
-                    let slot = value
-                        .owner
-                        .declaration
-                        .type_parameters
-                        .iter()
-                        .position(|p| p == name);
-                    if slot
-                        .and_then(|index| value.arguments.get(index))
-                        .is_some_and(Option::is_none)
-                    {
-                        return Ok(None);
-                    }
+                if captured(variable, value) {
+                    return Ok(None);
                 }
-                let Some(formal) = binding.result_value(
+                let Some(formal) = binding.signature_identity(
                     variable,
-                    usize::MAX,
                     &owner.declaration.imports,
                     Some(value),
                     0,
@@ -2989,11 +3100,7 @@ impl JavaDependencyLookup<'_> {
                 else {
                     return Ok(None);
                 };
-                result.push(format!(
-                    "{}{}",
-                    formal.owner.identity,
-                    "[]".repeat(*dimensions)
-                ));
+                result.push(format!("{}{}", formal, "[]".repeat(*dimensions)));
                 continue;
             }
             let Some(ty) = parameter else { return Ok(None) };
@@ -3088,10 +3195,134 @@ impl JavaDependencyLookup<'_> {
         if formal == "java.lang.Object" {
             return Ok(true);
         }
+        if formal.contains('<') {
+            let Some((name, _)) = java_generic_parts(formal) else {
+                return Ok(false);
+            };
+            let Some(signature) = java_invocation_signature(argument, 0) else {
+                return Ok(false);
+            };
+            let Some(value) = self.result_value(&signature, usize::MAX, &[], None, 0)? else {
+                return Ok(false);
+            };
+            let projected = self.declaring_value(&value, name, &mut HashSet::new(), 0)?;
+            // Source generics are invariant. An erased/raw receiver cannot
+            // establish a writable slot or a downstream declaring owner.
+            return Ok(projected
+                .and_then(|value| value.invocation_type())
+                .as_deref()
+                == Some(formal));
+        }
+        if let Some((name, _)) = java_generic_parts(argument) {
+            return self.invocation_conversion(name, formal, loose);
+        }
         self.subclass(argument, formal, &mut HashSet::new())
     }
 
-    /// Solve scalar method variables without borrowing enclosing class slots.
+    fn signature_identity(
+        &self,
+        signature: &crate::parsers::treesitter::java::DependencyResultType,
+        imports: &[(String, bool)],
+        substitution: Option<&JavaDependencyValue>,
+        depth: usize,
+    ) -> Result<Option<String>> {
+        use crate::parsers::treesitter::java::DependencyResultType;
+        if depth >= 16 {
+            return Ok(None);
+        }
+        match signature {
+            DependencyResultType::Parameter { .. } => Ok(self
+                .result_value(signature, usize::MAX, imports, substitution, depth)?
+                .and_then(|value| value.invocation_type())),
+            DependencyResultType::Named(name, arguments) => {
+                let Some(name) = self.invocation_identity(name, usize::MAX, imports)? else {
+                    return Ok(None);
+                };
+                if arguments.is_empty() {
+                    return Ok(Some(name));
+                }
+                let mut bound = Vec::new();
+                for argument in arguments {
+                    let Some(argument) = argument else {
+                        return Ok(None);
+                    };
+                    let Some(argument) =
+                        self.signature_identity(argument, imports, substitution, depth + 1)?
+                    else {
+                        return Ok(None);
+                    };
+                    bound.push(argument);
+                }
+                self.invocation_identity(&format!("{name}<{}>", bound.join(",")), usize::MAX, &[])
+            }
+        }
+    }
+
+    /// Infer invariant slots at their declaring sites, projecting source parents.
+    fn infer_method_parameter(
+        &self,
+        formal: &crate::parsers::treesitter::java::DependencyResultType,
+        argument: &str,
+        bindings: &mut std::collections::HashMap<String, String>,
+        imports: &[(String, bool)],
+        depth: usize,
+    ) -> Result<(bool, bool)> {
+        use crate::parsers::treesitter::java::DependencyResultType;
+        if depth >= 16 {
+            return Ok((false, true));
+        }
+        match formal {
+            DependencyResultType::Parameter { owner, name } if owner == "@method" => {
+                let mut ty = Self::boxed_type(argument).unwrap_or(argument).to_owned();
+                if let Some(prior) = bindings.get(name) {
+                    if self.invocation_conversion(&ty, prior, false)? {
+                        return Ok((true, false));
+                    }
+                    if !self.invocation_conversion(prior, &ty, false)? {
+                        ty = "java.lang.Object".to_owned();
+                    }
+                }
+                bindings.insert(name.clone(), ty);
+                Ok((true, false))
+            }
+            DependencyResultType::Named(name, parameters) if !parameters.is_empty() => {
+                let Some(name) = self.invocation_identity(name, usize::MAX, imports)? else {
+                    return Ok((false, true));
+                };
+                let Some(signature) = java_invocation_signature(argument, 0) else {
+                    return Ok((false, true));
+                };
+                let Some(value) = self.result_value(&signature, usize::MAX, &[], None, 0)? else {
+                    return Ok((false, true));
+                };
+                let Some(value) = self.declaring_value(&value, &name, &mut HashSet::new(), 0)?
+                else {
+                    return Ok((false, false));
+                };
+                if value.arguments.len() != parameters.len() {
+                    return Ok((false, true));
+                }
+                for (formal, actual) in parameters.iter().zip(&value.arguments) {
+                    let (Some(formal), Some(actual)) = (formal, actual) else {
+                        return Ok((false, true));
+                    };
+                    let Some(actual) = actual.invocation_type() else {
+                        return Ok((false, true));
+                    };
+                    let result =
+                        self.infer_method_parameter(formal, &actual, bindings, imports, depth + 1)?;
+                    if !result.0 {
+                        return Ok(result);
+                    }
+                }
+                Ok((true, false))
+            }
+            // Compatibility of fixed/class slots is checked after substitution.
+            _ => Ok((true, false)),
+        }
+    }
+
+    /// Solve method variables without borrowing enclosing class slots.
     /// Unknown constraints remain distinct from a proved incompatible call.
     fn bind_method_variables(
         &self,
@@ -3116,6 +3347,12 @@ impl JavaDependencyLookup<'_> {
         let Some(method) = &signature.method_signature else {
             return Ok((None, true));
         };
+        let declaring = self.declaring_value(value, &owner.identity, &mut HashSet::new(), 0)?;
+        let lookup = JavaDependencyLookup {
+            package: &owner.declaration.package,
+            contexts: &signature.contexts,
+            ..*self
+        };
         let mut bindings = std::collections::HashMap::<String, String>::new();
         if let Some(types) = type_arguments {
             if types.len() != method.variables.len() {
@@ -3138,7 +3375,7 @@ impl JavaDependencyLookup<'_> {
                 } else {
                     index
                 };
-                let Some(Some((name, dimensions))) = method.parameters.get(formal_index) else {
+                let Some(Some((formal, dimensions))) = method.parameters.get(formal_index) else {
                     continue;
                 };
                 let mut dimensions = *dimensions;
@@ -3157,23 +3394,19 @@ impl JavaDependencyLookup<'_> {
                     };
                     ty = element.to_owned();
                 }
-                if let Some(boxed) = Self::boxed_type(&ty) {
-                    if dimensions > 0 {
-                        return Ok((None, false));
-                    }
-                    ty = boxed.to_owned();
+                if dimensions > 0 && Self::boxed_type(&ty).is_some() {
+                    return Ok((None, false));
                 }
-                if let Some(prior) = bindings.get(name) {
-                    if self.invocation_conversion(&ty, prior, false)? {
-                        continue;
-                    }
-                    if !self.invocation_conversion(prior, &ty, false)? {
-                        // A nominal Object upper bound cannot invent a member
-                        // of either unrelated argument's declaring owner.
-                        ty = "java.lang.Object".to_owned();
-                    }
+                let (compatible, unknown) = lookup.infer_method_parameter(
+                    formal,
+                    &ty,
+                    &mut bindings,
+                    &owner.declaration.imports,
+                    0,
+                )?;
+                if !compatible {
+                    return Ok((None, unknown));
                 }
-                bindings.insert(name.clone(), ty);
             }
         }
         fn substitute(
@@ -3183,7 +3416,7 @@ impl JavaDependencyLookup<'_> {
             match ty {
                 DependencyResultType::Parameter { owner, name } if owner == "@method" => bindings
                     .get(name)
-                    .map(|name| DependencyResultType::Named(name.clone(), Vec::new())),
+                    .and_then(|name| java_invocation_signature(name, 0)),
                 DependencyResultType::Named(name, arguments) => Some(DependencyResultType::Named(
                     name.clone(),
                     arguments
@@ -3194,20 +3427,13 @@ impl JavaDependencyLookup<'_> {
                 _ => Some(ty.clone()),
             }
         }
-        let declaring = self.declaring_value(value, &owner.identity, &mut HashSet::new(), 0)?;
-        let lookup = JavaDependencyLookup {
-            package: &owner.declaration.package,
-            contexts: &signature.contexts,
-            ..*self
-        };
         for (name, bound) in &method.variables {
             let bound = if let Some(bound) = bound {
                 let Some(bound) = substitute(bound, &bindings) else {
                     return Ok((None, true));
                 };
-                let Some(bound) = lookup.result_value(
+                let Some(bound) = lookup.signature_identity(
                     &bound,
-                    usize::MAX,
                     &owner.declaration.imports,
                     declaring.as_ref(),
                     0,
@@ -3215,7 +3441,7 @@ impl JavaDependencyLookup<'_> {
                 else {
                     return Ok((None, true));
                 };
-                bound.owner.identity
+                bound
             } else {
                 "java.lang.Object".to_owned()
             };
@@ -3232,8 +3458,24 @@ impl JavaDependencyLookup<'_> {
             return Ok((None, true));
         };
         for (index, parameter) in method.parameters.iter().enumerate() {
-            if let Some((name, dimensions)) = parameter {
-                parameters[index] = Some(format!("{}{}", bindings[name], "[]".repeat(*dimensions)));
+            if let Some((formal, dimensions)) = parameter {
+                let Some(formal) = substitute(formal, &bindings) else {
+                    return Ok((None, true));
+                };
+                let Some(formal) = lookup.signature_identity(
+                    &formal,
+                    &owner.declaration.imports,
+                    declaring.as_ref(),
+                    0,
+                )?
+                else {
+                    return Ok((None, true));
+                };
+                parameters[index] = Some(format!("{formal}{}", "[]".repeat(*dimensions)));
+                // Method substitution has already bound any enclosing slots;
+                // do not re-read the parser's intentionally unresolved method
+                // variables as erased/class metadata during overload matching.
+                bound.parameter_variables[index] = None;
             }
         }
         bound.result_type = method

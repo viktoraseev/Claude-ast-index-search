@@ -692,7 +692,7 @@ pub(crate) struct DependencyMemberType {
 #[derive(Clone)]
 pub(crate) struct DependencyMethodSignature {
     pub variables: Vec<(String, Option<DependencyResultType>)>,
-    pub parameters: Vec<Option<(String, usize)>>,
+    pub parameters: Vec<Option<(DependencyResultType, usize)>>,
     pub result: Option<DependencyResultType>,
 }
 
@@ -781,11 +781,10 @@ fn dependency_method_signature(
                     .map_or(0, |node| node_text(content, &node).matches('[').count());
                 ty = ty.child_by_field_name("element")?;
             }
-            let name = node_text(content, &ty);
-            names
-                .iter()
-                .any(|variable| variable == name)
-                .then(|| (name.to_owned(), dimensions))
+            let signature = dependency_method_result_type(ty, content, package, &names, 0)?;
+            (ty.kind() == "generic_type"
+                || matches!(&signature, DependencyResultType::Parameter { owner, .. } if owner == "@method"))
+                .then_some((signature, dimensions))
         })
         .collect();
     let result = member
@@ -888,7 +887,8 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
                     ty = ty.child_by_field_name("element")?;
                 }
                 let variable = dependency_result_type(ty, content, package, 0)?;
-                matches!(variable, DependencyResultType::Parameter { .. })
+                (matches!(&variable, DependencyResultType::Parameter { .. })
+                    || matches!(&variable, DependencyResultType::Named(_, arguments) if !arguments.is_empty()))
                     .then_some((variable, dimensions))
             }));
             result.push(parameter_type(p).and_then(|ty| {
@@ -3330,6 +3330,7 @@ class Peer { Guarded field; int value=SECRET+secret(); }
             <T extends shared.Child> Box<T> get(T[] values) { return null; }
             <U extends T> U bound(U value) { return value; }
             <U extends shared.Child & Runnable> U intersection(U value) { return value; }
+            <U> U projected(Box<Box<U>> values[]) { return null; }
         }"#;
         let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
             .unwrap()
@@ -3338,7 +3339,11 @@ class Peer { Guarded field; int value=SECRET+secret(); }
         // Existing class metadata retains its safety boundary.
         assert!(signature.parameter_variables[0].is_none());
         let method = signature.method_signature.as_ref().unwrap();
-        assert_eq!(method.parameters, vec![Some(("T".into(), 1))]);
+        assert_eq!(method.parameters.len(), 1);
+        assert!(
+            matches!(&method.parameters[0], Some((DependencyResultType::Parameter { owner, name }, 1))
+            if owner == "@method" && name == "T")
+        );
         assert!(
             matches!(&method.variables[0].1, Some(DependencyResultType::Named(path, _)) if path == "shared.Child")
         );
@@ -3358,6 +3363,17 @@ class Peer { Guarded field; int value=SECRET+secret(); }
         let intersection = &declaration.value_types[&("intersection".into(), true)][0];
         assert!(intersection.method_generic);
         assert!(intersection.method_signature.is_none());
+        let projected = declaration.value_types[&("projected".into(), true)][0]
+            .method_signature
+            .as_ref()
+            .unwrap();
+        assert_eq!(projected.parameters.len(), 1);
+        assert!(
+            matches!(&projected.parameters[0], Some((DependencyResultType::Named(name, arguments), 1))
+            if name == "Box" && matches!(&arguments[0], Some(DependencyResultType::Named(inner, slots))
+                if inner == "Box" && matches!(&slots[0], Some(DependencyResultType::Parameter { owner, name })
+                    if owner == "@method" && name == "U")))
+        );
     }
 
     #[test]

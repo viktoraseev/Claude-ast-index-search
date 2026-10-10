@@ -115,7 +115,7 @@ CONTRACTS = {
     'java_inherited_import_contracts': ('src/commands/modules.rs',
         'unused-deps Java inherited/member/type/value imports and nominal chains in colliding roots: declaring provenance, lexical/value/record/local-subclass access and hiding guards, options/refresh'),
     'java_dependency_result_contracts': ('src/commands/modules.rs',
-        'unused-deps Java nominal field/return chains across attached modules: declaring identity, private/protected/this/super access, arity/ambiguous/array/static-context guards, class-variable formals through inheritance/arrays/varargs/boxing, scalar method-variable inference and explicit witnesses with separate bounds/shadowing/overload guards and option/refresh controls'),
+        'unused-deps Java nominal field/return chains across attached modules: declaring identity, private/protected/this/super access, arity/ambiguous/array/static-context guards, class-variable formals through inheritance/arrays/varargs/boxing, scalar and invariant parameterized method-variable inference and explicit witnesses with separate bounds/shadowing/overload guards and option/refresh controls'),
     'android_dependency_contracts': ('src/commands/android.rs and src/commands/modules.rs',
         'Java resource ownership: same resource names across attached modules, dependency R modes and literal namespace metadata; declaring root and unused-deps positives/negatives; XML-only syntax excluded'),
 }
@@ -261,7 +261,7 @@ RETAINED = (
     ('unused-deps:java-module-binding', 'disposable-java-module-declaration-binding', 151, '2f652ff6f93dc209f858d5994eb79063c391c04cd2fb6ff0e90196b3d941e9c0', '013a9a726cb3e0f837d870fbf532e70af59aa021cf0aac70e6d9fd2e5be402e4', 'java_module_binding_contracts'),
     # Retain the added variable-arity phases, guards, option pages and attached
     # refresh assertions alongside the original source-result population.
-    ('unused-deps:java-source-results', 'disposable-java-source-result-ownership', 611, '3a70bace9f7755f3d89ed0b93e8491c1335a17793039e1a15f9862d69104ec1b', 'a2ccdc78b074a86928aa9f4d56ef849ce13f59bba9ec7b3b79c96b74221b5c59', 'java_dependency_result_contracts'),
+    ('unused-deps:java-source-results', 'disposable-java-source-result-ownership', 798, '919f9930b2c12afb5d0781348244805abe9bcddda21c64d430032dbd17ee21f9', '6d1342ca7667bb47e8b66bbfdb5919225d036b4336869394473d357b6227c499', 'java_dependency_result_contracts'),
 )
 
 REVIEWED_SURFACE_SHA256 = 'f5a010676e71d715489eb595292d83e21e93ba4d9e8f2015279f9c55fb34a3df'

@@ -65,7 +65,16 @@ class DependencyResultTests(unittest.TestCase):
                         'attached:formals:rebuild', 'method-inferred:True',
                         'method-shadow:True', 'method-explicit-bound-guard:True',
                         'method-overload-guard:True', 'method-fixed-spread:True',
-                        'attached:method-explicit:rebuild', 'attached:method:changed-result'):
+                        'attached:method-explicit:rebuild', 'attached:method:changed-result',
+                        'parameterized-formal:True', 'parameterized-nested:True',
+                        'parameterized-inherited:True', 'parameterized-scalar-result:True',
+                        'parameterized-witness:True', 'parameterized-conflict-guard:True',
+                        'parameterized-class-slot-guard:True', 'parameterized-wildcard-guard:True',
+                        'formal-generic-fixed:True', 'formal-generic-class:True',
+                        'formal-generic-class-capture-guard:True',
+                        'attached:method-class-parameterized:rebuild',
+                        'attached:method-parameterized-nested:rebuild',
+                        'attached:parameterized:changed-result'):
                 with self.subTest(removed_assertion=key):
                     smaller = dict(samples)
                     del smaller[key]
@@ -81,6 +90,9 @@ class DependencyResultTests(unittest.TestCase):
             smaller['method-inferred:True'][0][2] = []
             with self.assertRaises(scope_acceptance.AcceptancePending):
                 scope_acceptance.validate_population(smaller, criterion)
+        parent = self.state.execute("SELECT status,reason FROM coverage WHERE feature='unused-deps:semantic-resolution'").fetchone()
+        self.assertEqual(parent['status'], 'pending')
+        self.assertIn('wildcard capture/nested array slots', parent['reason'])
         self.oracle.call.assert_not_called()
         self.assertFalse(self.fixture.database.exists())
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ['Foreign.kt', 'Sentinel.java'])
