@@ -55,6 +55,8 @@ pub(super) enum InvocationArgument {
 
 type InvocationArguments = Vec<Option<InvocationArgument>>;
 type InvocationSignature = (Vec<Option<String>>, bool);
+/// Owner name, declaration line and byte site, followed by call line and name.
+type CallKey = (String, i64, usize, i64, String);
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct InvocationOwner {
@@ -89,9 +91,9 @@ pub(super) struct JavaSource {
     parent_receivers: HashMap<usize, Vec<(JavaReceiver, ReceiverTypeSite)>>,
     /// Callable identity, reference line and name; None means colliding or
     /// unsupported invocations. Never confidently choose the first on a line.
-    invocations: HashMap<(String, i64, i64, String), Option<ParameterCall>>,
-    direct_calls: HashMap<(String, i64, i64, String), Option<usize>>,
-    bare_calls: HashMap<(String, i64, i64, String), Option<usize>>,
+    invocations: HashMap<CallKey, Option<ParameterCall>>,
+    direct_calls: HashMap<CallKey, Option<usize>>,
+    bare_calls: HashMap<CallKey, Option<usize>>,
     parameters: HashMap<(String, i64), Option<(usize, bool)>>,
     returns: HashMap<(String, i64, usize), Option<String>>,
     return_receivers: HashMap<(String, i64, usize), JavaReceiver>,
@@ -101,17 +103,17 @@ pub(super) struct JavaSource {
     type_parameters: HashMap<(String, i64, usize), Vec<String>>,
     return_parameters: HashMap<(String, i64, usize), String>,
     type_bounds: HashMap<(String, i64, usize), HashMap<String, String>>,
-    expressions: HashMap<(String, i64, i64, String), Option<ExpressionCall>>,
-    expression_variants: HashMap<(String, i64, i64, String), Vec<ExpressionCall>>,
-    constructors: HashMap<(String, i64, i64, String), Option<ConstructorCall>>,
+    expressions: HashMap<CallKey, Option<ExpressionCall>>,
+    expression_variants: HashMap<CallKey, Vec<ExpressionCall>>,
+    constructors: HashMap<CallKey, Option<ConstructorCall>>,
     constructor_types: HashMap<(String, i64), Vec<Vec<String>>>,
-    callback_parameters: HashMap<(String, i64), Vec<Option<JavaReceiver>>>,
-    reference_parameters: HashMap<(String, i64), Vec<Option<JavaReceiver>>>,
-    static_methods: HashSet<(String, i64)>,
-    constructor_declarations: HashSet<(String, i64)>,
+    callback_parameters: HashMap<(String, i64, usize), Vec<Option<JavaReceiver>>>,
+    reference_parameters: HashMap<(String, i64, usize), Vec<Option<JavaReceiver>>>,
+    static_methods: HashSet<(String, i64, usize)>,
+    constructor_declarations: HashSet<(String, i64, usize)>,
     canonical_types: HashMap<String, Vec<String>>,
-    creation_types: HashMap<(String, i64, i64, String), Vec<Option<String>>>,
-    invocation_types: HashMap<(String, i64, i64, String), Option<InvocationArguments>>,
+    creation_types: HashMap<CallKey, Vec<Option<String>>>,
+    invocation_types: HashMap<CallKey, Option<InvocationArguments>>,
     invocation_parameters: HashMap<(String, i64), Vec<Option<String>>>,
     /// Declaration order distinguishes overloads with the same name and line.
     invocation_signatures: HashMap<(String, i64), Vec<InvocationSignature>>,
@@ -1473,6 +1475,49 @@ fn variable_invocation_type(
         ancestor = node.parent();
     }
     None
+}
+
+/// Infer argument metadata once for ordinary and constructor invocations.
+fn invocation_argument_types(
+    node: Node<'_>,
+    owner: Node<'_>,
+    source: &str,
+    scopes: &VariableScopes,
+) -> Option<InvocationArguments> {
+    node.child_by_field_name("arguments").map(|arguments| {
+        let mut cursor = arguments.walk();
+        arguments
+            .named_children(&mut cursor)
+            .filter(|argument| !argument.is_extra())
+            .map(|argument| {
+                if argument.kind() == "lambda_expression" {
+                    let parameters = argument.child_by_field_name("parameters")?;
+                    let arity = if parameters.kind() == "identifier" {
+                        1
+                    } else {
+                        let mut cursor = parameters.walk();
+                        parameters
+                            .named_children(&mut cursor)
+                            .filter(|child| !child.is_extra())
+                            .count()
+                    };
+                    return Some(InvocationArgument::Lambda(arity));
+                }
+                invocation_argument_type(argument, owner, source, scopes, 0)
+                    .map(InvocationArgument::Type)
+                    .or_else(|| {
+                        let receiver = expression_receiver(argument, owner, source, scopes, 0);
+                        if matches!(receiver, JavaReceiver::Field { .. }) {
+                            Some(InvocationArgument::Field(receiver))
+                        } else if !matches!(receiver, JavaReceiver::Unknown) {
+                            Some(InvocationArgument::Value(receiver))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect()
+    })
 }
 
 /// Preserve argument types independently of receiver inference.
@@ -3725,6 +3770,7 @@ impl JavaSource {
                     result.constructor_declarations.insert((
                         text(name, source).to_owned(),
                         name.start_position().row as i64 + 1,
+                        name.start_byte(),
                     ));
                 }
             }
@@ -3956,7 +4002,9 @@ impl JavaSource {
                             is_static
                         })
                     {
-                        result.static_methods.insert(key.clone());
+                        result
+                            .static_methods
+                            .insert((key.0.clone(), key.1, name.start_byte()));
                     }
                     let mut cursor = parameters.walk();
                     let invocation_parameters: Vec<Option<String>> = parameters
@@ -3974,7 +4022,7 @@ impl JavaSource {
                         .insert(key.clone(), invocation_parameters);
                     let mut cursor = parameters.walk();
                     result.reference_parameters.insert(
-                        key.clone(),
+                        (key.0.clone(), key.1, name.start_byte()),
                         parameters
                             .named_children(&mut cursor)
                             .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
@@ -3988,7 +4036,7 @@ impl JavaSource {
                     );
                     let mut cursor = parameters.walk();
                     result.callback_parameters.insert(
-                        key.clone(),
+                        (key.0.clone(), key.1, name.start_byte()),
                         parameters
                             .named_children(&mut cursor)
                             .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
@@ -4055,6 +4103,7 @@ impl JavaSource {
                         let key = (
                             text(owner_name, source).to_owned(),
                             owner_name.start_position().row as i64 + 1,
+                            owner_name.start_byte(),
                             constructor.start_position().row as i64 + 1,
                             text(constructor, source).to_owned(),
                         );
@@ -4080,6 +4129,7 @@ impl JavaSource {
                             let key = (
                                 text(owner, source).to_owned(),
                                 line,
+                                owner.start_byte(),
                                 line,
                                 text(ty, source).to_owned(),
                             );
@@ -4132,6 +4182,7 @@ impl JavaSource {
                         let key = (
                             text(owner_name, source).to_owned(),
                             owner_name.start_position().row as i64 + 1,
+                            owner_name.start_byte(),
                             identifier.start_position().row as i64 + 1,
                             declared.rsplit("::").next().unwrap_or_default().to_owned(),
                         );
@@ -4145,6 +4196,17 @@ impl JavaSource {
                                 creation_argument_types(node, owner, source, &scopes),
                             );
                         }
+                        let argument_types =
+                            invocation_argument_types(node, owner, source, &scopes);
+                        result
+                            .invocation_types
+                            .entry(key.clone())
+                            .and_modify(|previous| {
+                                if *previous != argument_types {
+                                    *previous = None;
+                                }
+                            })
+                            .or_insert(argument_types);
                         result
                             .constructors
                             .entry(key)
@@ -4177,6 +4239,7 @@ impl JavaSource {
             let key = (
                 text(owner_name, source).to_owned(),
                 owner_name.start_position().row as i64 + 1,
+                owner_name.start_byte(),
                 name.start_position().row as i64 + 1,
                 text(name, source).to_owned(),
             );
@@ -4221,41 +4284,7 @@ impl JavaSource {
             if reference {
                 return WalkControl::Continue;
             }
-            let argument_types = node.child_by_field_name("arguments").map(|arguments| {
-                let mut cursor = arguments.walk();
-                arguments
-                    .named_children(&mut cursor)
-                    .filter(|argument| !argument.is_extra())
-                    .map(|argument| {
-                        if argument.kind() == "lambda_expression" {
-                            let parameters = argument.child_by_field_name("parameters")?;
-                            let arity = if parameters.kind() == "identifier" {
-                                1
-                            } else {
-                                let mut cursor = parameters.walk();
-                                parameters
-                                    .named_children(&mut cursor)
-                                    .filter(|child| !child.is_extra())
-                                    .count()
-                            };
-                            return Some(InvocationArgument::Lambda(arity));
-                        }
-                        invocation_argument_type(argument, owner, source, &scopes, 0)
-                            .map(InvocationArgument::Type)
-                            .or_else(|| {
-                                let receiver =
-                                    expression_receiver(argument, owner, source, &scopes, 0);
-                                if matches!(receiver, JavaReceiver::Field { .. }) {
-                                    Some(InvocationArgument::Field(receiver))
-                                } else if !matches!(receiver, JavaReceiver::Unknown) {
-                                    Some(InvocationArgument::Value(receiver))
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .collect()
-            });
+            let argument_types = invocation_argument_types(node, owner, source, &scopes);
             result
                 .invocation_types
                 .entry(key.clone())
@@ -4437,8 +4466,8 @@ impl JavaSource {
         Ok(result)
     }
 
-    pub fn is_static_method(&self, name: &str, line: i64) -> bool {
-        self.static_methods.contains(&(name.to_owned(), line))
+    pub fn is_static_method(&self, name: &str, line: i64, site: Option<usize>) -> bool {
+        site.is_some_and(|site| self.static_methods.contains(&(name.to_owned(), line, site)))
     }
 
     pub fn invocation_owners(&self, line: i64, name: &str) -> Option<&[InvocationOwner]> {
@@ -4447,9 +4476,14 @@ impl JavaSource {
             .map(Vec::as_slice)
     }
 
-    pub fn callback_parameter(&self, name: &str, line: i64, index: usize) -> Option<&JavaReceiver> {
-        self.callback_parameters
-            .get(&(name.to_owned(), line))?
+    pub fn callback_parameter(
+        &self,
+        name: &str,
+        line: i64,
+        site: Option<usize>,
+        index: usize,
+    ) -> Option<&JavaReceiver> {
+        declaration_metadata(&self.callback_parameters, name, line, site)?
             .get(index)?
             .as_ref()
     }
@@ -4458,10 +4492,10 @@ impl JavaSource {
         &self,
         name: &str,
         line: i64,
+        site: Option<usize>,
         index: usize,
     ) -> Option<&JavaReceiver> {
-        self.reference_parameters
-            .get(&(name.to_owned(), line))?
+        declaration_metadata(&self.reference_parameters, name, line, site)?
             .get(index)?
             .as_ref()
     }
@@ -4478,21 +4512,50 @@ impl JavaSource {
         self.parent_types_at(Some(site))
     }
 
+    /// Bind call metadata to an exact owner. A name/line fallback is valid
+    /// only for a unique source declaration, never for colliding overloads.
+    fn call_key(
+        &self,
+        owner: &str,
+        owner_line: i64,
+        site: Option<usize>,
+        line: i64,
+        name: &str,
+    ) -> Option<CallKey> {
+        let site = match site {
+            Some(site) => site,
+            None => {
+                let mut sites = self
+                    .symbol_sites
+                    .iter()
+                    .filter(|((candidate, row, _), _)| candidate == owner && *row == owner_line)
+                    .flat_map(|(_, sites)| sites.iter().copied());
+                let first = sites.next()?;
+                if sites.any(|site| site != first) {
+                    return None;
+                }
+                first
+            }
+        };
+        Some((owner.to_owned(), owner_line, site, line, name.to_owned()))
+    }
+
     pub fn constructor_call(
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> Option<&Option<ConstructorCall>> {
         self.constructors
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)
     }
 
     pub fn constructor_aliases(&self) -> impl Iterator<Item = (&str, i64)> {
         self.constructors
             .keys()
-            .map(|(_, _, line, name)| (name.as_str(), *line))
+            .map(|(_, _, _, line, name)| (name.as_str(), *line))
     }
 
     pub fn accepts_creation(
@@ -4501,6 +4564,7 @@ impl JavaSource {
         call_file: &Self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         call_line: i64,
     ) -> bool {
         let (name, line, ordinal) = declaration;
@@ -4513,12 +4577,10 @@ impl JavaSource {
         if !canonical_collision {
             return true;
         }
-        let Some(arguments) = call_file.creation_types.get(&(
-            owner.to_owned(),
-            owner_line,
-            call_line,
-            name.to_owned(),
-        )) else {
+        let Some(arguments) = call_file
+            .call_key(owner, owner_line, owner_site, call_line, name)
+            .and_then(|key| call_file.creation_types.get(&key))
+        else {
             return false;
         };
         arguments
@@ -4552,20 +4614,23 @@ impl JavaSource {
             .map(Vec::as_slice)
     }
 
-    pub fn is_constructor(&self, name: &str, line: i64) -> bool {
-        self.constructor_declarations
-            .contains(&(name.to_owned(), line))
+    pub fn is_constructor(&self, name: &str, line: i64, site: Option<usize>) -> bool {
+        site.is_some_and(|site| {
+            self.constructor_declarations
+                .contains(&(name.to_owned(), line, site))
+        })
     }
 
     pub fn creation_arguments(
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> Option<&[Option<String>]> {
         self.creation_types
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)
             .map(Vec::as_slice)
     }
 
@@ -4573,22 +4638,27 @@ impl JavaSource {
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> Option<&Option<ExpressionCall>> {
         self.expressions
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)
     }
 
     pub fn expression_variants(
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> &[ExpressionCall] {
+        let Some(key) = self.call_key(owner, owner_line, owner_site, line, name) else {
+            return &[];
+        };
         self.expression_variants
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .get(&key)
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -4785,16 +4855,23 @@ impl JavaSource {
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> Option<&Option<ParameterCall>> {
         self.invocations
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)
     }
 
-    pub fn recursive_arguments(&self, owner: &str, owner_line: i64, line: i64) -> Option<usize> {
+    pub fn recursive_arguments(
+        &self,
+        owner: &str,
+        owner_line: i64,
+        owner_site: Option<usize>,
+        line: i64,
+    ) -> Option<usize> {
         self.direct_calls
-            .get(&(owner.to_owned(), owner_line, line, owner.to_owned()))
+            .get(&self.call_key(owner, owner_line, owner_site, line, owner)?)
             .copied()
             .flatten()
     }
@@ -4803,11 +4880,12 @@ impl JavaSource {
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> Option<Option<usize>> {
         self.bare_calls
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)
             .copied()
     }
 
@@ -4844,11 +4922,12 @@ impl JavaSource {
         &self,
         owner: &str,
         owner_line: i64,
+        owner_site: Option<usize>,
         line: i64,
         name: &str,
     ) -> Option<&[Option<InvocationArgument>]> {
         self.invocation_types
-            .get(&(owner.to_owned(), owner_line, line, name.to_owned()))?
+            .get(&self.call_key(owner, owner_line, owner_site, line, name)?)?
             .as_deref()
     }
 
@@ -4893,7 +4972,7 @@ impl JavaSource {
         line: i64,
         name: &str,
     ) -> Option<&str> {
-        self.parameter_call(owner, owner_line, line, name)?
+        self.parameter_call(owner, owner_line, None, line, name)?
             .as_ref()
             .map(|call| call.receiver.as_str())
     }
@@ -4902,6 +4981,45 @@ impl JavaSource {
 #[cfg(test)]
 mod tests {
     use super::{JavaSource, TypeReference};
+
+    #[test]
+    fn callable_metadata_requires_exact_sites_when_names_and_lines_collide() {
+        let source = r#"class Probe { static int use(A a) { return route(a); } int use(B b) { return route(b, 1); } }
+class Callbacks { static void run(A a, java.util.function.Consumer<A> f) {} void run(B b, java.util.function.Consumer<B> f) {} }
+class A {} class B {}"#;
+        let java = JavaSource::parse(source).unwrap();
+        let first = java.symbol_site("use", 1, "function", 0);
+        let second = java.symbol_site("use", 1, "function", 1);
+        assert_ne!(first, second);
+        assert_eq!(
+            java.bare_arguments("use", 1, first, 1, "route"),
+            Some(Some(1))
+        );
+        assert_eq!(
+            java.bare_arguments("use", 1, second, 1, "route"),
+            Some(Some(2))
+        );
+        assert_eq!(java.bare_arguments("use", 1, None, 1, "route"), None);
+        assert!(java
+            .invocation_arguments("use", 1, None, 1, "route")
+            .is_none());
+        assert!(java.is_static_method("use", 1, first));
+        assert!(!java.is_static_method("use", 1, second));
+        let first = java.symbol_site("run", 2, "function", 0);
+        let second = java.symbol_site("run", 2, "function", 1);
+        assert!(java.reference_parameter("run", 2, None, 0).is_none());
+        assert!(java.callback_parameter("run", 2, None, 1).is_none());
+        assert!(
+            matches!(java.reference_parameter("run", 2, first, 0), Some(super::JavaReceiver::Type(name)) if name == "A")
+        );
+        assert!(
+            matches!(java.reference_parameter("run", 2, second, 0), Some(super::JavaReceiver::Type(name)) if name == "B")
+        );
+        assert!(
+            java.callback_parameter("run", 2, first, 1)
+                != java.callback_parameter("run", 2, second, 1)
+        );
+    }
 
     #[test]
     fn colliding_local_types_keep_sites_containers_and_parents() {
@@ -5061,10 +5179,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            java.bare_arguments("library", 5, 5, "identity"),
+            java.bare_arguments("library", 5, None, 5, "identity"),
             Some(Some(0))
         );
-        assert_eq!(java.bare_arguments("qualified", 6, 6, "valueOf"), None);
+        assert_eq!(
+            java.bare_arguments("qualified", 6, None, 6, "valueOf"),
+            None
+        );
     }
 
     #[test]
@@ -5183,11 +5304,11 @@ class Fields { Member value; }
         assert_eq!(java.receiver_type("local", 4, 4, "leaf"), None);
         assert_eq!(java.receiver_type("inferred", 5, 5, "leaf"), None);
         assert!(java
-            .parameter_call("field", 3, 3, "leaf")
+            .parameter_call("field", 3, None, 3, "leaf")
             .unwrap()
             .is_none());
         assert!(java
-            .parameter_call("inferred", 5, 5, "leaf")
+            .parameter_call("inferred", 5, None, 5, "leaf")
             .unwrap()
             .is_none());
     }
@@ -5207,14 +5328,20 @@ class Fields { Member value; }
             JavaSource::parse("class Probe {\n void use(A a, B b) { a.leaf(); b.leaf(); }\n}\n")
                 .unwrap();
         assert_eq!(java.receiver_type("use", 2, 2, "leaf"), None);
-        assert!(java.parameter_call("use", 2, 2, "leaf").unwrap().is_none());
+        assert!(java
+            .parameter_call("use", 2, None, 2, "leaf")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn type_parameters_and_lambda_boundaries_are_not_class_guesses() {
         let java = JavaSource::parse("class Probe<A> {\n void use(A a) { a.leaf(); }\n void lambda(B b) { Runnable r = () -> b.leaf(); }\n}\n").unwrap();
         assert_eq!(java.receiver_type("use", 2, 2, "leaf"), None);
-        assert!(java.parameter_call("use", 2, 2, "leaf").unwrap().is_none());
+        assert!(java
+            .parameter_call("use", 2, None, 2, "leaf")
+            .unwrap()
+            .is_none());
         assert_eq!(java.receiver_type("lambda", 3, 3, "leaf"), None);
     }
 
@@ -5222,7 +5349,7 @@ class Fields { Member value; }
     fn arity_and_array_parameters_keep_conservative_syntax_evidence() {
         let java = JavaSource::parse("class Probe {\n void use(A receiver) { receiver.leaf(/* before */ 1 /* after */); }\n void leaf() {}\n void leaf(int value) {}\n void varargs(int... values) {}\n void prefix(A[] receiver) { receiver.leaf(); }\n void postfix(A receiver[]) { receiver.leaf(); }\n}\n").unwrap();
         assert_eq!(
-            java.parameter_call("use", 2, 2, "leaf")
+            java.parameter_call("use", 2, None, 2, "leaf")
                 .unwrap()
                 .as_ref()
                 .unwrap()
@@ -5235,11 +5362,11 @@ class Fields { Member value; }
         assert!(java.accepts_arguments("varargs", 5, 0));
         assert!(java.accepts_arguments("varargs", 5, 3));
         assert!(java
-            .parameter_call("prefix", 6, 6, "leaf")
+            .parameter_call("prefix", 6, None, 6, "leaf")
             .unwrap()
             .is_none());
         assert!(java
-            .parameter_call("postfix", 7, 7, "leaf")
+            .parameter_call("postfix", 7, None, 7, "leaf")
             .unwrap()
             .is_none());
     }

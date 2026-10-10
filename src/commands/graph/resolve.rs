@@ -2556,7 +2556,7 @@ impl Builder {
                 let owner = &self.syms[source as usize];
                 let source_java = self.files[owner.file as usize].java.as_ref()?;
                 let call = source_java
-                    .expression_call(&owner.name, owner.line, line, name)?
+                    .expression_call(&owner.name, owner.line, owner.java_site, line, name)?
                     .as_ref()?;
                 if self.java_receiver_classes(source, &call.receiver, 0) != [class] {
                     return None;
@@ -2585,7 +2585,7 @@ impl Builder {
         for (index, parameter) in parameters.iter_mut().enumerate() {
             if parameter.is_none() {
                 *parameter = java
-                    .reference_parameter(&symbol.name, symbol.line, index)
+                    .reference_parameter(&symbol.name, symbol.line, symbol.java_site, index)
                     .and_then(|template| {
                         self.java_formal_template(source, target, name, line, template, 0)
                     });
@@ -2617,7 +2617,9 @@ impl Builder {
         for (index, (input, parameter)) in arguments.iter().zip(parameters.iter()).enumerate() {
             if let Some(InvocationArgument::Lambda(arity)) = input {
                 let java = self.files[symbol.file as usize].java.as_ref()?;
-                if let Some(template) = java.reference_parameter(&symbol.name, symbol.line, index) {
+                if let Some(template) =
+                    java.reference_parameter(&symbol.name, symbol.line, symbol.java_site, index)
+                {
                     if let Some(inputs) = self.java_functional_arity(target, template) {
                         if inputs != *arity {
                             return Some(false);
@@ -2696,7 +2698,9 @@ impl Builder {
         let Some(arguments) = self.files[owner.file as usize]
             .java
             .as_ref()
-            .and_then(|java| java.invocation_arguments(&owner.name, owner.line, line, name))
+            .and_then(|java| {
+                java.invocation_arguments(&owner.name, owner.line, owner.java_site, line, name)
+            })
         else {
             return true;
         };
@@ -2722,7 +2726,9 @@ impl Builder {
         let Some(arguments) = self.files[owner.file as usize]
             .java
             .as_ref()
-            .and_then(|java| java.invocation_arguments(&owner.name, owner.line, line, name))
+            .and_then(|java| {
+                java.invocation_arguments(&owner.name, owner.line, owner.java_site, line, name)
+            })
         else {
             return;
         };
@@ -2835,9 +2841,9 @@ impl Builder {
     ) -> Option<Result<Resolution, DropReason>> {
         let java = self.files[file as usize].java.as_ref()?;
         let owner = &self.syms[source as usize];
-        let call = java.parameter_call(&owner.name, owner.line, line, name)?;
+        let call = java.parameter_call(&owner.name, owner.line, owner.java_site, line, name)?;
         if java
-            .expression_call(&owner.name, owner.line, line, name)
+            .expression_call(&owner.name, owner.line, owner.java_site, line, name)
             .is_some_and(|call| {
                 call.as_ref()
                     .is_none_or(|call| call.receiver_site.is_some())
@@ -2847,7 +2853,7 @@ impl Builder {
         }
         let Some(call) = call else {
             if java
-                .expression_call(&owner.name, owner.line, line, name)
+                .expression_call(&owner.name, owner.line, owner.java_site, line, name)
                 .is_some()
             {
                 return self.resolve_java_expression_call(file, source, name, line);
@@ -3422,7 +3428,8 @@ impl Builder {
     ) -> Option<Result<Resolution, DropReason>> {
         let java = self.files[file as usize].java.as_ref()?;
         let owner = &self.syms[source as usize];
-        let arguments = java.bare_arguments(&owner.name, owner.line, line, name)?;
+        let arguments =
+            java.bare_arguments(&owner.name, owner.line, owner.java_site, line, name)?;
         let explicit: Vec<&str> = java
             .static_imports
             .iter()
@@ -3498,7 +3505,9 @@ impl Builder {
     ) -> Option<Result<Resolution, DropReason>> {
         let java = self.files[file as usize].java.as_ref()?;
         let owner = &self.syms[source as usize];
-        let Some(arguments) = java.bare_arguments(&owner.name, owner.line, line, name)? else {
+        let Some(arguments) =
+            java.bare_arguments(&owner.name, owner.line, owner.java_site, line, name)?
+        else {
             return Some(Err(DropReason::ReceiverUnresolved));
         };
         let mut scope = self.class_scope(source);
@@ -4455,7 +4464,9 @@ impl Builder {
                         self.files[symbol.file as usize]
                             .java
                             .as_ref()
-                            .is_some_and(|java| java.is_static_method(&symbol.name, symbol.line))
+                            .is_some_and(|java| {
+                                java.is_static_method(&symbol.name, symbol.line, symbol.java_site)
+                            })
                     })
                     .collect();
                 let receiver = if let [_] = static_targets.as_slice() {
@@ -4611,7 +4622,12 @@ impl Builder {
                             .java
                             .as_ref()
                             .and_then(|java| {
-                                java.callback_parameter(&symbol.name, symbol.line, *parameter)
+                                java.callback_parameter(
+                                    &symbol.name,
+                                    symbol.line,
+                                    symbol.java_site,
+                                    *parameter,
+                                )
                             })
                             .and_then(|callback| {
                                 self.java_collection_kind(target, callback, depth + 1)
@@ -4636,7 +4652,7 @@ impl Builder {
                 let callback = self.files[symbol.file as usize]
                     .java
                     .as_ref()?
-                    .callback_parameter(&symbol.name, symbol.line, *parameter)?;
+                    .callback_parameter(&symbol.name, symbol.line, symbol.java_site, *parameter)?;
                 let kind = self.java_collection_kind(*target, callback, depth + 1)?;
                 if !matches!(
                     kind.as_str(),
@@ -4684,9 +4700,12 @@ impl Builder {
                         let Some(literal) = literal else {
                             continue;
                         };
-                        let Some(formal) =
-                            java.callback_parameter(&symbol.name, symbol.line, index)
-                        else {
+                        let Some(formal) = java.callback_parameter(
+                            &symbol.name,
+                            symbol.line,
+                            symbol.java_site,
+                            index,
+                        ) else {
                             continue;
                         };
                         if self
@@ -5612,10 +5631,10 @@ impl Builder {
     ) -> Option<Result<Resolution, DropReason>> {
         let java = self.files[file as usize].java.as_ref()?;
         let owner = &self.syms[source as usize];
-        let call = java.expression_call(&owner.name, owner.line, line, name)?;
+        let call = java.expression_call(&owner.name, owner.line, owner.java_site, line, name)?;
         let calls = match call {
             Some(call) => std::slice::from_ref(call),
-            None => java.expression_variants(&owner.name, owner.line, line, name),
+            None => java.expression_variants(&owner.name, owner.line, owner.java_site, line, name),
         };
         let calls: Vec<_> = calls
             .iter()
@@ -5745,8 +5764,8 @@ impl Builder {
                         let Some(java) = &self.files[symbol.file as usize].java else {
                             return false;
                         };
-                        let unbound =
-                            reference_is_type && !java.is_static_method(&symbol.name, symbol.line);
+                        let unbound = reference_is_type
+                            && !java.is_static_method(&symbol.name, symbol.line, symbol.java_site);
                         inputs
                             .checked_sub(usize::from(unbound))
                             .is_some_and(|arguments| {
@@ -5762,9 +5781,12 @@ impl Builder {
                                     ) else {
                                         return true;
                                     };
-                                    let Some(parameter) =
-                                        java.reference_parameter(&symbol.name, symbol.line, index)
-                                    else {
+                                    let Some(parameter) = java.reference_parameter(
+                                        &symbol.name,
+                                        symbol.line,
+                                        symbol.java_site,
+                                        index,
+                                    ) else {
                                         return true;
                                     };
                                     self.java_reference_input_compatible(
@@ -5784,7 +5806,11 @@ impl Builder {
                             // Unbound instance references also consume a receiver;
                             // leave that separate conversion to existing binding.
                             if reference_is_type
-                                && !java.is_static_method(&symbol.name, symbol.line)
+                                && !java.is_static_method(
+                                    &symbol.name,
+                                    symbol.line,
+                                    symbol.java_site,
+                                )
                             {
                                 return false;
                             }
@@ -5994,7 +6020,7 @@ impl Builder {
             .as_ref()
             .and_then(|java| {
                 let owner = &self.syms[source as usize];
-                java.constructor_call(&owner.name, owner.line, line, name)
+                java.constructor_call(&owner.name, owner.line, owner.java_site, line, name)
             })
             .filter(|call| {
                 matches!(
@@ -6029,7 +6055,9 @@ impl Builder {
                     self.files[symbol.file as usize]
                         .java
                         .as_ref()
-                        .is_some_and(|java| java.is_constructor(&symbol.name, symbol.line))
+                        .is_some_and(|java| {
+                            java.is_constructor(&symbol.name, symbol.line, symbol.java_site)
+                        })
                 })
                 .collect();
             return match targets.len() {
@@ -6040,7 +6068,7 @@ impl Builder {
         }
         if let Some(Some(call)) = node.java.as_ref().and_then(|java| {
             let owner = &self.syms[source as usize];
-            java.constructor_call(&owner.name, owner.line, line, name)
+            java.constructor_call(&owner.name, owner.line, owner.java_site, line, name)
         }) {
             let classes = self.resolve_java_type_at(
                 source,
@@ -6051,7 +6079,7 @@ impl Builder {
             );
             if let [class] = classes.as_slice() {
                 let mut types = classes.clone();
-                let constructors: Vec<_> = self
+                let mut constructors: Vec<_> = self
                     .java_receiver_members(
                         source,
                         &[*class],
@@ -6067,9 +6095,9 @@ impl Builder {
                             .as_ref()
                             .is_some_and(|java| {
                                 node.java.as_ref().is_some_and(|call_java| {
-                                    if !java.is_constructor(&symbol.name, symbol.line) { return false; }
+                                    if !java.is_constructor(&symbol.name, symbol.line, symbol.java_site) { return false; }
                                     let compatible = java.constructor_parameters(&symbol.name, symbol.line, symbol.java_callable_ordinal)
-                                        .zip(call_java.creation_arguments(&owner.name, owner.line, line, name))
+                                        .zip(call_java.creation_arguments(&owner.name, owner.line, owner.java_site, line, name))
                                         .is_none_or(|(parameters, arguments)| parameters.iter().zip(arguments).all(|(parameter, argument)| {
                                             let Some(argument) = argument else { return true; };
                                             if argument == "java::lang::String" {
@@ -6092,12 +6120,14 @@ impl Builder {
                                         call_java,
                                         &owner.name,
                                         owner.line,
+                                        owner.java_site,
                                         line,
                                     )
                                 })
                             })
                     })
                     .collect();
+                self.java_narrow_invocation_targets(source, name, line, &mut constructors);
                 if constructors.len() == 1 {
                     types.extend(constructors);
                 }
@@ -6148,11 +6178,9 @@ impl Builder {
         }
         let owner = &self.syms[source as usize];
         if owner.kind == "function" && owner.name == name {
-            if let Some(arguments) = node
-                .java
-                .as_ref()
-                .and_then(|java| java.recursive_arguments(&owner.name, owner.line, line))
-            {
+            if let Some(arguments) = node.java.as_ref().and_then(|java| {
+                java.recursive_arguments(&owner.name, owner.line, owner.java_site, line)
+            }) {
                 // A declaration and its recursive call may share a line.
                 // Syntax and arity must establish the call before the generic
                 // declaration/self-reference filters can discard its row.
@@ -6815,13 +6843,25 @@ fn resolve_file(
                     let owner = &builder.syms[source as usize];
                     if let Some(java) = &file_node.java {
                         let invocation = java
-                            .expression_call(&owner.name, owner.line, line, &name)
+                            .expression_call(&owner.name, owner.line, owner.java_site, line, &name)
                             .is_some()
                             || java
-                                .bare_arguments(&owner.name, owner.line, line, &name)
+                                .bare_arguments(
+                                    &owner.name,
+                                    owner.line,
+                                    owner.java_site,
+                                    line,
+                                    &name,
+                                )
                                 .is_some()
                             || java
-                                .constructor_call(&owner.name, owner.line, line, &name)
+                                .constructor_call(
+                                    &owner.name,
+                                    owner.line,
+                                    owner.java_site,
+                                    line,
+                                    &name,
+                                )
                                 .is_some();
                         if !invocation {
                             resolution
@@ -6832,7 +6872,7 @@ fn resolve_file(
                     let recursive_java_call = owner.kind == "function"
                         && owner.name == name
                         && file_node.java.as_ref().is_some_and(|java| {
-                            java.recursive_arguments(&owner.name, owner.line, line)
+                            java.recursive_arguments(&owner.name, owner.line, owner.java_site, line)
                                 .is_some()
                         });
                     resolution

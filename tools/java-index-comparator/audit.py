@@ -65,6 +65,8 @@ import java_array_receiver_contracts
 import java_local_class_contracts
 import graph_mcp_contracts
 import call_tree_mcp_contracts
+import java_callable_site_contracts
+import java_overload_context_contracts
 import java_pattern_scope_contracts
 import java_type_binding_contracts
 import java_type_access_contracts
@@ -118,8 +120,9 @@ import java_resource_scope_contracts
 import java_resource_definition_contracts
 import java_resource_metadata_contracts
 import resource_acceptance
+import call_tree_acceptance
 
-PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance)
+PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance, call_tree_acceptance)
 
 
 SCHEMA = """
@@ -2373,6 +2376,14 @@ class Fixture:
                 self.state.execute("UPDATE coverage SET status='pending' WHERE feature=?", (check['feature'],))
             raise Unsupported(str(error)) from error
 
+    def java_callable_site_check(self, check: sqlite3.Row):
+        module = (java_callable_site_contracts if check['feature'] in java_callable_site_contracts.FEATURES
+                  else java_overload_context_contracts)
+        expected, actual = module.exercise(self.binary, self.database.parent)
+        return {'source': module.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def java_resource_scope_check(self, check: sqlite3.Row):
         if getattr(self, '_java_resource_scope_results', None) is None:
             self._java_resource_scope_results = java_resource_scope_contracts.exercise(self.binary, self.database.parent)
@@ -2541,6 +2552,8 @@ class Fixture:
                 handler = self.graph_mcp_check
             if check['feature'] in call_tree_mcp_contracts.FEATURES:
                 handler = self.call_tree_mcp_check
+            if check['feature'] in java_callable_site_contracts.FEATURES | java_overload_context_contracts.FEATURES:
+                handler = self.java_callable_site_check
             if check['feature'] in file_view_contracts.FEATURES:
                 handler = self.file_view_check
             if check['feature'] in outline_contracts.FEATURES:
@@ -2704,6 +2717,8 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(call_hierarchy_contracts.FEATURES)
     features.update(graph_mcp_contracts.FEATURES)
     features.update(call_tree_mcp_contracts.FEATURES)
+    features.update(java_callable_site_contracts.FEATURES)
+    features.update(java_overload_context_contracts.FEATURES)
     return features
 
 
@@ -2856,6 +2871,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     java_array_receiver_contracts.plan_arrays(state, root)
     java_local_class_contracts.plan_classes(state, root)
     java_pattern_scope_contracts.plan_scopes(state, root)
+    java_callable_site_contracts.plan_sites(state, root)
+    java_overload_context_contracts.plan_contexts(state, root)
     java_type_binding_contracts.plan_types(state, root)
     java_type_access_contracts.plan_access(state, root)
     java_inherited_type_contracts.plan_types(state, root)
@@ -2906,6 +2923,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     parent_acceptance.plan(state, java_only=java_only and root is not None)
     scope_acceptance.plan(state, java_only=java_only and root is not None)
     resource_acceptance.plan(state, java_only=java_only and root is not None)
+    call_tree_acceptance.plan(state, java_only=java_only and root is not None)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:
@@ -2981,6 +2999,7 @@ def scan_locked(arguments: argparse.Namespace) -> dict[str, Any]:
         call_hierarchy_contracts.plan_methods(state, root, source_files, fixture.structure)
         graph_mcp_contracts.plan(state)
         call_tree_mcp_contracts.plan(state)
+        call_tree_acceptance.plan(state, java_only=True)
         limit = arguments.case_limit
         processed = 0
         check_scope, scope_parameters = check_scope_filter(state)
