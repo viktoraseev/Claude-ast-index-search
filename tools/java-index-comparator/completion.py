@@ -55,6 +55,8 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
         call_tree_readiness(state, {**metadata, **fingerprints})
         from graph_acceptance import readiness as graph_readiness
         graph_readiness(state, {**metadata, **fingerprints})
+        from explore_acceptance import readiness as explore_readiness
+        explore_readiness(state, {**metadata, **fingerprints})
         if any(status == 'out-of-scope' and feature not in JAVA_EXCLUDED_FEATURES
                for feature, status in coverage.items()):
             raise ToolError('Java-applicable contract was classified outside the task')

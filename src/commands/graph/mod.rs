@@ -547,6 +547,8 @@ pub(crate) fn resolved_dependents_of_filtered(
     resolved_dependents_filtered(conn, seeds, limit, false, keep)
 }
 
+pub(crate) use resolve::transient_java_dependents;
+
 /// Expand Java call-tree declarations by id, including recursive calls.
 /// A name query can union overloads, but deeper expansion keeps the exact id.
 pub(crate) fn resolved_callers_of_filtered(

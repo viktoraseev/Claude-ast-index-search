@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Instant;
 
@@ -2489,6 +2489,22 @@ impl Builder {
         )
     }
 
+    fn java_scalar_witnesses(&self, target: u32, variable: &str) -> Vec<usize> {
+        let symbol = &self.syms[target as usize];
+        let Some(java) = self.files[symbol.file as usize].java.as_ref() else {
+            return Vec::new();
+        };
+        let Some((formals, false)) =
+            java.invocation_signature_at(&symbol.name, symbol.line, symbol.java_callable_ordinal)
+        else {
+            return Vec::new();
+        };
+        (0..formals.len()).filter(|&index| {
+            matches!(java.reference_parameter(&symbol.name, symbol.line, symbol.java_site, index),
+                     Some(JavaReceiver::Parameter(parameter)) if parameter == variable)
+        }).collect()
+    }
+
     fn java_known_container(&self, owner: u32, path: &str) -> Option<String> {
         self.java_collection_kind(
             owner,
@@ -3715,6 +3731,11 @@ impl Builder {
                             .parameter_index(&symbol.name, symbol.line, symbol.java_site, parameter)
                             .is_some()
                         {
+                            // A failed scalar inference is authoritative. Its
+                            // erased bound cannot revive an invalid call.
+                            if !self.java_scalar_witnesses(target, parameter).is_empty() {
+                                return Vec::new();
+                            }
                             java.type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
                                 .map(|bound| {
                                     self.resolve_java_type(
@@ -5150,6 +5171,80 @@ impl Builder {
                         return java
                             .type_bound(&owner.name, owner.line, owner.java_site, parameter)
                             .map(|path| (*target, JavaReceiver::Type(path.to_owned())));
+                    }
+                    // A scalar method variable is inferred at the invocation,
+                    // rather than erased to its declaration bound. Conflicting
+                    // witnesses expose only a verified declaration bound;
+                    // this does not infer a more specific common superclass
+                    // or a target-dependent type.
+                    let owner = &self.syms[source as usize];
+                    let call_java = self.files[owner.file as usize].java.as_ref()?;
+                    if let (Some((formals, false)), Some(inputs)) = (
+                        java.invocation_signature_at(
+                            &symbol.name,
+                            symbol.line,
+                            symbol.java_callable_ordinal,
+                        ),
+                        call_java.invocation_arguments(
+                            &owner.name,
+                            owner.line,
+                            owner.java_site,
+                            *line,
+                            name,
+                        ),
+                    ) {
+                        let witnesses = self.java_scalar_witnesses(*target, parameter);
+                        if formals.len() == inputs.len() && !witnesses.is_empty() {
+                            let mut inferred = None;
+                            let mut identity = None;
+                            let mut common_bound = false;
+                            for index in witnesses {
+                                let input = inputs[index].as_ref()?;
+                                let (context, ty) = self.java_invocation_argument(source, input)?;
+                                if Self::java_primitive(&ty) || ty.ends_with("[]") {
+                                    return None;
+                                }
+                                let key = self.java_invocation_identity(context, &ty, 0)?;
+                                let bound = java.type_bound(
+                                    &symbol.name,
+                                    symbol.line,
+                                    symbol.java_site,
+                                    parameter,
+                                );
+                                if let Some(bound) = bound {
+                                    if self.java_invocation_conversion_at(
+                                        (context, &ty, self.syms[context as usize].java_site),
+                                        (*target, bound, symbol.java_site),
+                                        false,
+                                        0,
+                                    ) != Some(true)
+                                    {
+                                        return None;
+                                    }
+                                }
+                                if common_bound {
+                                    continue;
+                                }
+                                if identity.as_ref().is_some_and(|previous| previous != &key) {
+                                    // Both witnesses satisfy this bound. Keep
+                                    // only its guaranteed members, without
+                                    // inventing a more specific common type.
+                                    inferred = bound.map(|bound| {
+                                        (*target, JavaReceiver::Type(bound.to_owned()))
+                                    });
+                                    common_bound = true;
+                                    if inferred.is_none() {
+                                        return None;
+                                    }
+                                    // Validate every remaining witness before
+                                    // returning the conservative bound below.
+                                    continue;
+                                }
+                                identity = Some(key);
+                                inferred = Some((context, JavaReceiver::Type(ty)));
+                            }
+                            return inferred;
+                        }
                     }
                     return java
                         .type_bound(&symbol.name, symbol.line, symbol.java_site, parameter)
@@ -6929,6 +7024,108 @@ fn resolve_file(
     out
 }
 
+/// Resolve Java neighbours without publishing a graph or borrowing stale edges.
+/// Stream one file at a time and retain only the bounded, scoped seed pages.
+pub(crate) fn transient_java_dependents(
+    conn: &Connection,
+    root: &Path,
+    seeds: &[db::SearchResult],
+    limit: usize,
+    keep: impl Fn(&db::GraphSymbolInfo) -> bool,
+) -> Result<Vec<Vec<db::SearchResult>>> {
+    let mut targets: HashMap<i64, Vec<usize>> = HashMap::new();
+    for (index, seed) in seeds
+        .iter()
+        .enumerate()
+        .filter(|(_, seed)| seed.path.ends_with(".java"))
+    {
+        if let Some(id) = db::find_symbol_id_by_kind(
+            conn,
+            seed.root_path.as_deref(),
+            &seed.path,
+            seed.line,
+            &seed.name,
+            &seed.kind,
+        )? {
+            targets.entry(id).or_default().push(index);
+        }
+    }
+    let mut pages: Vec<BTreeMap<(u8, i64), db::SearchResult>> = vec![BTreeMap::new(); seeds.len()];
+    if targets.is_empty() || limit == 0 {
+        return Ok(pages
+            .into_iter()
+            .map(|page| page.into_values().collect())
+            .collect());
+    }
+    let builder = Builder::load(conn, root)?;
+    let mut consume = |file_id, batch| -> Result<()> {
+        let resolved = resolve_file(&builder, file_id, batch);
+        let mut incoming = Vec::new();
+        for ((source, target), edge) in resolved.edges {
+            let source_id = builder.syms[source as usize].id;
+            let target_id = builder.syms[target as usize].id;
+            if source_id != target_id
+                && edge.confidence <= Confidence::Unique
+                && targets.contains_key(&target_id)
+            {
+                incoming.push((source_id, target_id, edge.confidence.code()));
+            }
+        }
+        let ids: Vec<i64> = incoming.iter().map(|(source, _, _)| *source).collect();
+        let infos = db::load_graph_symbol_infos(conn, &ids)?;
+        for (source, target, confidence) in incoming {
+            let Some(info) = infos.get(&source).filter(|info| keep(info)) else {
+                continue;
+            };
+            for &index in &targets[&target] {
+                let page = &mut pages[index];
+                page.insert(
+                    (confidence, source),
+                    db::SearchResult {
+                        name: info.name.clone(),
+                        qualified_name: info.qualified_name.clone(),
+                        kind: info.kind.clone(),
+                        line: info.line,
+                        end_line: info.end_line,
+                        signature: None,
+                        path: info.path.clone(),
+                        root_path: info.root_path.clone(),
+                    },
+                );
+                if page.len() > limit {
+                    page.pop_last();
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut file = None;
+    let mut batch = Vec::new();
+    db::for_each_graph_ref(conn, |file_id, name, line, context| {
+        if file != Some(file_id) {
+            if let Some(previous) = file {
+                consume(previous, std::mem::take(&mut batch))?;
+            }
+            file = Some(file_id);
+        }
+        if builder
+            .file_index
+            .get(&file_id)
+            .is_some_and(|&index| builder.files[index as usize].java.is_some())
+        {
+            batch.push((name.to_owned(), line, context.map(str::to_owned)));
+        }
+        Ok(())
+    })?;
+    if let Some(file) = file {
+        consume(file, batch)?;
+    }
+    Ok(pages
+        .into_iter()
+        .map(|page| page.into_values().collect())
+        .collect())
+}
+
 /// Build (or rebuild) the stored symbol graph from the current index.
 pub fn build_symbol_graph(
     conn: &mut Connection,
@@ -7113,6 +7310,101 @@ pub fn build_symbol_graph(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_scalar_generic_result_uses_invocation_witness() {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join(".artifacts/tests");
+        std::fs::create_dir_all(&base).unwrap();
+        let root = tempfile::tempdir_in(base).unwrap();
+        std::fs::write(
+            root.path().join("Probe.java"),
+            r#"package view;
+class Leaf { int beacon() { return 1; } }
+class Probe {
+ <T> T identity(T input) { return input; }
+ int inferred(Leaf input) {
+  return identity(input).beacon();
+ }
+}
+class Foreign {}
+class Invalid {
+ <T extends Leaf> T bounded(T input) { return input; }
+ int rejected(Foreign input) { return bounded(input).beacon(); }
+}
+"#,
+        )
+        .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init_db(&conn).unwrap();
+        crate::indexer::index_directory(&mut conn, root.path(), false, false).unwrap();
+        let builder = Builder::load(&conn, root.path()).unwrap();
+        let source = builder
+            .syms
+            .iter()
+            .position(|symbol| symbol.name == "inferred")
+            .unwrap() as u32;
+        let owner = &builder.syms[source as usize];
+        let java = builder.files[owner.file as usize].java.as_ref().unwrap();
+        let targets = builder.java_invocation_targets(source, None, "identity", 6, 1, 0);
+        assert_eq!(targets.len(), 1, "generic invocation target");
+        let target = &builder.syms[targets[0] as usize];
+        assert_eq!(
+            java.return_parameter(&target.name, target.line, target.java_site),
+            Some("T")
+        );
+        assert!(
+            matches!(java.reference_parameter(&target.name, target.line, target.java_site, 0),
+                         Some(JavaReceiver::Parameter(variable)) if variable == "T"),
+            "formal method variable metadata"
+        );
+        assert!(
+            java.invocation_arguments(&owner.name, owner.line, owner.java_site, 6, "identity")
+                .is_some(),
+            "invocation arguments"
+        );
+        let argument = java
+            .invocation_arguments(&owner.name, owner.line, owner.java_site, 6, "identity")
+            .unwrap()[0]
+            .as_ref()
+            .unwrap();
+        let (argument_owner, argument_type) = builder
+            .java_invocation_argument(source, argument)
+            .expect("typed argument");
+        assert!(
+            builder
+                .java_invocation_identity(argument_owner, &argument_type, 0)
+                .is_some(),
+            "argument identity: {argument_type}"
+        );
+        let call = java
+            .expression_call(&owner.name, owner.line, owner.java_site, 6, "beacon")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert!(
+            !builder
+                .java_receiver_classes(source, &call.receiver, 0)
+                .is_empty(),
+            "inferred result receiver"
+        );
+        let source = builder
+            .syms
+            .iter()
+            .position(|symbol| symbol.name == "rejected")
+            .unwrap() as u32;
+        let owner = &builder.syms[source as usize];
+        let call = java
+            .expression_call(&owner.name, owner.line, owner.java_site, 12, "beacon")
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert!(
+            builder
+                .java_receiver_classes(source, &call.receiver, 0)
+                .is_empty(),
+            "invalid scalar inference must not fall back to its erased bound"
+        );
+    }
 
     #[test]
     fn classify_usage_reads_qualifiers_and_receivers() {

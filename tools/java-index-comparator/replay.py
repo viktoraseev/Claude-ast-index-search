@@ -177,6 +177,9 @@ def replay(evidence: Path, root: Path, binary: Path, output: Path, limit: int = 
                 if check['feature'] == 'graph':
                     from graph_acceptance import replay_children
                     replay_children(fixture, source)
+                if check['feature'] == 'explore:semantic-resolution':
+                    from explore_acceptance import replay_children
+                    replay_children(fixture, source)
                 fixture.evaluate(check)
                 try:
                     oracle.assert_consumed()

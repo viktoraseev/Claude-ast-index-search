@@ -41,7 +41,7 @@ def required_acceptance_features():
     import selector_error_contracts
     import freshness_error_contracts
     return {f for f in required_features() if (f.startswith('graph:') and f != graph.FEATURE)
-            or 'java-graph' in f} | selector_error_contracts.FEATURES | freshness_error_contracts.FEATURES
+            or (f.startswith('global:') and 'java-graph' in f)} | selector_error_contracts.FEATURES | freshness_error_contracts.FEATURES
 
 
 def unmapped_commands():

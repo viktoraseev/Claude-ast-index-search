@@ -55,6 +55,9 @@ import rank_contracts
 import stack_contracts
 import context_contracts
 import explore_contracts
+import explore_freshness_contracts
+import explore_result_contracts
+import explore_acceptance
 import graph_contracts
 import java_receiver_contracts
 import java_exception_scope_contracts
@@ -126,7 +129,7 @@ import call_tree_acceptance
 import graph_acceptance
 import graph_overload_contracts
 
-PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance, call_tree_acceptance, graph_acceptance)
+PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance, call_tree_acceptance, graph_acceptance, explore_acceptance)
 
 
 SCHEMA = """
@@ -2396,6 +2399,14 @@ class Fixture:
                 self.state.execute("UPDATE coverage SET status='pending' WHERE feature=?", (check['feature'],))
             raise Unsupported(str(error)) from error
 
+    def explore_semantic_source_check(self, check: sqlite3.Row):
+        module = (explore_freshness_contracts if check['feature'] in explore_freshness_contracts.FEATURES
+                  else explore_result_contracts)
+        expected, actual = module.exercise(self.binary, self.database.parent)
+        return {'source': module.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def java_callable_site_check(self, check: sqlite3.Row):
         module = (graph_overload_contracts if check['feature'] in graph_overload_contracts.FEATURES else
                   java_callable_site_contracts if check['feature'] in java_callable_site_contracts.FEATURES
@@ -2603,6 +2614,8 @@ class Fixture:
                 handler = self.java_resource_definition_check
             if check['feature'] in {policy.FEATURE for policy in PARENT_POLICIES}:
                 handler = self.parent_acceptance_check
+            if check['feature'] in explore_freshness_contracts.FEATURES | explore_result_contracts.FEATURES:
+                handler = self.explore_semantic_source_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
             if check['feature'] in annotation_contracts.EXTENSIONS:
@@ -2747,6 +2760,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_callable_site_contracts.FEATURES)
     features.update(java_overload_context_contracts.FEATURES)
     features.update(graph_overload_contracts.FEATURES)
+    features.update(explore_freshness_contracts.FEATURES | explore_result_contracts.FEATURES)
     return features
 
 
@@ -2956,6 +2970,9 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     resource_acceptance.plan(state, java_only=java_only and root is not None)
     call_tree_acceptance.plan(state, java_only=java_only and root is not None)
     graph_acceptance.plan(state, java_only=java_only and root is not None)
+    explore_freshness_contracts.plan_contracts(state, root)
+    explore_result_contracts.plan_contracts(state, root)
+    explore_acceptance.plan(state, java_only=java_only and root is not None)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

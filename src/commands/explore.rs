@@ -246,7 +246,14 @@ fn run_explore(
 
     // Stage B: re-rank by RWR over an in-memory call/inheritance graph.
     if use_rwr {
-        apply_rwr(&conn, &resolver, scope, dom_lang.as_deref(), &mut cands)?;
+        apply_rwr(
+            &conn,
+            root,
+            &resolver,
+            scope,
+            dom_lang.as_deref(),
+            &mut cands,
+        )?;
     }
 
     // The fallback inherits search's result budget, including an empty page.
@@ -1180,6 +1187,7 @@ impl Graph {
 /// (no schema migration, no parser changes).
 fn apply_rwr(
     conn: &Connection,
+    root: &Path,
     resolver: &PathResolver,
     scope: &SearchScope,
     dom_lang: Option<&str>,
@@ -1203,8 +1211,8 @@ fn apply_rwr(
 
     // Build edges around each seed: callers + inheritance. Callers come from
     // the symbol graph when it is built and fresh — resolved edges point at
-    // this definition, not at every symbol sharing its name — and otherwise
-    // from references matched by name, each attributed to its owning symbol.
+    // this definition, not at every symbol sharing its name. Java uses the
+    // same resolver transiently when no current graph is available.
     let seeds: Vec<SearchResult> = cands.iter().take(seed_n).map(|c| c.sym.clone()).collect();
     // Role a node plays relative to the seed — for the "Graph neighbours" section.
     let mut link_role: HashMap<SymbolKey, &'static str> = HashMap::new();
@@ -1212,6 +1220,21 @@ fn apply_rwr(
         super::graph::resolved_dependents_of_filtered(conn, &seeds, REF_LIMIT, |info| {
             scope.matches_path(&info.path) && resolver.matches_filter(info.root_path.as_deref())
         })?;
+    let transient_java = if graph_dependents.is_none()
+        && seeds.iter().any(|seed| seed.path.ends_with(".java"))
+    {
+        Some(super::graph::transient_java_dependents(
+            conn,
+            root,
+            &seeds,
+            REF_LIMIT,
+            |info| {
+                scope.matches_path(&info.path) && resolver.matches_filter(info.root_path.as_deref())
+            },
+        )?)
+    } else {
+        None
+    };
     for (i, sym) in seeds.iter().enumerate() {
         let sid = g.intern(sym);
         // A fresh graph's empty Java caller set must stay empty: a name
@@ -1220,7 +1243,13 @@ fn apply_rwr(
         let resolved = graph_dependents
             .as_ref()
             .map(|dependents| dependents[i].clone())
-            .filter(|dependents| sym.path.ends_with(".java") || !dependents.is_empty());
+            .filter(|dependents| sym.path.ends_with(".java") || !dependents.is_empty())
+            .or_else(|| {
+                transient_java
+                    .as_ref()
+                    .filter(|_| sym.path.ends_with(".java"))
+                    .map(|dependents| dependents[i].clone())
+            });
         let callers: Vec<SearchResult> = match resolved {
             Some(dependents) => dependents,
             None => {
