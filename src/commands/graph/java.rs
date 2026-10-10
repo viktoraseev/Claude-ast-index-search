@@ -2434,6 +2434,7 @@ pub(crate) struct DependencyValueMember {
     pub method: bool,
     pub chain: Option<DependencyValueReceiver>,
     pub arguments: Option<Vec<DependencyInvocationArgument>>,
+    pub type_arguments: Option<Vec<DependencyInvocationArgument>>,
 }
 
 pub(crate) struct DependencyInvocationArgument {
@@ -2463,6 +2464,7 @@ pub(crate) enum DependencyValueReceiver {
         name: String,
         arity: Option<usize>,
         arguments: Option<Vec<DependencyInvocationArgument>>,
+        type_arguments: Option<Vec<DependencyInvocationArgument>>,
     },
 }
 
@@ -2471,6 +2473,24 @@ pub(crate) fn dependency_value_members(
     package: &str,
 ) -> Result<Vec<DependencyValueMember>> {
     use crate::parsers::treesitter::java::{dependency_contexts, dependency_instances};
+    fn type_arguments(
+        node: Node<'_>,
+        source: &str,
+        package: &str,
+    ) -> Option<Vec<DependencyInvocationArgument>> {
+        let types = node.child_by_field_name("type_arguments")?;
+        Some(
+            types
+                .named_children(&mut types.walk())
+                .filter(|child| !child.is_extra())
+                .map(|ty| DependencyInvocationArgument {
+                    ty: Some(text(ty, source).to_owned()),
+                    position: ty.start_byte(),
+                    contexts: dependency_contexts(ty, source, package),
+                })
+                .collect(),
+        )
+    }
     fn arguments(
         node: Node<'_>,
         source: &str,
@@ -2668,12 +2688,14 @@ pub(crate) fn dependency_value_members(
                 name: text(node.child_by_field_name("name")?, source).to_owned(),
                 arity: Some(argument_count(node)?),
                 arguments: arguments(node, source, scopes, tree, declarations, package),
+                type_arguments: type_arguments(node, source, package),
             }),
             "field_access" => Some(DependencyValueReceiver::Member {
                 receiver: Box::new(nested(node.child_by_field_name("object")?)?),
                 name: text(node.child_by_field_name("field")?, source).to_owned(),
                 arity: None,
                 arguments: None,
+                type_arguments: None,
             }),
             // An unbound syntax name is a type qualifier only when receiver
             // inference did not detect a value shadow or unknown binding.
@@ -2770,6 +2792,7 @@ pub(crate) fn dependency_value_members(
                     method,
                     chain: None,
                     arguments: arguments(node, source, &scopes, &tree, &declarations, package),
+                    type_arguments: type_arguments(node, source, package),
                 });
             }
         } else if let Some(chain) = parameter.or_else(|| {
@@ -2789,6 +2812,7 @@ pub(crate) fn dependency_value_members(
                 method,
                 chain: Some(chain),
                 arguments: arguments(node, source, &scopes, &tree, &declarations, package),
+                type_arguments: type_arguments(node, source, package),
             });
         }
         WalkControl::Continue
@@ -2798,6 +2822,29 @@ pub(crate) fn dependency_value_members(
 
 #[cfg(test)]
 mod dependency_value_tests {
+    #[test]
+    fn method_witnesses_keep_use_sites_and_chained_invocations() {
+        let source = r#"class Box { <T> T get() { return null; } }
+            class Use { int run(Box b) { return b.<shared.Child>get().instance(); } }"#;
+        let members = super::dependency_value_members(source, "").unwrap();
+        let call = members.iter().find(|member| member.name == "get").unwrap();
+        let witness = &call.type_arguments.as_ref().unwrap()[0];
+        assert_eq!(witness.ty.as_deref(), Some("shared.Child"));
+        assert_eq!(witness.position, source.find("shared.Child").unwrap());
+        let call = members
+            .iter()
+            .find(|member| member.name == "instance")
+            .unwrap();
+        let Some(super::DependencyValueReceiver::Member { type_arguments, .. }) = &call.chain
+        else {
+            panic!("method witness lost its result chain");
+        };
+        assert_eq!(
+            type_arguments.as_ref().unwrap()[0].position,
+            witness.position
+        );
+    }
+
     #[test]
     fn bounded_record_receivers_keep_parameter_owner_and_instance_guards() {
         let source = r#"record Probe<T extends shared.Child>(T value) {

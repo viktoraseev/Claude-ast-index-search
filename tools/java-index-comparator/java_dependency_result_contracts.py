@@ -11,12 +11,40 @@ FEATURES = {'unused-deps:java-source-results'}
 REASON = ('independent source/javac/CLI: explicit class generic result substitution, '
           'fields/records/inheritance and initializer-site var chains with access, '
           'ambiguity, class-variable formals/arrays/boxing, nominal variable-arity '
-          'invocation phases and attached classpath guards; '
+          'invocation phases, scalar method-variable inference, explicit witnesses, '
+          'bounds, shadowing, array/spread formals and attached classpath guards; '
           'not MCP equivalence')
 
 # Each input has an authored declaring owner. Invalid-Java guards must remain
 # uncredited; VALID_NEGATIVE_CASES separately compile valid ownership controls.
 CASES = {
+    'method-inferred': ('class Box { <T> T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
+    'method-bounded': ('class Box { <T extends shared.Child> T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
+    'method-null-bound': ('class Box { <T extends shared.Child> T get(T value){return value;} }', 'Box b', 'b.get(null).instance()', True),
+    'method-unused-bound': ('class Box { <T extends shared.Child> T get(){return null;} }', 'Box b', 'b.get().instance()', True),
+    'method-multiple': ('class Box { <A,B> B get(A ignored,B value){return value;} }', 'Box b, shared.Child c', 'b.get("x",c).instance()', True),
+    'method-shadow': ('class Box<T> { <T> T get(T value){return value;} }', 'Box<String> b, shared.Child c', 'b.get(c).instance()', True),
+    'method-array': ('class Box { <T> T get(T[] value){return null;} }', 'Box b, shared.Child[] c', 'b.get(c).instance()', True),
+    'method-postfix-array': ('class Box { <T> T get(T value[]){return null;} }', 'Box b, shared.Child[] c', 'b.get(c).instance()', True),
+    'method-spread': ('class Box { <T> T get(T... value){return null;} }', 'Box b, shared.Child c', 'b.get(c,c).instance()', True),
+    'method-fixed-spread': ('class Box { <T> T get(T... value){return null;} }', 'Box b, shared.Child[] c', 'b.get(c).instance()', True),
+    'method-empty-bound-spread': ('class Box { <T extends shared.Child> T get(T... value){return null;} }', 'Box b', 'b.get().instance()', True),
+    'method-nested-result': ('class Wrap<U> { U get(){return null;} } class Box { <T> Wrap<T> get(T value){return null;} }', 'Box b, shared.Child c', 'b.get(c).get().instance()', True),
+    'method-inherited': ('class Parent { <T> T get(T value){return value;} } class Box extends Parent {}', 'Box b, shared.Child c', 'b.get(c).instance()', True),
+    'method-class-bound': ('class Box<T> { <U extends T> U get(U value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
+    'method-explicit': ('class Box { <T> T get(){return null;} }', 'Box b', 'b.<shared.Child>get().instance()', True),
+    'method-explicit-null': ('class Box { <T> T get(T value){return value;} }', 'Box b', 'b.<shared.Child>get(null).instance()', True),
+    'method-var-capture': ('class Box { <T> T get(T value){return value;} }', 'Box b, shared.Child c', 'var value=b.get(c); return ((java.util.function.IntSupplier)value::instance).getAsInt()', True),
+    'method-private-guard': ('class Box { private <T> T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', False),
+    'method-bound-guard': ('class Box { <T extends String> T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', False),
+    'method-unbound-guard': ('class Box { <T> T get(){return null;} }', 'Box b', 'b.get().instance()', False),
+    'method-null-guard': ('class Box { <T> T get(T value){return value;} }', 'Box b', 'b.get(null).instance()', False),
+    'method-mixed-guard': ('class Box { <T> T get(T first,T second){return first;} }', 'Box b, shared.Child c', 'b.get(c,"x").instance()', False),
+    'method-array-rank-guard': ('class Box { <T> T get(T[][] value){return null;} }', 'Box b, shared.Child[] c', 'b.get(c).instance()', False),
+    'method-explicit-bound-guard': ('class Box { <T extends String> T get(){return null;} }', 'Box b', 'b.<shared.Child>get().instance()', False),
+    'method-explicit-type-guard': ('class Box { <T> T get(T value){return value;} }', 'Box b', 'b.<shared.Child>get("x").instance()', False),
+    'method-explicit-arity-guard': ('class Box { <T> T get(){return null;} }', 'Box b', 'b.<shared.Child,String>get().instance()', False),
+    'method-overload-guard': ('class Box { <T> T get(T value){return value;} Object get(shared.Child value){return null;} }', 'Box b, shared.Child c', 'b.get(c).instance()', False),
     'formal-class-bounded': ('class Box<T extends shared.Child> { T get(T value){return value;} }', 'Box<shared.Child> b, shared.Child c', 'b.get(c).instance()', True),
     'formal-class-raw-bounded': ('class Box<T extends shared.Child> { T get(T value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
     'formal-class-overridden': ('class Parent<T> { T get(T value){return value;} } class Box extends Parent<shared.Child> { shared.Child get(shared.Child value){return value;} }', 'Box b, shared.Child c', 'b.get(c).instance()', True),
@@ -155,6 +183,15 @@ def plan_results(state, root):
             state.execute('INSERT OR IGNORE INTO checks(id,feature,subject) VALUES (?,?,?)',
                           (stable_id({'feature': feature, 'subject': subject}), feature, subject))
         # This finite child never closes the full shared/semantic parents.
+        note = ('; executed scalar method-variable checklist covers inferred/explicit/bounded '
+                'results, class/method shadow separation, array/postfix/spread formals, nested '
+                'result projections, inheritance, capture, access/type/arity/overload guards '
+                'and attached declaring imports with JSON/text/options/update/rebuild; '
+                'parameterized formal and target-dependent inference, intersection/common '
+                'bound inference, overload erasure and classpath ordering remain pending; '
+                'independent source/javac/CLI, not MCP equivalence')
+        state.execute("UPDATE coverage SET reason=reason || ? WHERE feature='unused-deps:semantic-resolution' "
+                      "AND status='pending' AND instr(reason,'executed scalar method-variable checklist')=0", (note,))
 
 
 def exercise(binary, base):
@@ -215,10 +252,10 @@ def exercise(binary, base):
                 raise ToolError('source results did not execute unused-deps')
             return sorted((row['name'], row['category'], row['examples']['direct']) for row in doc['items'])
 
-        for label, (declarations, parameter, _, used) in CASES.items():
+        for label, (declarations, parameter, body, used) in CASES.items():
             # Even a guard has the explicitly written Child type as a direct
             # dependency. Its downstream Base must never be inferred by name.
-            child = ['Child'] if 'Child' in parameter + declarations else []
+            child = ['Child'] if 'Child' in parameter + declarations + (body if label.startswith('method-') else '') else []
             want = [('base', 'direct' if used else 'unused', ['Base'] if used else []),
                     ('lib', 'direct' if child else 'unused', child)]
             for flags in ((), ('--strict',)):
@@ -309,5 +346,38 @@ def exercise(binary, base):
         write('box/Box.java', 'package api; public class Box<T> { public Object get(T... values){return null;} }', attached)
         runner.command('update')
         record('attached:formals:changed-result', [('attached::base', 'unused', []), ('attached::box', 'direct', ['Box', 'Wrap']),
+            ('attached::lib', 'direct', ['Child'])], classifications('consumer', ('--strict',), attached))
+        # Method variables bind from consumer arguments, while provider bounds
+        # bind in provider imports. Neither may borrow Box's class parameter.
+        method_cases = (
+            ('inferred', '<U> U get(U value){return value;}', 'shared.Child c', 'b.get(c)'),
+            ('shadow', '<T> T get(T value){return value;}', 'shared.Child c', 'b.get(c)'),
+            ('explicit', '<U> U get(){return null;}', 'shared.Child c', 'b.<shared.Child>get()'),
+            ('bounded', '<U extends Child> U get(){return null;}', 'shared.Child c', 'b.get()'),
+            ('array', '<U> U get(U[] value){return null;}', 'shared.Child[] c', 'b.get(c)'),
+            ('spread', '<U> U get(U... value){return null;}', 'shared.Child c', 'b.get(c,c)'),
+        )
+        for label, declaration, parameter, expression in method_cases:
+            write('box/Box.java', 'package api; import shared.Child; public class Box<T> { public ' + declaration + ' }', attached)
+            write('box/build.gradle', 'dependencies { api(project(":lib")) }', attached)
+            write('consumer/Use.java', 'package fixture; class Use { int run(api.Wrap<String> b, ' + parameter + '){var value=' + expression + '; return value.instance();} }', attached)
+            with (runner.directory / ('attached.method-' + label + '.javac.log')).open('wb') as log:
+                result = subprocess.run([javac, '-proc:none', '-d', str(runner.directory / 'attached-method-classes'),
+                    *map(str, sorted(attached.rglob('*.java')))], stdout=log, stderr=log, timeout=30)
+            if result.returncode:
+                raise ToolError('attached method-variable fixture failed javac; see private log')
+            runner.command('update')
+            for flags in ((), ('--strict',), ('--no-transitive',), ('--no-xml',), ('--no-resources',),
+                          ('--no-transitive', '--no-xml', '--no-resources')):
+                record('attached:method-' + label + ':' + ','.join(flags), formal_want,
+                       classifications('consumer', flags, attached))
+            _, text = runner.command('unused-deps', 'consumer', '--verbose', '--strict', cwd=attached)
+            record('attached:method-' + label + ':text', True, 'Base' in text)
+            runner.command('rebuild', '--force', '--max-files', '0')
+            record('attached:method-' + label + ':rebuild', formal_want,
+                   classifications('consumer', ('--strict',), attached))
+        write('box/Box.java', 'package api; public class Box<T> { public <U> Object get(U... value){return null;} }', attached)
+        runner.command('update')
+        record('attached:method:changed-result', [('attached::base', 'unused', []), ('attached::box', 'direct', ['Box', 'Wrap']),
             ('attached::lib', 'direct', ['Child'])], classifications('consumer', ('--strict',), attached))
         return expected, actual

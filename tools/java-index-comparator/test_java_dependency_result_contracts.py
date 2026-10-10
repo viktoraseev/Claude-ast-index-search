@@ -62,7 +62,10 @@ class DependencyResultTests(unittest.TestCase):
                         'fixed-before-varargs-guard:options:--no-transitive',
                         'attached:varargs:rebuild', 'formal-class-reordered:True',
                         'formal-class-boxed-array-guard:True', 'formal-class-shadow-array-guard:True',
-                        'attached:formals:rebuild'):
+                        'attached:formals:rebuild', 'method-inferred:True',
+                        'method-shadow:True', 'method-explicit-bound-guard:True',
+                        'method-overload-guard:True', 'method-fixed-spread:True',
+                        'attached:method-explicit:rebuild', 'attached:method:changed-result'):
                 with self.subTest(removed_assertion=key):
                     smaller = dict(samples)
                     del smaller[key]
@@ -72,6 +75,10 @@ class DependencyResultTests(unittest.TestCase):
             smaller['varargs-many-result:True'][0][2] = []
             # Keeping every outer key cannot conceal loss of declaring-owner
             # evidence inside a newly retained positive assertion.
+            with self.assertRaises(scope_acceptance.AcceptancePending):
+                scope_acceptance.validate_population(smaller, criterion)
+            smaller = json.loads(json.dumps(samples))
+            smaller['method-inferred:True'][0][2] = []
             with self.assertRaises(scope_acceptance.AcceptancePending):
                 scope_acceptance.validate_population(smaller, criterion)
         self.oracle.call.assert_not_called()
@@ -109,6 +116,15 @@ class DependencyResultTests(unittest.TestCase):
                      'formal-class-shadow-guard', 'formal-class-shadow-array-guard',
                      'formal-class-strict-phase-guard',
                      'formal-class-local-wrapper-guard'):
+            self.assertIs(contracts.CASES[name][3], False)
+        for name in ('method-inferred', 'method-bounded', 'method-null-bound',
+                     'method-multiple', 'method-shadow', 'method-array', 'method-spread',
+                     'method-nested-result', 'method-inherited', 'method-class-bound',
+                     'method-explicit', 'method-var-capture'):
+            self.assertIs(contracts.CASES[name][3], True)
+        for name in ('method-unbound-guard', 'method-bound-guard', 'method-null-guard',
+                     'method-mixed-guard', 'method-explicit-type-guard',
+                     'method-explicit-arity-guard', 'method-overload-guard'):
             self.assertIs(contracts.CASES[name][3], False)
 
     def test_bad_missing_or_interrupted_results_never_pass_or_close_parents(self):

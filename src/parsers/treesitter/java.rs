@@ -681,10 +681,126 @@ pub(crate) struct DependencyMemberType {
     pub contexts: Vec<String>,
     pub parameters: Option<Vec<Option<String>>>,
     pub parameter_variables: Vec<Option<(DependencyResultType, usize)>>,
+    pub method_generic: bool,
+    pub method_signature: Option<DependencyMethodSignature>,
     pub is_static: bool,
     pub public: bool,
     pub private: bool,
     pub protected: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct DependencyMethodSignature {
+    pub variables: Vec<(String, Option<DependencyResultType>)>,
+    pub parameters: Vec<Option<(String, usize)>>,
+    pub result: Option<DependencyResultType>,
+}
+
+/// Retain method variables separately from the class substitution contract.
+fn dependency_method_result_type(
+    ty: Node<'_>,
+    content: &str,
+    package: &str,
+    names: &[String],
+    depth: usize,
+) -> Option<DependencyResultType> {
+    if depth >= 16 || ty.has_error() {
+        return None;
+    }
+    if ty.kind() == "generic_type" {
+        let arguments = ty.named_child(1)?;
+        return Some(DependencyResultType::Named(
+            node_text(content, &ty.named_child(0)?).to_owned(),
+            arguments
+                .named_children(&mut arguments.walk())
+                .map(|argument| {
+                    dependency_method_result_type(argument, content, package, names, depth + 1)
+                })
+                .collect(),
+        ));
+    }
+    let name = node_text(content, &ty);
+    if ty.kind() == "type_identifier" && names.iter().any(|variable| variable == name) {
+        return Some(DependencyResultType::Parameter {
+            owner: "@method".into(),
+            name: name.into(),
+        });
+    }
+    dependency_result_type(ty, content, package, depth)
+}
+
+fn dependency_method_signature(
+    member: Node<'_>,
+    content: &str,
+    package: &str,
+) -> Option<DependencyMethodSignature> {
+    let variables = member.child_by_field_name("type_parameters")?;
+    let nodes: Vec<_> = variables.named_children(&mut variables.walk()).collect();
+    let names: Vec<_> = nodes
+        .iter()
+        .map(|node| {
+            node.named_children(&mut node.walk())
+                .find(|child| child.kind() == "type_identifier")
+                .map(|name| node_text(content, &name).to_owned())
+        })
+        .collect::<Option<_>>()?;
+    let mut variables = Vec::new();
+    for (node, name) in nodes.iter().zip(&names) {
+        let bound = node
+            .named_children(&mut node.walk())
+            .find(|child| child.kind() == "type_bound");
+        let bound = if let Some(bound) = bound {
+            let bounds: Vec<_> = bound.named_children(&mut bound.walk()).collect();
+            let [bound] = bounds.as_slice() else {
+                return None;
+            };
+            Some(dependency_method_result_type(
+                *bound, content, package, &names, 0,
+            )?)
+        } else {
+            None
+        };
+        variables.push((name.clone(), bound));
+    }
+    let parameters = member.child_by_field_name("parameters")?;
+    let parameters = parameters
+        .named_children(&mut parameters.walk())
+        .filter(|p| matches!(p.kind(), "formal_parameter" | "spread_parameter"))
+        .map(|p| {
+            let mut ty = parameter_type(p)?;
+            let mut dimensions = usize::from(p.kind() == "spread_parameter");
+            for child in p
+                .named_children(&mut p.walk())
+                .filter(|c| c.kind() == "dimensions")
+            {
+                dimensions += node_text(content, &child).matches('[').count();
+            }
+            while ty.kind() == "array_type" {
+                dimensions += ty
+                    .child_by_field_name("dimensions")
+                    .map_or(0, |node| node_text(content, &node).matches('[').count());
+                ty = ty.child_by_field_name("element")?;
+            }
+            let name = node_text(content, &ty);
+            names
+                .iter()
+                .any(|variable| variable == name)
+                .then(|| (name.to_owned(), dimensions))
+        })
+        .collect();
+    let result = member
+        .child_by_field_name("type")
+        .filter(|_| {
+            !member
+                .named_children(&mut member.walk())
+                .any(|n| n.kind() == "dimensions")
+        })
+        .and_then(|ty| dependency_method_result_type(ty, content, package, &names, 0));
+    Some(DependencyMethodSignature {
+        variables,
+        parameters,
+        result,
+    })
 }
 
 fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> DependencyMemberType {
@@ -825,6 +941,8 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         contexts: dependency_contexts(member, content, package),
         parameters,
         parameter_variables,
+        method_generic: member.child_by_field_name("type_parameters").is_some(),
+        method_signature: dependency_method_signature(member, content, package),
         is_static: modifier("static"),
         public: modifier("public") || interface_member && !modifier("private"),
         private: modifier("private"),
@@ -3204,6 +3322,42 @@ class Peer { Guarded field; int value=SECRET+secret(); }
         let shadow_array = &declaration.value_types[&("shadowArray".into(), true)][0];
         assert!(shadow_array.parameter_variables[0].is_none());
         assert!(shadow_array.parameters.as_ref().unwrap()[0].is_none());
+    }
+
+    #[test]
+    fn dependency_method_variables_retain_separate_constraints_and_nested_results() {
+        let source = r#"package fixture; class Box<T> {
+            <T extends shared.Child> Box<T> get(T[] values) { return null; }
+            <U extends T> U bound(U value) { return value; }
+            <U extends shared.Child & Runnable> U intersection(U value) { return value; }
+        }"#;
+        let declaration = dependency_import_declaration(source, "fixture.Box", "fixture")
+            .unwrap()
+            .unwrap();
+        let signature = &declaration.value_types[&("get".into(), true)][0];
+        // Existing class metadata retains its safety boundary.
+        assert!(signature.parameter_variables[0].is_none());
+        let method = signature.method_signature.as_ref().unwrap();
+        assert_eq!(method.parameters, vec![Some(("T".into(), 1))]);
+        assert!(
+            matches!(&method.variables[0].1, Some(DependencyResultType::Named(path, _)) if path == "shared.Child")
+        );
+        assert!(
+            matches!(&method.result, Some(DependencyResultType::Named(path, arguments))
+            if path == "Box" && matches!(&arguments[0], Some(DependencyResultType::Parameter { owner, name })
+                if owner == "@method" && name == "T"))
+        );
+        let bound = declaration.value_types[&("bound".into(), true)][0]
+            .method_signature
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(&bound.variables[0].1, Some(DependencyResultType::Parameter { owner, name })
+            if owner == "fixture.Box" && name == "T")
+        );
+        let intersection = &declaration.value_types[&("intersection".into(), true)][0];
+        assert!(intersection.method_generic);
+        assert!(intersection.method_signature.is_none());
     }
 
     #[test]

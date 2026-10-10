@@ -2248,6 +2248,12 @@ struct JavaDependencyValue {
     instance: bool,
 }
 
+struct JavaDependencyInvocation<'a> {
+    arguments: &'a [super::graph::DependencyInvocationArgument],
+    type_arguments: Option<&'a [super::graph::DependencyInvocationArgument]>,
+    imports: &'a [(String, bool)],
+}
+
 impl JavaDependencyValue {
     fn nominal(owner: JavaDependencyType, instance: bool) -> Self {
         Self {
@@ -3085,11 +3091,164 @@ impl JavaDependencyLookup<'_> {
         self.subclass(argument, formal, &mut HashSet::new())
     }
 
+    /// Solve scalar method variables without borrowing enclosing class slots.
+    /// Unknown constraints remain distinct from a proved incompatible call.
+    fn bind_method_variables(
+        &self,
+        owner: &JavaDependencyType,
+        signature: &crate::parsers::treesitter::java::DependencyMemberType,
+        value: &JavaDependencyValue,
+        invocation: &JavaDependencyInvocation<'_>,
+        variable: bool,
+    ) -> Result<(
+        Option<crate::parsers::treesitter::java::DependencyMemberType>,
+        bool,
+    )> {
+        use crate::parsers::treesitter::java::DependencyResultType;
+        let JavaDependencyInvocation {
+            arguments,
+            type_arguments,
+            imports,
+        } = *invocation;
+        if !signature.method_generic {
+            return Ok((Some(signature.clone()), false));
+        }
+        let Some(method) = &signature.method_signature else {
+            return Ok((None, true));
+        };
+        let mut bindings = std::collections::HashMap::<String, String>::new();
+        if let Some(types) = type_arguments {
+            if types.len() != method.variables.len() {
+                return Ok((None, false));
+            }
+            for ((name, _), ty) in method.variables.iter().zip(types) {
+                let Some(ty) = self.invocation_argument(ty, imports)? else {
+                    return Ok((None, true));
+                };
+                // Java witnesses must be reference types.
+                if Self::boxed_type(&ty).is_some() || ty == "null" {
+                    return Ok((None, false));
+                }
+                bindings.insert(name.clone(), ty);
+            }
+        } else {
+            for (index, argument) in arguments.iter().enumerate() {
+                let formal_index = if variable {
+                    index.min(method.parameters.len().saturating_sub(1))
+                } else {
+                    index
+                };
+                let Some(Some((name, dimensions))) = method.parameters.get(formal_index) else {
+                    continue;
+                };
+                let mut dimensions = *dimensions;
+                if variable && formal_index + 1 == method.parameters.len() {
+                    dimensions = dimensions.saturating_sub(1);
+                }
+                let Some(mut ty) = self.invocation_argument(argument, imports)? else {
+                    return Ok((None, true));
+                };
+                if ty == "null" {
+                    continue;
+                }
+                for _ in 0..dimensions {
+                    let Some(element) = ty.strip_suffix("[]") else {
+                        return Ok((None, false));
+                    };
+                    ty = element.to_owned();
+                }
+                if let Some(boxed) = Self::boxed_type(&ty) {
+                    if dimensions > 0 {
+                        return Ok((None, false));
+                    }
+                    ty = boxed.to_owned();
+                }
+                if let Some(prior) = bindings.get(name) {
+                    if self.invocation_conversion(&ty, prior, false)? {
+                        continue;
+                    }
+                    if !self.invocation_conversion(prior, &ty, false)? {
+                        // A nominal Object upper bound cannot invent a member
+                        // of either unrelated argument's declaring owner.
+                        ty = "java.lang.Object".to_owned();
+                    }
+                }
+                bindings.insert(name.clone(), ty);
+            }
+        }
+        fn substitute(
+            ty: &DependencyResultType,
+            bindings: &std::collections::HashMap<String, String>,
+        ) -> Option<DependencyResultType> {
+            match ty {
+                DependencyResultType::Parameter { owner, name } if owner == "@method" => bindings
+                    .get(name)
+                    .map(|name| DependencyResultType::Named(name.clone(), Vec::new())),
+                DependencyResultType::Named(name, arguments) => Some(DependencyResultType::Named(
+                    name.clone(),
+                    arguments
+                        .iter()
+                        .map(|argument| argument.as_ref().and_then(|ty| substitute(ty, bindings)))
+                        .collect(),
+                )),
+                _ => Some(ty.clone()),
+            }
+        }
+        let declaring = self.declaring_value(value, &owner.identity, &mut HashSet::new(), 0)?;
+        let lookup = JavaDependencyLookup {
+            package: &owner.declaration.package,
+            contexts: &signature.contexts,
+            ..*self
+        };
+        for (name, bound) in &method.variables {
+            let bound = if let Some(bound) = bound {
+                let Some(bound) = substitute(bound, &bindings) else {
+                    return Ok((None, true));
+                };
+                let Some(bound) = lookup.result_value(
+                    &bound,
+                    usize::MAX,
+                    &owner.declaration.imports,
+                    declaring.as_ref(),
+                    0,
+                )?
+                else {
+                    return Ok((None, true));
+                };
+                bound.owner.identity
+            } else {
+                "java.lang.Object".to_owned()
+            };
+            if let Some(ty) = bindings.get(name) {
+                if !self.invocation_conversion(ty, &bound, false)? {
+                    return Ok((None, false));
+                }
+            } else {
+                bindings.insert(name.clone(), bound);
+            }
+        }
+        let mut bound = signature.clone();
+        let Some(parameters) = bound.parameters.as_mut() else {
+            return Ok((None, true));
+        };
+        for (index, parameter) in method.parameters.iter().enumerate() {
+            if let Some((name, dimensions)) = parameter {
+                parameters[index] = Some(format!("{}{}", bindings[name], "[]".repeat(*dimensions)));
+            }
+        }
+        bound.result_type = method
+            .result
+            .as_ref()
+            .and_then(|ty| substitute(ty, &bindings));
+        Ok((Some(bound), false))
+    }
+
     fn value_method(
         &self,
         value: &JavaDependencyValue,
         name: &str,
         arguments: &[super::graph::DependencyInvocationArgument],
+        type_arguments: Option<&[super::graph::DependencyInvocationArgument]>,
         imports: &[(String, bool)],
     ) -> Result<
         Option<(
@@ -3098,6 +3257,11 @@ impl JavaDependencyLookup<'_> {
         )>,
     > {
         let mut applicable = Vec::new();
+        let invocation = JavaDependencyInvocation {
+            arguments,
+            type_arguments,
+            imports,
+        };
         let candidates = self.method_candidates(&value.owner, name, false, &mut HashSet::new())?;
         // JLS 15.12.2: fixed strict, fixed loose, then variable arity.
         // A varargs declaration participates in the first phases as an array.
@@ -3140,6 +3304,12 @@ impl JavaDependencyLookup<'_> {
                 if !allowed {
                     continue;
                 }
+                let (bound, unknown) =
+                    self.bind_method_variables(owner, signature, value, &invocation, variable)?;
+                uncertain |= unknown;
+                let Some(signature) = bound.as_ref() else {
+                    continue;
+                };
                 let substitution = if signature.parameter_variables.iter().any(Option::is_some) {
                     self.declaring_value(value, &owner.identity, &mut HashSet::new(), 0)?
                 } else {
@@ -3191,9 +3361,11 @@ impl JavaDependencyLookup<'_> {
             }
         }
         let mut best = Vec::new();
-        for (index, (owner, _, parameters)) in applicable.iter().enumerate() {
+        for (index, (owner, signature, parameters)) in applicable.iter().enumerate() {
             let mut dominated = false;
-            for (other_index, (other, _, other_parameters)) in applicable.iter().enumerate() {
+            for (other_index, (other, other_signature, other_parameters)) in
+                applicable.iter().enumerate()
+            {
                 if index == other_index {
                     continue;
                 }
@@ -3212,6 +3384,7 @@ impl JavaDependencyLookup<'_> {
                 }
                 if more_specific
                     && (other_parameters != parameters
+                        || signature.method_generic && !other_signature.method_generic
                         || other.identity != owner.identity
                             && self.subclass(
                                 &other.identity,
@@ -3550,6 +3723,7 @@ impl JavaDependencyLookup<'_> {
                 name,
                 arity,
                 arguments,
+                type_arguments,
             } => {
                 let member = (name.clone(), arity.is_some());
                 let mut receiver_value = None;
@@ -3581,7 +3755,14 @@ impl JavaDependencyLookup<'_> {
                             {
                                 let value = JavaDependencyValue::nominal(owner.clone(), instance);
                                 found = if let Some(arguments) = arguments {
-                                    self.value_method(&value, name, arguments, imports)?.map(
+                                    self.value_method(
+                                        &value,
+                                        name,
+                                        arguments,
+                                        type_arguments.as_deref(),
+                                        imports,
+                                    )?
+                                    .map(
                                         |(identity, signature)| {
                                             selected_signature = Some(signature);
                                             identity
@@ -3637,12 +3818,17 @@ impl JavaDependencyLookup<'_> {
                         return Ok(value.arguments.get(index).and_then(Clone::clone));
                     }
                     let identity = if let Some(arguments) = arguments {
-                        self.value_method(&value, name, arguments, imports)?.map(
-                            |(identity, signature)| {
-                                selected_signature = Some(signature);
-                                identity
-                            },
-                        )
+                        self.value_method(
+                            &value,
+                            name,
+                            arguments,
+                            type_arguments.as_deref(),
+                            imports,
+                        )?
+                        .map(|(identity, signature)| {
+                            selected_signature = Some(signature);
+                            identity
+                        })
                     } else if value.instance {
                         self.value_member(&value.owner, &member)?
                     } else {
@@ -4172,7 +4358,13 @@ fn count_symbols_used_in_module(
                     let key = (member.name.clone(), member.method);
                     let identity = if let Some(arguments) = &member.arguments {
                         accessing
-                            .value_method(&value, &member.name, arguments, &syntax.imports)?
+                            .value_method(
+                                &value,
+                                &member.name,
+                                arguments,
+                                member.type_arguments.as_deref(),
+                                &syntax.imports,
+                            )?
                             .map(|(identity, _)| identity)
                     } else if value.instance {
                         accessing.value_member(&value.owner, &key)?
@@ -4202,6 +4394,7 @@ fn count_symbols_used_in_module(
                             &JavaDependencyValue::nominal(owner, true),
                             &member.name,
                             arguments,
+                            member.type_arguments.as_deref(),
                             &syntax.imports,
                         )?
                         .map(|(identity, _)| identity)
