@@ -3872,6 +3872,22 @@ pub(crate) fn java_resource_references(
                 reference.namespace = imported.into_iter().next().map(str::to_owned);
             }
         }
+        if let Some(namespace) = &reference.namespace {
+            let owner = format!("{namespace}.R");
+            // Generated R need not be indexed. When an authored/generated
+            // declaration is indexed, its access and members are authoritative;
+            // inaccessible or absent members cannot become resource references.
+            if lookup.raw(&owner)?.is_some()
+                && lookup
+                    .static_member(
+                        &format!("{owner}.{}", reference.resource_type),
+                        &(reference.name.clone(), false),
+                    )?
+                    .is_none()
+            {
+                continue;
+            }
+        }
         output.push(reference);
     }
     Ok(output)

@@ -189,6 +189,8 @@ def readiness(state, bindings, *, policy=None):
             raise AcceptancePending(f'missing, oversized or invalid {policy.LABEL} proof: ' + feature) from None
         samples = expected.get('samples') if isinstance(expected, dict) else None
         criterion = required[feature]
+        if hasattr(policy, 'criterion_for_proof'):
+            criterion = policy.criterion_for_proof(row, criterion)
         if not isinstance(samples, dict) or not samples or not isinstance(expected.get('source'), str) \
                 or len(samples) != criterion['samples_count'] \
                 or stable_id(policy.assertion_keys(samples, criterion)) != criterion['sample_keys_sha256']:

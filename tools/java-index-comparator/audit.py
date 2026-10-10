@@ -114,6 +114,11 @@ import call_hierarchy_contracts
 import parent_acceptance
 import scope_acceptance
 import java_resource_scope_contracts
+import java_resource_definition_contracts
+import java_resource_metadata_contracts
+import resource_acceptance
+
+PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance)
 
 
 SCHEMA = """
@@ -174,7 +179,7 @@ def next_check(state: sqlite3.Connection):
         ORDER BY (feature='outline' OR feature GLOB 'outline:*'),feature,subject LIMIT 1""", parameters).fetchone()
     if check is None:
         return None
-    acceptance = next((policy for policy in (parent_acceptance, scope_acceptance)
+    acceptance = next((policy for policy in PARENT_POLICIES
                        if check['feature'] == policy.FEATURE), None)
     if acceptance is not None:
         child = acceptance.pending_children(state)
@@ -2351,7 +2356,7 @@ class Fixture:
             {(key, canonical_json(value)) for key, value in actual.items()}
 
     def parent_acceptance_check(self, check: sqlite3.Row):
-        policy = scope_acceptance if check['feature'] == scope_acceptance.FEATURE else parent_acceptance
+        policy = next(policy for policy in PARENT_POLICIES if check['feature'] == policy.FEATURE)
         try:
             return policy.exercise(self)
         except parent_acceptance.AcceptancePending as error:
@@ -2364,6 +2369,17 @@ class Fixture:
             self._java_resource_scope_results = java_resource_scope_contracts.exercise(self.binary, self.database.parent)
         expected, actual = (section[check['feature']] for section in self._java_resource_scope_results)
         return {'source': java_resource_scope_contracts.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
+    def java_resource_definition_check(self, check: sqlite3.Row):
+        module = (java_resource_definition_contracts if check['feature'] in java_resource_definition_contracts.FEATURES
+                  else java_resource_metadata_contracts)
+        attribute = '_' + module.__name__ + '_results'
+        if getattr(self, attribute, None) is None:
+            setattr(self, attribute, module.exercise(self.binary, self.database.parent))
+        expected, actual = (section[check['feature']] for section in getattr(self, attribute))
+        return {'source': module.REASON, 'samples': expected}, actual, \
             {(key, canonical_json(value)) for key, value in expected.items()}, \
             {(key, canonical_json(value)) for key, value in actual.items()}
 
@@ -2534,7 +2550,9 @@ class Fixture:
                 handler = self.java_resource_scope_check
             if check['feature'] == 'api':
                 handler = self.api_check
-            if check['feature'] in {parent_acceptance.FEATURE, scope_acceptance.FEATURE}:
+            if check['feature'] in java_resource_definition_contracts.FEATURES | java_resource_metadata_contracts.FEATURES:
+                handler = self.java_resource_definition_check
+            if check['feature'] in {policy.FEATURE for policy in PARENT_POLICIES}:
                 handler = self.parent_acceptance_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
@@ -2568,8 +2586,8 @@ class Fixture:
                     (verdict, canonical_json(expected), canonical_json(actual),
                      canonical_json({"missing": missing, "unexpected": unexpected}), now_ms(), check["id"]),
                 )
-                if check['feature'] in {parent_acceptance.FEATURE, scope_acceptance.FEATURE}:
-                    policy = scope_acceptance if check['feature'] == scope_acceptance.FEATURE else parent_acceptance
+                if check['feature'] in {policy.FEATURE for policy in PARENT_POLICIES}:
+                    policy = next(policy for policy in PARENT_POLICIES if check['feature'] == policy.FEATURE)
                     self.state.execute('UPDATE coverage SET status=?,reason=? WHERE feature=?',
                                        ('implemented' if verdict == 'pass' else 'pending',
                                         policy.REASON, check['feature']))
@@ -2668,6 +2686,8 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(graph_root_contracts.FEATURES)
     features.update(graph_directory_contracts.FEATURES)
     features.update(java_resource_scope_contracts.FEATURES)
+    features.update(java_resource_definition_contracts.FEATURES)
+    features.update(java_resource_metadata_contracts.FEATURES)
     features.update(graph_ambiguity_contracts.FEATURES)
     features.update(call_hierarchy_contracts.FEATURES)
     features.update(graph_mcp_contracts.FEATURES)
@@ -2808,6 +2828,8 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     else:
         android_syntax_contracts.plan_syntax(state, root)
     java_resource_contracts.plan_java_resources(state, root)
+    java_resource_definition_contracts.plan_definitions(state, root)
+    java_resource_metadata_contracts.plan_metadata(state, root)
     vcs_contracts.plan_vcs(state, root)
     rank_contracts.plan_rank(state, root)
     stack_contracts.plan_stacks(state, root)
@@ -2870,6 +2892,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     cache_collision_contracts.plan_cache(state, root)
     parent_acceptance.plan(state, java_only=java_only and root is not None)
     scope_acceptance.plan(state, java_only=java_only and root is not None)
+    resource_acceptance.plan(state, java_only=java_only and root is not None)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

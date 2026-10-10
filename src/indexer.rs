@@ -4509,23 +4509,19 @@ pub fn index_resources(
                         .is_some_and(|suffix| suffix.starts_with('-'))
             };
 
-            // Drawable files
-            if is_folder("drawable") || is_folder("mipmap") {
+            // File resource identity comes from the resource directory, not
+            // its contents. Values files are handled separately below.
+            if let Some(res_type) = ANDROID_RES_SUBDIRS
+                .iter()
+                .find(|kind| **kind != "values" && is_folder(kind))
+            {
                 if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
-                    let res_type = if is_folder("mipmap") {
-                        "mipmap"
+                    let name = if *res_type == "drawable" {
+                        name.strip_suffix(".9").unwrap_or(name)
                     } else {
-                        "drawable"
+                        name
                     };
                     res_stmt.execute(rusqlite::params![module_id, res_type, name, rel_path, 1])?;
-                    resource_count += 1;
-                }
-            }
-
-            // Layout files
-            if is_folder("layout") && rel_path.ends_with(".xml") {
-                if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
-                    res_stmt.execute(rusqlite::params![module_id, "layout", name, rel_path, 1])?;
                     resource_count += 1;
                 }
             }
@@ -4537,19 +4533,61 @@ pub fn index_resources(
                     for tag in android_xml::tags(&visible) {
                         let resource_type = match tag.name {
                             "string" | "color" | "dimen" | "style" | "integer" | "bool"
-                            | "plurals" | "array" => Some(tag.name),
+                            | "attr" | "plurals" | "array" => Some(tag.name),
                             "string-array" | "integer-array" => Some("array"),
                             "item" => tag.attribute("type").map(|value| value.value.as_ref()),
                             _ => None,
                         };
                         if let Some(resource_type) = resource_type {
                             if let Some(name) = tag.attribute("name") {
+                                if resource_type == "attr" && name.value.contains(':') {
+                                    continue;
+                                }
                                 res_stmt.execute(rusqlite::params![
                                     module_id,
                                     resource_type,
                                     name.value.as_ref(),
                                     rel_path,
                                     tag.line as i64
+                                ])?;
+                                resource_count += 1;
+                            }
+                        }
+                    }
+                    // Java R.styleable groups own an array and one index per
+                    // attribute. This associates existing literal metadata;
+                    // the XML reader's syntax/entity contract is unchanged.
+                    static STYLEABLE: LazyLock<Regex> = LazyLock::new(|| {
+                        Regex::new(r"(?s)<declare-styleable\b[^>]*>.*?</declare-styleable\s*>")
+                            .unwrap()
+                    });
+                    for group in STYLEABLE.find_iter(&visible) {
+                        let tags = android_xml::tags(group.as_str());
+                        let Some(name) = tags.first().and_then(|tag| tag.attribute("name")) else {
+                            continue;
+                        };
+                        let line = visible[..group.start()]
+                            .bytes()
+                            .filter(|b| *b == b'\n')
+                            .count() as i64;
+                        res_stmt.execute(rusqlite::params![
+                            module_id,
+                            "styleable",
+                            name.value.as_ref(),
+                            rel_path,
+                            line + 1
+                        ])?;
+                        resource_count += 1;
+                        for tag in tags.iter().skip(1).filter(|tag| tag.name == "attr") {
+                            if let Some(attribute) = tag.attribute("name") {
+                                let index =
+                                    format!("{}_{}", name.value, attribute.value.replace(':', "_"));
+                                res_stmt.execute(rusqlite::params![
+                                    module_id,
+                                    "styleable",
+                                    index,
+                                    rel_path,
+                                    line + tag.line as i64
                                 ])?;
                                 resource_count += 1;
                             }

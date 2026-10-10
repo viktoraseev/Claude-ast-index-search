@@ -95,6 +95,17 @@ class CycleTests(unittest.TestCase):
                 self.assertIn("repair the recorded problem batch or failed verification first", prompt)
                 self.assertNotIn("close one coherent family of pending contracts", prompt)
 
+    def test_deferred_outline_cannot_replace_missing_parent_acceptance(self):
+        summary = {"evidence": "evidence.sqlite", "counts": {"pass": 15353},
+                   "remaining_checks": 205, "deferred_outline_checks": 205,
+                   "unimplemented_features": 5}
+        prompt = cycle.agent_prompt(summary, Path("project"))
+        for instruction in ("Outline runs LAST", "do not select deferred outline checks",
+                            "implement that missing acceptance mechanism",
+                            "actually pending parent from coverage"):
+            self.assertIn(instruction, prompt)
+        self.assertIn("require executed evidence for its acceptance checklist", prompt)
+
     def test_failed_command_keeps_payload_on_disk_not_in_exception(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

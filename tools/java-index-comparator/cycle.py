@@ -136,7 +136,15 @@ def agent_prompt(summary: dict, root: Path) -> str:
         priority = """Round priority: close one coherent family of pending contracts,
 not just one easy command followed by another expensive full audit. Inspect the
 pending list first, group commands sharing an oracle or fixture, and implement
-the related contracts together. Do not trade correctness for a coverage count;
+the related contracts together. Outline runs LAST: while Java coverage parents
+are pending, do not select deferred outline checks as the repair family or
+rerun already-passing outline cases as a substitute for closing a parent.
+If a parent's concrete children already pass but its executed acceptance check
+does not exist, implement that missing acceptance mechanism. The existing
+format/scope parent policies provide bounded, current-edition proof composition;
+they do not automatically establish the other parents' semantics. Select an
+actually pending parent from coverage, not a completed child family.
+Do not trade correctness for a coverage count;
 leave genuinely unresolved contracts pending and explain the remaining gap.
 For each pending parent, derive a finite acceptance checklist from the actual
 commands/options and entity mappings, documented source/CLI contracts and target

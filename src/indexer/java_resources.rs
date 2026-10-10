@@ -9,8 +9,51 @@ use anyhow::Result;
 use regex::Regex;
 use rusqlite::Connection;
 
-/// Read literal namespace values and definite top-level aliases without executing Gradle.
+/// Read source-proven namespace constants without executing Gradle.
 fn namespace_metadata(content: &str) -> Option<Option<String>> {
+    fn constant(
+        tokens: &[&str],
+        start: usize,
+        variables: &HashMap<&str, Option<String>>,
+        depth: usize,
+    ) -> Option<(String, usize)> {
+        if depth >= 16 {
+            return None;
+        }
+        let term = |index: usize| -> Option<(String, usize)> {
+            let token = *tokens.get(index)?;
+            if token == "(" {
+                let (value, end) = constant(tokens, index + 1, variables, depth + 1)?;
+                return (tokens.get(end) == Some(&")")).then_some((value, end + 1));
+            }
+            if token.starts_with(['\'', '"']) {
+                // Escape/interpolation evaluation belongs to the build tool.
+                let value = &token[1..token.len() - 1];
+                if value.contains('\\') || token.starts_with('"') && value.contains('$') {
+                    return None;
+                }
+                return Some((value.to_owned(), index + 1));
+            }
+            Some((variables.get(token)?.as_ref()?.clone(), index + 1))
+        };
+        let (mut value, mut end) = term(start)?;
+        while tokens.get(end) == Some(&"+") {
+            if end - start >= 128 || value.len() > 1024 {
+                return None;
+            }
+            let (suffix, next) = term(end + 1)?;
+            value.push_str(&suffix);
+            end = next;
+        }
+        if value.len() > 1024
+            || tokens
+                .get(end)
+                .is_some_and(|v| matches!(*v, "." | "?" | "[" | "(" | "*" | "-" | "/" | "%"))
+        {
+            return None;
+        }
+        Some((value, end))
+    }
     static TOKENS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r#"(?s)//[^\n]*|/\*.*?\*/|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[A-Za-z_$][\w$]*|[^\s]"#,
@@ -28,7 +71,7 @@ fn namespace_metadata(content: &str) -> Option<Option<String>> {
     let mut depth = 0usize;
     let mut android_depth = None;
     let mut namespaces = Vec::new();
-    let mut variables: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut variables: HashMap<&str, Option<String>> = HashMap::new();
     for (index, token) in tokens.iter().enumerate() {
         match *token {
             "{" => {
@@ -45,42 +88,19 @@ fn namespace_metadata(content: &str) -> Option<Option<String>> {
             }
             "namespace" if android_depth == Some(depth) => {
                 let mut value = index + 1;
-                if tokens.get(value).is_some_and(|v| matches!(*v, "=" | "(")) {
+                if tokens.get(value) == Some(&"=") {
                     value += 1;
                 }
-                let Some(mut token) = tokens.get(value).copied() else {
+                let Some((name, _)) = constant(&tokens, value, &variables, 0) else {
                     return Some(None);
                 };
-                if !token.starts_with(['\'', '"']) {
-                    let Some(Some(literal)) = variables.get(token) else {
-                        return Some(None);
-                    };
-                    token = literal;
-                }
-                if !token.starts_with(['\'', '"']) {
+                if !NAME.is_match(&name) {
                     return Some(None);
                 }
-                let name = &token[1..token.len() - 1];
-                if !NAME.is_match(name) {
-                    return Some(None);
-                }
-                if tokens
-                    .get(value + 1)
-                    .is_some_and(|v| matches!(*v, "+" | "." | "?" | "["))
-                {
-                    return Some(None);
-                }
-                namespaces.push(name.to_owned());
+                namespaces.push(name);
             }
             name if depth == 0 && tokens.get(index + 1) == Some(&"=") => {
-                let literal = tokens.get(index + 2).copied().filter(|value| {
-                    value.starts_with(['\'', '"'])
-                        && value.len() > 2
-                        && NAME.is_match(&value[1..value.len() - 1])
-                        && !tokens
-                            .get(index + 3)
-                            .is_some_and(|v| matches!(*v, "+" | "." | "?" | "["))
-                });
+                let literal = constant(&tokens, index + 2, &variables, 0).map(|(value, _)| value);
                 // Reassignment or unknown expressions cannot establish a
                 // namespace. Do not run Gradle to guess their values.
                 variables
