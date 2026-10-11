@@ -10,13 +10,17 @@ import json
 from pathlib import Path
 import sys
 
-from audit import Unsupported, location_keys
+from audit import JAVA_EXCLUDED_FEATURES, Unsupported, location_keys
 from common import ToolError, canonical_json, connect
 
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS equivalence_metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS equivalence_issues(
+ category TEXT NOT NULL,case_id TEXT NOT NULL,detail_json TEXT NOT NULL,
+ PRIMARY KEY(category,case_id)
+);
+CREATE TABLE IF NOT EXISTS equivalence_exclusions(
  category TEXT NOT NULL,case_id TEXT NOT NULL,detail_json TEXT NOT NULL,
  PRIMARY KEY(category,case_id)
 );
@@ -44,11 +48,23 @@ def compare(reference_path, evidence_path, output_path):
         report.executescript(SCHEMA)
         with report:
             report.execute('DELETE FROM equivalence_issues')
+            report.execute('DELETE FROM equivalence_exclusions')
             report.execute("INSERT OR REPLACE INTO equivalence_metadata VALUES ('status','running')")
 
         def issue(category, identity, detail=None):
             report.execute('INSERT OR REPLACE INTO equivalence_issues VALUES (?,?,?)',
                            (category, identity, canonical_json(detail or {})))
+
+        # Only the existing explicit Java-only policy can exclude a baseline
+        # contract. Keep excluded IDs/verdicts in the report; never call them
+        # passing, and never exempt arbitrary reclassified Java functionality.
+        excluded = set()
+        if before.get('audit_scope') == after.get('audit_scope') == 'java':
+            excluded = JAVA_EXCLUDED_FEATURES & {row[0] for row in current.execute(
+                "SELECT feature FROM coverage WHERE status='out-of-scope'")}
+        excluded_parameters = tuple(sorted(excluded))
+        scope = ('feature NOT IN (' + ','.join('?' for _ in excluded_parameters) + ')'
+                 if excluded_parameters else '1')
 
         # The Java driver deliberately leaves outline unobserved while another
         # coverage family is pending. Such a baseline still defines case IDs,
@@ -61,12 +77,25 @@ def compare(reference_path, evidence_path, output_path):
                   AND (status!='complete' OR verdict IS NOT 'pass') LIMIT 1""").fetchone() is None)
         implemented_outline = {row[0] for row in reference.execute("""SELECT feature FROM coverage
             WHERE status='implemented' AND (feature='outline' OR feature GLOB 'outline:*')""")}
-        originals, present, deferred_outlines = 0, 0, 0
+        originals, present, deferred_outlines, excluded_originals = 0, 0, 0, 0
         for row in current.execute('''SELECT r.id,r.feature,r.subject,r.status AS prior_status,r.verdict AS prior_verdict,
             r.expected_json IS NULL AS unobserved_expected,r.actual_json IS NULL AS unobserved_actual,
             c.id AS current_id,c.feature AS current_feature,c.subject AS current_subject,c.status,c.verdict
             FROM reference.checks r LEFT JOIN main.checks c ON c.id=r.id ORDER BY r.id'''):
             originals += 1
+            if row['current_id'] is not None:
+                present += 1
+                if row['feature'] != row['current_feature'] or row['subject'] != row['current_subject']:
+                    issue('changed_case_contract', row['id'])
+            if row['feature'] in excluded:
+                excluded_originals += 1
+                report.execute('INSERT INTO equivalence_exclusions VALUES (?,?,?)', (
+                    'java_out_of_scope', row['id'], canonical_json({
+                        'feature': row['feature'], 'prior_status': row['prior_status'],
+                        'prior_verdict': row['prior_verdict'], 'current_status': row['status']})))
+                if originals % 250 == 0:
+                    report.commit()
+                continue
             deferred = (deferred_outline_baseline and row['feature'] in implemented_outline
                         and row['prior_status'] == 'pending' and row['prior_verdict'] is None
                         and row['unobserved_expected'] and row['unobserved_actual'])
@@ -76,9 +105,6 @@ def compare(reference_path, evidence_path, output_path):
             if row['current_id'] is None:
                 issue('missing_case', row['id'])
                 continue
-            present += 1
-            if row['feature'] != row['current_feature'] or row['subject'] != row['current_subject']:
-                issue('changed_case_contract', row['id'])
             if row['status'] != 'complete':
                 issue('unfinished_case', row['id'])
             elif row['verdict'] in {'unsupported', 'error'}:
@@ -91,7 +117,7 @@ def compare(reference_path, evidence_path, output_path):
                 report.commit()
         for row in current.execute('''SELECT r.feature,c.status FROM reference.coverage r
             LEFT JOIN main.coverage c ON c.feature=r.feature WHERE r.status='implemented' '''):
-            if row['status'] != 'implemented':
+            if row['status'] != 'implemented' and row['feature'] not in excluded:
                 issue('reduced_feature_coverage', row['feature'])
 
         text_cases = 0
@@ -114,14 +140,20 @@ def compare(reference_path, evidence_path, output_path):
             if text_cases % 100 == 0:
                 report.commit()
         problems = dict(report.execute('SELECT category,count(*) FROM equivalence_issues GROUP BY category'))
-        remaining = current.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0]
+        remaining = current.execute(f"SELECT count(*) FROM checks WHERE status!='complete' AND {scope}",
+                                    excluded_parameters).fetchone()[0]
         result = {'original_cases': originals, 'present_cases': present,
+                  'in_scope_original_cases': originals - excluded_originals,
+                  'excluded_reference_cases': excluded_originals,
+                  'current_excluded_cases': current.execute(f'SELECT count(*) FROM checks WHERE NOT ({scope})',
+                                                            excluded_parameters).fetchone()[0],
                   'deferred_reference_outline_cases': deferred_outlines,
                   'additional_cases': current.execute('''SELECT count(*) FROM main.checks c
                     LEFT JOIN reference.checks r ON r.id=c.id WHERE r.id IS NULL''').fetchone()[0],
                   'text_truth_cases': text_cases, 'issues': problems, 'remaining_checks': remaining,
+                  'total_remaining_checks': current.execute("SELECT count(*) FROM checks WHERE status!='complete'").fetchone()[0],
                   'pending_features_after': current.execute("SELECT count(*) FROM coverage WHERE status='pending'").fetchone()[0],
-                  'verified': bool(originals) and not problems and not remaining}
+                  'verified': bool(originals - excluded_originals) and not problems and not remaining}
         with report:
             report.execute("INSERT OR REPLACE INTO equivalence_metadata VALUES ('result',?)", (canonical_json(result),))
             report.execute("INSERT OR REPLACE INTO equivalence_metadata VALUES ('status','complete')")

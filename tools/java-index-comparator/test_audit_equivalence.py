@@ -133,6 +133,95 @@ class AuditEquivalenceTests(unittest.TestCase):
         state.close()
         self.assertEqual(self.result()['issues'], {'incomplete_reference': 1})
 
+    def java_exclusion_pair(self, feature='xml-usages:syntax'):
+        for path, original in ((self.original, True), (self.optimized, False)):
+            state = connect(path)
+            with state:
+                state.execute("INSERT OR REPLACE INTO metadata VALUES ('audit_scope','java')")
+                state.execute('INSERT INTO coverage VALUES (?,?,?)',
+                              (feature, 'implemented' if original else 'out-of-scope',
+                               'explicit Java scope'))
+                if original:
+                    state.execute("INSERT INTO checks(id,feature,subject,status,verdict) "
+                                  "VALUES ('foreign-case',?,'fixture','complete','pass')", (feature,))
+            state.close()
+
+    def test_explicit_java_exclusions_are_reported_not_passed_or_lost(self):
+        self.java_exclusion_pair()
+        self.mutate("INSERT INTO coverage VALUES ('unused-deps:android-ownership','out-of-scope','legacy XML')")
+        self.mutate("INSERT INTO checks(id,feature,subject,status) "
+                    "VALUES ('legacy-case','unused-deps:android-ownership','fixture','pending')")
+        result = self.result()
+        self.assertTrue(result['verified'], result['issues'])
+        self.assertEqual(result['original_cases'], 2)
+        self.assertEqual(result['in_scope_original_cases'], 1)
+        self.assertEqual(result['present_cases'], 1)
+        self.assertEqual(result['excluded_reference_cases'], 1)
+        self.assertEqual(result['current_excluded_cases'], 1)
+        self.assertEqual(result['remaining_checks'], 0)
+        self.assertEqual(result['total_remaining_checks'], 1)
+        state = connect(self.report, read_only=True)
+        try:
+            row = state.execute('SELECT category,case_id,detail_json FROM equivalence_exclusions').fetchone()
+            self.assertEqual(tuple(row)[:2], ('java_out_of_scope', 'foreign-case'))
+            self.assertIn('xml-usages:syntax', row['detail_json'])
+        finally:
+            state.close()
+
+    def test_java_exclusion_requires_explicit_current_coverage(self):
+        self.java_exclusion_pair()
+        self.mutate("DELETE FROM coverage WHERE feature='xml-usages:syntax'")
+        result = self.result()
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['excluded_reference_cases'], 0)
+        self.assertEqual(result['issues'], {'missing_case': 1, 'reduced_feature_coverage': 1})
+
+    def test_java_applicable_checks_cannot_be_reclassified_outside_scope(self):
+        self.java_exclusion_pair(feature='unused-deps:java-source-results')
+        self.assertEqual(self.result()['issues'], {'missing_case': 1, 'reduced_feature_coverage': 1})
+
+    def test_foreign_case_exclusion_requires_matching_java_audit_scope(self):
+        self.java_exclusion_pair()
+        self.mutate("UPDATE metadata SET value='all' WHERE key='audit_scope'")
+        self.assertEqual(self.result()['issues'], {'missing_case': 1, 'reduced_feature_coverage': 1})
+
+    def test_scope_exclusions_do_not_hide_unfinished_java_checks(self):
+        self.java_exclusion_pair()
+        self.mutate("UPDATE checks SET status='pending',verdict=NULL WHERE id='case'")
+        result = self.result()
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['issues'], {'unfinished_case': 1})
+        self.assertEqual(result['remaining_checks'], 1)
+
+    def test_excluded_case_id_cannot_be_reused_for_a_java_contract(self):
+        self.java_exclusion_pair()
+        self.mutate("INSERT INTO checks(id,feature,subject,status,verdict) "
+                    "VALUES ('foreign-case','search:content','fixture','complete','pass')")
+        result = self.result()
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['issues'], {'changed_case_contract': 1})
+
+    def test_arbitrary_pending_java_feature_is_not_hidden_by_out_of_scope(self):
+        self.java_exclusion_pair()
+        self.mutate("INSERT INTO coverage VALUES ('java-required','out-of-scope','invalid dismissal')")
+        self.mutate("INSERT INTO checks(id,feature,subject,status) "
+                    "VALUES ('java-pending','java-required','fixture','pending')")
+        result = self.result()
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['remaining_checks'], 1)
+        self.assertEqual(result['current_excluded_cases'], 0)
+
+    def test_excluded_only_reference_is_not_positive_java_evidence(self):
+        self.java_exclusion_pair()
+        for path in (self.original, self.optimized):
+            state = connect(path)
+            with state:
+                state.execute("DELETE FROM checks WHERE id='case'")
+            state.close()
+        result = self.result()
+        self.assertFalse(result['verified'])
+        self.assertEqual(result['in_scope_original_cases'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()
