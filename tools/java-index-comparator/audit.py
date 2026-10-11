@@ -131,6 +131,7 @@ import graph_acceptance
 import unused_acceptance
 import java_common_bound_contracts
 import java_dependency_gap_contracts
+import java_classpath_contracts
 import graph_overload_contracts
 
 PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance, call_tree_acceptance, graph_acceptance, explore_acceptance, unused_acceptance)
@@ -2412,8 +2413,8 @@ class Fixture:
             raise Unsupported(str(error)) from error
 
     def unused_semantic_source_check(self, check: sqlite3.Row):
-        module = (java_common_bound_contracts if check['feature'] in java_common_bound_contracts.FEATURES
-                  else java_dependency_gap_contracts)
+        module = next(module for module in (java_common_bound_contracts, java_dependency_gap_contracts,
+                                            java_classpath_contracts) if check['feature'] in module.FEATURES)
         expected, actual = module.exercise(self.binary, self.database.parent)
         return {'source': module.REASON, 'samples': expected}, actual, \
             {(key, canonical_json(value)) for key, value in expected.items()}, \
@@ -2638,7 +2639,7 @@ class Fixture:
                 handler = self.parent_acceptance_check
             if check['feature'] in explore_freshness_contracts.FEATURES | explore_result_contracts.FEATURES:
                 handler = self.explore_semantic_source_check
-            if check['feature'] in java_common_bound_contracts.FEATURES | java_dependency_gap_contracts.FEATURES:
+            if check['feature'] in java_common_bound_contracts.FEATURES | java_dependency_gap_contracts.FEATURES | java_classpath_contracts.FEATURES:
                 handler = self.unused_semantic_source_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
@@ -2787,6 +2788,7 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(graph_overload_contracts.FEATURES)
     features.update(explore_freshness_contracts.FEATURES | explore_result_contracts.FEATURES)
     features.update(java_common_bound_contracts.FEATURES | java_dependency_gap_contracts.FEATURES)
+    features.update(java_classpath_contracts.FEATURES)
     return features
 
 
@@ -3004,6 +3006,7 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     explore_acceptance.plan(state, java_only=java_only and root is not None)
     java_common_bound_contracts.plan_contracts(state, root)
     java_dependency_gap_contracts.plan_contracts(state, root)
+    java_classpath_contracts.plan_contracts(state, root)
     unused_acceptance.plan(state, java_only=java_only and root is not None)
 
 

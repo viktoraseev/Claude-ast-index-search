@@ -43,6 +43,10 @@ class UnusedParentPlanningTests(unittest.TestCase):
                 required = {item['feature'] for item in acceptance.specification()['criteria']}
                 self.assertEqual(required, acceptance.required_acceptance_features())
                 self.assertIn('unused-deps:java-retained-inference', required)
+                self.assertIn('unused-deps:java-source-classpath-ambiguity', required)
+                decision = next(item for item in spec.API_DECISIONS
+                                if item['id'] == 'duplicate-source-classpath-order')
+                self.assertEqual(decision['criterion'], 'unused-deps:java-source-classpath-ambiguity')
                 self.assertNotIn('unused-deps:android-ownership', required)
                 self.assertNotIn('resource-usages:xml-syntax', required)
             finally:

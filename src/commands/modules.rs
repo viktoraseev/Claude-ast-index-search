@@ -2199,6 +2199,34 @@ impl UsedDependencySymbols {
     }
 }
 
+/// Select a source owner without inventing a compiler classpath order.
+fn java_dependency_source(
+    conn: &Connection,
+    qualified: &str,
+) -> Result<Option<(i64, String, String)>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT DISTINCT f.id,f.path,f.root_path,scope.is_consumer
+         FROM symbols s JOIN files f ON s.file_id=f.id
+         JOIN temp.java_dependency_scope scope ON scope.file_id=f.id
+         WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
+         AND s.kind IN ('class','interface','enum')
+         ORDER BY scope.is_consumer DESC,f.path,f.root_path LIMIT 2",
+    )?;
+    let mut rows = statement.query(params![qualified])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let source = (row.get(0)?, row.get(1)?, row.get(2)?);
+    let is_consumer: bool = row.get(3)?;
+    if let Some(next) = rows.next()? {
+        anyhow::ensure!(
+            is_consumer != next.get::<_, bool>(3)?,
+            "ambiguous Java source classpath type '{qualified}': multiple source owners at the same precedence; dependency order is not specified"
+        );
+    }
+    Ok(Some(source))
+}
+
 /// Check accessible import declarations with one bounded source tree at a time.
 fn java_dependency_declaration(
     conn: &Connection,
@@ -2207,17 +2235,7 @@ fn java_dependency_declaration(
     qualified: &str,
     accessing_package: &str,
 ) -> Result<Option<crate::parsers::treesitter::java::DependencyImportDeclaration>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT DISTINCT f.path,f.root_path FROM symbols s JOIN files f ON s.file_id=f.id
-         JOIN temp.java_dependency_scope scope ON scope.file_id=f.id
-         WHERE substr(f.path,-5)='.java' AND s.qualified_name=?1
-         AND s.kind IN ('class','interface','enum')
-         ORDER BY scope.is_consumer DESC,f.path,f.root_path LIMIT 1",
-    )?;
-    let mut rows = statement.query(params![qualified])?;
-    if let Some(row) = rows.next()? {
-        let path: String = row.get(0)?;
-        let owner: String = row.get(1)?;
+    if let Some((_, path, owner)) = java_dependency_source(conn, qualified)? {
         let content = super::grep::read_java_syntax_source(
             &root.join(resolver.resolve_with_root_raw(&path, Some(&owner))),
             crate::indexer::max_file_size_bytes(),
@@ -2252,12 +2270,19 @@ struct JavaDependencyValue {
     capture_rank: Option<usize>,
     /// Retained only for invocation containment when projecting source parents.
     capture_lower: Option<String>,
+    intersection: Vec<JavaDependencyValue>,
 }
 
 struct JavaDependencyInvocation<'a> {
     arguments: &'a [super::graph::DependencyInvocationArgument],
     type_arguments: Option<&'a [super::graph::DependencyInvocationArgument]>,
     imports: &'a [(String, bool)],
+    target: Option<&'a str>,
+}
+
+/// Invocation-local capture identity; only its upper bound permits reads.
+fn java_capture_bound(ty: &str) -> Option<&str> {
+    ty.strip_prefix("@capture:")?.splitn(3, ':').nth(2)
 }
 
 /// Split only complete, bounded generic signatures; uncertainty is not erasure.
@@ -2343,12 +2368,13 @@ impl JavaDependencyValue {
             array_dimensions: 0,
             capture_rank: None,
             capture_lower: None,
+            intersection: Vec::new(),
         }
     }
 
     fn signature(&self) -> String {
         format!(
-            "{}<{}>{}{:?}{:?}",
+            "{}<{}>{}{:?}{:?}{:?}",
             self.owner.identity,
             self.arguments
                 .iter()
@@ -2362,6 +2388,10 @@ impl JavaDependencyValue {
             "[]".repeat(self.array_dimensions),
             self.capture_rank,
             self.capture_lower,
+            self.intersection
+                .iter()
+                .map(Self::signature)
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -2395,6 +2425,15 @@ impl JavaDependencyValue {
     }
 
     fn invocation_type(&self) -> Option<String> {
+        if !self.intersection.is_empty() {
+            let mut primary = self.clone();
+            primary.intersection.clear();
+            let mut bounds = vec![primary.invocation_type()?];
+            for bound in &self.intersection {
+                bounds.push(bound.invocation_type()?);
+            }
+            return Some(bounds.join(" & "));
+        }
         if self.capture_rank.is_some() {
             return None;
         }
@@ -2481,7 +2520,7 @@ impl JavaDependencyLookup<'_> {
             return Ok(Some("java.lang.Object".to_owned()));
         }
         let mut ancestors = HashSet::new();
-        let mut pending = vec![left.to_owned()];
+        let mut pending: Vec<_> = left.split(" & ").map(str::to_owned).collect();
         while let Some(name) = pending.pop() {
             if !ancestors.insert(name.clone()) {
                 continue;
@@ -2499,7 +2538,7 @@ impl JavaDependencyLookup<'_> {
         }
         let mut common = Vec::new();
         for ancestor in ancestors {
-            if self.subclass(right, &ancestor, &mut HashSet::new())? {
+            if self.invocation_conversion(right, &ancestor, false)? {
                 common.push(ancestor);
             }
         }
@@ -2531,7 +2570,18 @@ impl JavaDependencyLookup<'_> {
                     Some(candidate)
                 }
             }
-            _ => None,
+            _ => {
+                for candidate in &most_specific {
+                    if self
+                        .raw(candidate)?
+                        .is_some_and(|owner| !owner.declaration.type_parameters.is_empty())
+                    {
+                        return Ok(None);
+                    }
+                }
+                most_specific.sort();
+                Some(most_specific.join(" & "))
+            }
         })
     }
 
@@ -3096,6 +3146,21 @@ impl JavaDependencyLookup<'_> {
         if depth >= 16 {
             return Ok(None);
         }
+        if java_capture_bound(ty).is_some() {
+            return Ok(Some(ty.to_owned()));
+        }
+        if ty.contains(" & ") {
+            let mut bounds = Vec::new();
+            for bound in ty.split(" & ") {
+                let Some(bound) =
+                    self.invocation_identity_depth(bound, position, imports, depth + 1)?
+                else {
+                    return Ok(None);
+                };
+                bounds.push(bound);
+            }
+            return Ok(Some(bounds.join(" & ")));
+        }
         let ty = ty.replace("::", ".");
         let ty = ty.trim();
         if ty == "?" {
@@ -3324,7 +3389,8 @@ impl JavaDependencyLookup<'_> {
             let upper = if argument == "?" || argument.starts_with("? super ") {
                 "java.lang.Object"
             } else {
-                argument.strip_prefix("? extends ").unwrap_or(argument)
+                java_capture_bound(argument)
+                    .unwrap_or_else(|| argument.strip_prefix("? extends ").unwrap_or(argument))
             };
             return self.invocation_conversion(upper, bound, false);
         }
@@ -3345,6 +3411,28 @@ impl JavaDependencyLookup<'_> {
     fn invocation_conversion(&self, argument: &str, formal: &str, loose: bool) -> Result<bool> {
         if argument == formal {
             return Ok(true);
+        }
+        if formal.contains(" & ") {
+            for bound in formal.split(" & ") {
+                if !self.invocation_conversion(argument, bound, loose)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        if argument.contains(" & ") {
+            for bound in argument.split(" & ") {
+                if self.invocation_conversion(bound, formal, loose)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        if java_capture_bound(formal).is_some() {
+            return Ok(argument == "null");
+        }
+        if let Some(bound) = java_capture_bound(argument) {
+            return self.invocation_conversion(bound, formal, loose);
         }
         let primitive = |ty| {
             matches!(
@@ -3410,7 +3498,12 @@ impl JavaDependencyLookup<'_> {
                 return Ok(false);
             };
             if arguments.len() != formals.len() {
-                return Ok(false);
+                // A source raw type can undergo unchecked invocation conversion.
+                // A parameterized incompatible slot must never use this path.
+                return Ok(arguments.is_empty()
+                    && self.raw(name)?.is_some_and(|owner| {
+                        owner.declaration.type_parameters.len() == formals.len()
+                    }));
             }
             for (argument, formal) in arguments.iter().zip(formals) {
                 if !self.invocation_slot_contained(argument, formal)? {
@@ -3502,7 +3595,8 @@ impl JavaDependencyLookup<'_> {
                 let argument = if argument == "?" || argument.starts_with("? super ") {
                     "java.lang.Object"
                 } else {
-                    argument.strip_prefix("? extends ").unwrap_or(argument)
+                    java_capture_bound(argument)
+                        .unwrap_or_else(|| argument.strip_prefix("? extends ").unwrap_or(argument))
                 };
                 self.infer_method_parameter(
                     bound,
@@ -3514,7 +3608,10 @@ impl JavaDependencyLookup<'_> {
                 )
             }
             DependencyResultType::LowerBound(bound) => {
-                if argument == "?" || argument.starts_with("? extends ") {
+                if argument == "?"
+                    || argument.starts_with("? extends ")
+                    || java_capture_bound(argument).is_some()
+                {
                     return Ok((false, false));
                 }
                 // ? super T gives an upper constraint on T. It must not widen
@@ -3553,6 +3650,11 @@ impl JavaDependencyLookup<'_> {
                 }
                 let mut ty = Self::boxed_type(argument).unwrap_or(argument).to_owned();
                 if let Some(prior) = bindings.get(name) {
+                    if (java_capture_bound(prior).is_some() || java_capture_bound(&ty).is_some())
+                        && prior != &ty
+                    {
+                        return Ok((false, false));
+                    }
                     if self.invocation_conversion(&ty, prior, false)? {
                         return Ok((true, false));
                     }
@@ -3618,11 +3720,16 @@ impl JavaDependencyLookup<'_> {
             arguments,
             type_arguments,
             imports,
+            target,
         } = *invocation;
         if !signature.method_generic {
             return Ok((Some(signature.clone()), false));
         }
-        let Some(method) = &signature.method_signature else {
+        let Some(method) = signature
+            .method_signature
+            .as_ref()
+            .or(signature.intersection_signature.as_ref())
+        else {
             return Ok((None, true));
         };
         let declaring = self.declaring_value(value, &owner.identity, &mut HashSet::new(), 0)?;
@@ -3717,6 +3824,18 @@ impl JavaDependencyLookup<'_> {
                 _ => Some(ty.clone()),
             }
         }
+        // A poly invocation with an otherwise unconstrained result variable
+        // inherits the enclosing candidate's formal target. Receiver chains
+        // without an invocation context never acquire this constraint.
+        if type_arguments.is_none() {
+            if let (Some(target), Some(DependencyResultType::Parameter { owner, name })) =
+                (target, &method.result)
+            {
+                if owner == "@method" && !bindings.contains_key(name) {
+                    bindings.insert(name.clone(), target.to_owned());
+                }
+            }
+        }
         for (name, bound) in &method.variables {
             let mut bound = if let Some(bound) = bound {
                 let Some(bound) = substitute(bound, &bindings) else {
@@ -3757,6 +3876,28 @@ impl JavaDependencyLookup<'_> {
                 }
             } else {
                 bindings.insert(name.clone(), bound);
+            }
+        }
+        for (name, bounds) in &method.intersection_bounds {
+            let Some(actual) = bindings.get(name) else {
+                return Ok((None, true));
+            };
+            for bound in bounds {
+                let Some(bound) = substitute(bound, &bindings) else {
+                    return Ok((None, true));
+                };
+                let Some(bound) = lookup.signature_identity(
+                    &bound,
+                    &owner.declaration.imports,
+                    declaring.as_ref(),
+                    0,
+                )?
+                else {
+                    return Ok((None, true));
+                };
+                if !self.invocation_conversion(actual, &bound, false)? {
+                    return Ok((None, false));
+                }
             }
         }
         let mut bound = signature.clone();
@@ -3808,6 +3949,28 @@ impl JavaDependencyLookup<'_> {
             crate::parsers::treesitter::java::DependencyMemberType,
         )>,
     > {
+        self.value_method_target(value, name, arguments, type_arguments, imports, None, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn value_method_target(
+        &self,
+        value: &JavaDependencyValue,
+        name: &str,
+        arguments: &[super::graph::DependencyInvocationArgument],
+        type_arguments: Option<&[super::graph::DependencyInvocationArgument]>,
+        imports: &[(String, bool)],
+        target: Option<&str>,
+        depth: usize,
+    ) -> Result<
+        Option<(
+            String,
+            crate::parsers::treesitter::java::DependencyMemberType,
+        )>,
+    > {
+        if depth >= 16 {
+            return Ok(None);
+        }
         if value.array_dimensions != 0 {
             return Ok(None);
         }
@@ -3816,8 +3979,22 @@ impl JavaDependencyLookup<'_> {
             arguments,
             type_arguments,
             imports,
+            target,
         };
-        let candidates = self.method_candidates(&value.owner, name, false, &mut HashSet::new())?;
+        let mut candidates =
+            self.method_candidates(&value.owner, name, false, &mut HashSet::new())?;
+        for bound in &value.intersection {
+            for candidate in
+                self.method_candidates(&bound.owner, name, false, &mut HashSet::new())?
+            {
+                if !candidates.iter().any(|(owner, signature)| {
+                    owner.identity == candidate.0.identity
+                        && signature.position == candidate.1.position
+                }) {
+                    candidates.push(candidate);
+                }
+            }
+        }
         // JLS 15.12.2: fixed strict, fixed loose, then variable arity.
         // A varargs declaration participates in the first phases as an array.
         for (loose, variable) in [(false, false), (true, false), (true, true)] {
@@ -3893,7 +4070,12 @@ impl JavaDependencyLookup<'_> {
                 let mut compatible = true;
                 let mut unknown = false;
                 for (argument, formal) in arguments.iter().zip(&parameters) {
-                    match self.invocation_argument(argument, imports)? {
+                    match self.invocation_argument_target(
+                        argument,
+                        imports,
+                        Some(formal),
+                        depth + 1,
+                    )? {
                         Some(argument) => {
                             // An unsupported source-parent projection must not
                             // make an unrelated overload appear uniquely valid.
@@ -3988,14 +4170,59 @@ impl JavaDependencyLookup<'_> {
         argument: &super::graph::DependencyInvocationArgument,
         imports: &[(String, bool)],
     ) -> Result<Option<String>> {
+        self.invocation_argument_target(argument, imports, None, 0)
+    }
+
+    fn invocation_argument_target(
+        &self,
+        argument: &super::graph::DependencyInvocationArgument,
+        imports: &[(String, bool)],
+        target: Option<&str>,
+        depth: usize,
+    ) -> Result<Option<String>> {
+        if depth >= 16 {
+            return Ok(None);
+        }
+        let lookup = JavaDependencyLookup {
+            contexts: &argument.contexts,
+            ..*self
+        };
+        if let Some(receiver) = &argument.receiver {
+            return Ok(lookup
+                .value_receiver_target(
+                    receiver,
+                    imports,
+                    &mut Default::default(),
+                    depth + 1,
+                    target,
+                )?
+                .and_then(|value| value.invocation_type()));
+        }
         let Some(ty) = &argument.ty else {
             return Ok(None);
         };
-        JavaDependencyLookup {
-            contexts: &argument.contexts,
-            ..*self
+        let Some(ty) = lookup.invocation_identity(ty, argument.position, imports)? else {
+            return Ok(None);
+        };
+        // Capture each top-level wildcard once for this expression occurrence.
+        // Repeating an identically spelled argument creates a different capture.
+        if let Some((name, slots)) = java_generic_parts(&ty) {
+            let slots: Vec<_> = slots
+                .iter()
+                .enumerate()
+                .map(|(index, slot)| {
+                    let bound = slot
+                        .strip_prefix("? extends ")
+                        .or_else(|| (*slot == "?").then_some("java.lang.Object"));
+                    bound.map_or_else(
+                        || (*slot).to_owned(),
+                        |bound| format!("@capture:{}:{index}:{bound}", argument.occurrence),
+                    )
+                })
+                .collect();
+            return Ok(Some(format!("{name}<{}>", slots.join(","))));
         }
-        .invocation_identity(ty, argument.position, imports)
+        Ok(Some(ty))
     }
 
     /// Instantiate source-declared parameters and bounded known JDK result types.
@@ -4235,6 +4462,41 @@ impl JavaDependencyLookup<'_> {
                 )
             }
             DependencyResultType::Named(path, arguments) => {
+                if arguments.is_empty() {
+                    if let Some(bound) = java_capture_bound(path) {
+                        let Some(signature) = java_invocation_signature(bound, 0) else {
+                            return Ok(None);
+                        };
+                        return Ok(self
+                            .result_value(&signature, position, imports, substitution, depth + 1)?
+                            .map(|mut value| {
+                                value.capture_rank = Some(value.array_dimensions);
+                                value
+                            }));
+                    }
+                    if path.contains(" & ") {
+                        let mut values = Vec::new();
+                        for bound in path.split(" & ") {
+                            let Some(signature) = java_invocation_signature(bound, 0) else {
+                                return Ok(None);
+                            };
+                            let Some(value) = self.result_value(
+                                &signature,
+                                position,
+                                imports,
+                                substitution,
+                                depth + 1,
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            values.push(value);
+                        }
+                        let mut value = values.remove(0);
+                        value.intersection = values;
+                        return Ok(Some(value));
+                    }
+                }
                 if arguments.is_empty() && Self::boxed_type(path).is_some() {
                     // Scalar primitive results may be array indexes. They
                     // remain platform values and never project declarations.
@@ -4275,6 +4537,7 @@ impl JavaDependencyLookup<'_> {
                     array_dimensions: 0,
                     capture_rank: None,
                     capture_lower: None,
+                    intersection: Vec::new(),
                 }))
             }
         }
@@ -4352,6 +4615,17 @@ impl JavaDependencyLookup<'_> {
         imports: &[(String, bool)],
         identities: &mut std::collections::BTreeSet<String>,
         depth: usize,
+    ) -> Result<Option<JavaDependencyValue>> {
+        self.value_receiver_target(receiver, imports, identities, depth, None)
+    }
+
+    fn value_receiver_target(
+        &self,
+        receiver: &super::graph::DependencyValueReceiver,
+        imports: &[(String, bool)],
+        identities: &mut std::collections::BTreeSet<String>,
+        depth: usize,
+        target: Option<&str>,
     ) -> Result<Option<JavaDependencyValue>> {
         use super::graph::DependencyValueReceiver;
         if depth >= 16 {
@@ -4480,12 +4754,14 @@ impl JavaDependencyLookup<'_> {
                             {
                                 let value = JavaDependencyValue::nominal(owner.clone(), instance);
                                 found = if let Some(arguments) = arguments {
-                                    self.value_method(
+                                    self.value_method_target(
                                         &value,
                                         name,
                                         arguments,
                                         type_arguments.as_deref(),
                                         imports,
+                                        target,
+                                        depth + 1,
                                     )?
                                     .map(
                                         |(identity, signature)| {
@@ -4546,12 +4822,14 @@ impl JavaDependencyLookup<'_> {
                         return Ok(value.arguments.get(index).and_then(Clone::clone));
                     }
                     let identity = if let Some(arguments) = arguments {
-                        self.value_method(
+                        self.value_method_target(
                             &value,
                             name,
                             arguments,
                             type_arguments.as_deref(),
                             imports,
+                            target,
+                            depth + 1,
                         )?
                         .map(|(identity, signature)| {
                             selected_signature = Some(signature);
@@ -4872,11 +5150,7 @@ fn count_symbols_used_in_module(
         "SELECT DISTINCT s.name FROM symbols s JOIN files f ON s.file_id=f.id
          WHERE {MODULE_FILE_SCOPE} AND (?3='' OR f.root_path=?3) AND substr(f.path,-5)='.java' AND s.qualified_name=?2
          AND s.kind IN ('class','interface','enum')
-         AND s.file_id=(SELECT candidate.file_id FROM symbols candidate
-             JOIN temp.java_dependency_scope scope ON scope.file_id=candidate.file_id
-             JOIN files source ON source.id=candidate.file_id
-             WHERE candidate.qualified_name=?2 AND candidate.kind IN ('class','interface','enum')
-             ORDER BY scope.is_consumer DESC,source.path,source.root_path LIMIT 1)
+         AND s.file_id=?4
          ORDER BY s.name"
     ))?;
     for row in rows {
@@ -5170,11 +5444,13 @@ fn count_symbols_used_in_module(
             }
         }
         for identity in identities {
-            for name in owners
-                .query_map(params![dependency_path, identity, dependency_root], |row| {
-                    row.get::<_, String>(0)
-                })?
-            {
+            let Some((source_id, _, _)) = java_dependency_source(conn, &identity)? else {
+                continue;
+            };
+            for name in owners.query_map(
+                params![dependency_path, identity, dependency_root, source_id],
+                |row| row.get::<_, String>(0),
+            )? {
                 used.insert(&name?)?;
             }
         }

@@ -22,15 +22,16 @@ def criteria():
 
 
 # Preserve the recorded source-classpath ordering obligation. The current CLI
-# has root selectors but no compiler classpath-order contract. Neither a sorted
-# native DB row nor an external binary-loader proposal establishes that order.
+# has root selectors but no compiler classpath-order contract. Execute the
+# explicit ambiguity alternative rather than inventing an order or skipping it.
 API_DECISIONS = ({
     'id': 'duplicate-source-classpath-order',
+    'criterion': 'unused-deps:java-source-classpath-ambiguity',
     'input': 'two declared dependency modules export the same Java qualified type; consumer uses that type; reverse descriptor and source-path order',
     'expected': 'declaring dependency ownership must follow an independently specified source-classpath order or an explicitly unresolved ambiguity contract',
-    'production': 'src/commands/modules.rs java_dependency_declaration ORDER BY ... LIMIT 1',
-    'verification': 'java_module_binding_contracts covers selected-root/local precedence but has no same-classpath duplicate-order proof',
-    'stop': 'review the ownership contract, execute both orderings and retain their Java case IDs; user direction is required if a new classpath API is needed',
+    'production': 'src/commands/modules.rs java_dependency_source rejects equally preferred owners',
+    'verification': 'java_classpath_contracts executes both descriptor/path orderings, javac order sensitivity, JSON/text ambiguity and local/scope/refresh controls',
+    'stop': 'every ambiguity and control branch must execute and match; no claimed compiler order or new classpath API',
 },)
 
 
@@ -334,5 +335,19 @@ RETAINED = ({'feature': 'global:format:java-modules',
               'capture/invariant/bound guards leave Base unused',
   'stop': 'all CASES and JSON/text/options/refresh assertions execute and match; unresolved positives remain '
           'failures'})
+
+RETAINED += ({
+    'feature': 'unused-deps:java-source-classpath-ambiguity',
+    'subject': 'duplicate-source-classpath-order',
+    'samples_count': 182,
+    'sample_keys_sha256': '1d81e282edebaf269e15e27a67b9e98a1d18f0a12246d9be3067409d431103e1',
+    'population_sha256': 'fccc7958233f6fb7fd1e1c63d340ee68bd49d2c88aa8f7190f038cd796a8573e',
+    'fixture': 'java_classpath_contracts.exercise',
+    'production': 'src/commands/modules.rs java_dependency_source',
+    'contract': 'explicit unresolved source ownership for equally preferred duplicate Java types',
+    'input': 'both descriptor/path orderings, attached roots and API exports, import/qualified/member/receiver sites; javac classpath sensitivity and full inventories',
+    'expected': 'nonzero ambiguity without dependency classification for duplicate lookups; unique/local/hidden/unreferenced controls retain authored ownership; refresh rechecks ambiguity',
+    'stop': 'every retained ordering, option, format, inventory, javac and refresh branch executes and matches; this is not MCP equivalence',
+},)
 
 REVIEWED_SURFACE = 'fa3898263c794d8a021d2b2a75a6520f9dd130c14bd851cf09b0cb48bc22b059'

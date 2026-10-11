@@ -730,6 +730,8 @@ pub(crate) struct DependencyMemberType {
     pub parameter_variables: Vec<Option<(DependencyResultType, usize)>>,
     pub method_generic: bool,
     pub method_signature: Option<DependencyMethodSignature>,
+    /// Multi-bound signatures are separate from the legacy single-bound view.
+    pub intersection_signature: Option<DependencyMethodSignature>,
     pub is_static: bool,
     pub public: bool,
     pub private: bool,
@@ -739,6 +741,7 @@ pub(crate) struct DependencyMemberType {
 #[derive(Clone)]
 pub(crate) struct DependencyMethodSignature {
     pub variables: Vec<(String, Option<DependencyResultType>)>,
+    pub intersection_bounds: Vec<(String, Vec<DependencyResultType>)>,
     pub parameters: Vec<Option<(DependencyResultType, usize)>>,
     pub result: Option<DependencyResultType>,
     pub array_result: Option<DependencyResultType>,
@@ -880,17 +883,29 @@ fn dependency_method_signature(
         })
         .collect::<Option<_>>()?;
     let mut variables = Vec::new();
+    let mut intersection_bounds = Vec::new();
     for (node, name) in nodes.iter().zip(&names) {
         let bound = node
             .named_children(&mut node.walk())
             .find(|child| child.kind() == "type_bound");
         let bound = if let Some(bound) = bound {
             let bounds: Vec<_> = bound.named_children(&mut bound.walk()).collect();
-            let [bound] = bounds.as_slice() else {
+            if bounds.is_empty() {
                 return None;
-            };
+            }
+            if bounds.len() > 1 {
+                intersection_bounds.push((
+                    name.clone(),
+                    bounds
+                        .iter()
+                        .map(|bound| {
+                            dependency_method_result_type(*bound, content, package, &names, 0)
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                ));
+            }
             Some(dependency_method_result_type(
-                *bound, content, package, &names, 0,
+                bounds[0], content, package, &names, 0,
             )?)
         } else {
             None
@@ -937,6 +952,7 @@ fn dependency_method_signature(
         .and_then(|ty| dependency_array_result(ty, member, content));
     Some(DependencyMethodSignature {
         variables,
+        intersection_bounds,
         parameters,
         result,
         array_result,
@@ -1088,6 +1104,11 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         }
         result
     });
+    let (method_signature, intersection_signature) =
+        match dependency_method_signature(member, content, package) {
+            Some(signature) if !signature.intersection_bounds.is_empty() => (None, Some(signature)),
+            signature => (signature, None),
+        };
     DependencyMemberType {
         path,
         array_result_type: ty
@@ -1115,7 +1136,8 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
         parameters,
         parameter_variables,
         method_generic: member.child_by_field_name("type_parameters").is_some(),
-        method_signature: dependency_method_signature(member, content, package),
+        method_signature,
+        intersection_signature,
         is_static: modifier("static"),
         public: modifier("public") || interface_member && !modifier("private"),
         private: modifier("private"),
@@ -3686,6 +3708,15 @@ class Box<T> {
         let intersection = &declaration.value_types[&("intersection".into(), true)][0];
         assert!(intersection.method_generic);
         assert!(intersection.method_signature.is_none());
+        let constraints = &intersection
+            .intersection_signature
+            .as_ref()
+            .unwrap()
+            .intersection_bounds;
+        assert!(matches!(constraints.as_slice(), [(name, bounds)]
+            if name == "U" && matches!(bounds.as_slice(),
+                [DependencyResultType::Named(base, _), DependencyResultType::Named(interface, _)]
+                if base == "shared.Child" && interface == "Runnable")));
         let projected = declaration.value_types[&("projected".into(), true)][0]
             .method_signature
             .as_ref()

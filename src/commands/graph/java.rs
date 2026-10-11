@@ -2503,7 +2503,9 @@ pub(crate) struct DependencyValueMember {
 pub(crate) struct DependencyInvocationArgument {
     pub ty: Option<String>,
     pub position: usize,
+    pub occurrence: usize,
     pub contexts: Vec<String>,
+    pub receiver: Option<Box<DependencyValueReceiver>>,
 }
 
 pub(crate) enum DependencyValueReceiver {
@@ -2548,6 +2550,7 @@ pub(crate) fn dependency_value_members(
         tree: &tree_sitter::Tree,
         declarations: &HashMap<usize, InvocationOwner>,
         package: &str,
+        depth: usize,
     ) -> DependencyInvocationArgument {
         let position = expression_receiver_site(node, source, scopes, declarations)
             .map_or(node.start_byte(), |site| site.position);
@@ -2558,7 +2561,14 @@ pub(crate) fn dependency_value_members(
         DependencyInvocationArgument {
             ty: invocation_argument_type(node, callable(node).unwrap_or(node), source, scopes, 0),
             position,
+            occurrence: node.start_byte(),
             contexts: dependency_contexts(binding, source, package),
+            receiver: (depth < 16 && node.kind() == "method_invocation")
+                .then(|| {
+                    chain_receiver(node, source, tree, scopes, declarations, package, depth + 1)
+                })
+                .flatten()
+                .map(Box::new),
         }
     }
 
@@ -2575,7 +2585,9 @@ pub(crate) fn dependency_value_members(
                 .map(|ty| DependencyInvocationArgument {
                     ty: Some(text(ty, source).to_owned()),
                     position: ty.start_byte(),
+                    occurrence: ty.start_byte(),
                     contexts: dependency_contexts(ty, source, package),
+                    receiver: None,
                 })
                 .collect(),
         )
@@ -2587,12 +2599,13 @@ pub(crate) fn dependency_value_members(
         tree: &tree_sitter::Tree,
         declarations: &HashMap<usize, InvocationOwner>,
         package: &str,
+        depth: usize,
     ) -> Option<Vec<DependencyInvocationArgument>> {
         Some(
             node.child_by_field_name("arguments")?
                 .named_children(&mut node.child_by_field_name("arguments")?.walk())
                 .filter(|child| !child.is_extra())
-                .map(|node| argument(node, source, scopes, tree, declarations, package))
+                .map(|node| argument(node, source, scopes, tree, declarations, package, depth))
                 .collect(),
         )
     }
@@ -2790,6 +2803,7 @@ pub(crate) fn dependency_value_members(
                     tree,
                     declarations,
                     package,
+                    depth,
                 ),
             }),
             "array_creation_expression" => {
@@ -2830,7 +2844,7 @@ pub(crate) fn dependency_value_members(
                 }),
                 name: text(node.child_by_field_name("name")?, source).to_owned(),
                 arity: Some(argument_count(node)?),
-                arguments: arguments(node, source, scopes, tree, declarations, package),
+                arguments: arguments(node, source, scopes, tree, declarations, package, depth),
                 type_arguments: type_arguments(node, source, package),
             }),
             "field_access" => Some(DependencyValueReceiver::Member {
@@ -2934,7 +2948,7 @@ pub(crate) fn dependency_value_members(
                     name: text(member, source).to_owned(),
                     method,
                     chain: None,
-                    arguments: arguments(node, source, &scopes, &tree, &declarations, package),
+                    arguments: arguments(node, source, &scopes, &tree, &declarations, package, 0),
                     type_arguments: type_arguments(node, source, package),
                 });
             }
@@ -2958,7 +2972,7 @@ pub(crate) fn dependency_value_members(
                 name: text(member, source).to_owned(),
                 method,
                 chain: Some(chain),
-                arguments: arguments(node, source, &scopes, &tree, &declarations, package),
+                arguments: arguments(node, source, &scopes, &tree, &declarations, package, 0),
                 type_arguments: type_arguments(node, source, package),
             });
         }

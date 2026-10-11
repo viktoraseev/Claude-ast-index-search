@@ -31,7 +31,7 @@ SHARED = {'global:format:java-modules', 'global:scope:java-module-aliases',
 def specification():
     return {'parent': FEATURE, 'criteria': spec.criteria(),
             'cli_surface_sha256': spec.REVIEWED_SURFACE,
-            'pending_contract_decisions': spec.API_DECISIONS,
+            'retained_contract_decisions': spec.API_DECISIONS,
             'scope': 'full advertised Java unused-deps API and retained semantic cases',
             'target': 'complete file inventory, independent Maven graph and executed target commands; nonempty/unmodelled graphs remain unresolved',
             'boundaries': [
@@ -162,9 +162,13 @@ def target_proof(state, bindings):
 
 def readiness(state, bindings):
     result = engine.readiness(state, bindings, policy=sys.modules[__name__])
-    if spec.API_DECISIONS:
+    criteria = {item['feature']: item for item in specification()['criteria']}
+    unresolved = [item for item in spec.API_DECISIONS
+                  if item.get('criterion') not in criteria
+                  or criteria[item['criterion']]['subject'] != item['id']]
+    if unresolved:
         raise AcceptancePending('retained source-classpath contract needs an executable decision: ' +
-                                ', '.join(item['id'] for item in spec.API_DECISIONS))
+                                ', '.join(item['id'] for item in unresolved))
     return {**result, 'target': target_proof(state, bindings)}
 
 
