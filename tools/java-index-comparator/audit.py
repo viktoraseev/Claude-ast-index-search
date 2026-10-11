@@ -128,9 +128,12 @@ import java_resource_metadata_contracts
 import resource_acceptance
 import call_tree_acceptance
 import graph_acceptance
+import unused_acceptance
+import java_common_bound_contracts
+import java_dependency_gap_contracts
 import graph_overload_contracts
 
-PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance, call_tree_acceptance, graph_acceptance, explore_acceptance)
+PARENT_POLICIES = (parent_acceptance, scope_acceptance, resource_acceptance, call_tree_acceptance, graph_acceptance, explore_acceptance, unused_acceptance)
 
 
 SCHEMA = """
@@ -2408,6 +2411,14 @@ class Fixture:
                 self.state.execute("UPDATE coverage SET status='pending' WHERE feature=?", (check['feature'],))
             raise Unsupported(str(error)) from error
 
+    def unused_semantic_source_check(self, check: sqlite3.Row):
+        module = (java_common_bound_contracts if check['feature'] in java_common_bound_contracts.FEATURES
+                  else java_dependency_gap_contracts)
+        expected, actual = module.exercise(self.binary, self.database.parent)
+        return {'source': module.REASON, 'samples': expected}, actual, \
+            {(key, canonical_json(value)) for key, value in expected.items()}, \
+            {(key, canonical_json(value)) for key, value in actual.items()}
+
     def explore_semantic_source_check(self, check: sqlite3.Row):
         module = (explore_freshness_contracts if check['feature'] in explore_freshness_contracts.FEATURES
                   else explore_result_contracts)
@@ -2627,6 +2638,8 @@ class Fixture:
                 handler = self.parent_acceptance_check
             if check['feature'] in explore_freshness_contracts.FEATURES | explore_result_contracts.FEATURES:
                 handler = self.explore_semantic_source_check
+            if check['feature'] in java_common_bound_contracts.FEATURES | java_dependency_gap_contracts.FEATURES:
+                handler = self.unused_semantic_source_check
             if check['feature'] in mobile_contracts.EXTENSIONS or check['feature'] in perl_contracts.EXTENSIONS:
                 handler = self.mobile_text_check
             if check['feature'] in annotation_contracts.EXTENSIONS:
@@ -2773,10 +2786,13 @@ def required_features(help_text: str = '') -> set[str]:
     features.update(java_overload_context_contracts.FEATURES)
     features.update(graph_overload_contracts.FEATURES)
     features.update(explore_freshness_contracts.FEATURES | explore_result_contracts.FEATURES)
+    features.update(java_common_bound_contracts.FEATURES | java_dependency_gap_contracts.FEATURES)
     return features
 
 
 def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_text: str, candidates: Any = (), root: Path | None = None, *, java_only: bool = False) -> None:
+    if java_only:
+        unused_acceptance.retain_note(state, state)
     features = required_features(help_text)
     # A base navigation handler does not establish coverage of source bodies,
     # search ranking, or constructor/annotation entries omitted by Go-to-Symbol.
@@ -2986,6 +3002,9 @@ def plan(state: sqlite3.Connection, source_files: list[dict[str, Any]], help_tex
     explore_freshness_contracts.plan_contracts(state, root)
     explore_result_contracts.plan_contracts(state, root)
     explore_acceptance.plan(state, java_only=java_only and root is not None)
+    java_common_bound_contracts.plan_contracts(state, root)
+    java_dependency_gap_contracts.plan_contracts(state, root)
+    unused_acceptance.plan(state, java_only=java_only and root is not None)
 
 
 def scan(arguments: argparse.Namespace) -> dict[str, Any]:

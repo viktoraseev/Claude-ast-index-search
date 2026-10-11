@@ -2473,6 +2473,68 @@ impl JavaDependencyLookup<'_> {
         Ok(false)
     }
 
+    /// Infer a unique common nominal source ancestor without erasing intersections.
+    fn common_source_bound(&self, left: &str, right: &str) -> Result<Option<String>> {
+        // Parameterized/array least-upper bounds need slot/rank constraints;
+        // do not turn a nominal ancestor into a raw generic binding.
+        if left.contains(['<', '[', '?']) || right.contains(['<', '[', '?']) {
+            return Ok(Some("java.lang.Object".to_owned()));
+        }
+        let mut ancestors = HashSet::new();
+        let mut pending = vec![left.to_owned()];
+        while let Some(name) = pending.pop() {
+            if !ancestors.insert(name.clone()) {
+                continue;
+            }
+            if ancestors.len() > 128 {
+                return Ok(None);
+            }
+            if let Some(owner) = self.raw(&name)? {
+                pending.extend(
+                    self.parents(&owner)?
+                        .into_iter()
+                        .map(|parent| parent.identity),
+                );
+            }
+        }
+        let mut common = Vec::new();
+        for ancestor in ancestors {
+            if self.subclass(right, &ancestor, &mut HashSet::new())? {
+                common.push(ancestor);
+            }
+        }
+        let mut most_specific = Vec::new();
+        for ancestor in &common {
+            let mut shadowed = false;
+            for other in &common {
+                if other != ancestor && self.subclass(other, ancestor, &mut HashSet::new())? {
+                    shadowed = true;
+                    break;
+                }
+            }
+            if !shadowed {
+                most_specific.push(ancestor.clone());
+            }
+        }
+        Ok(match most_specific.len() {
+            0 => Some("java.lang.Object".to_owned()),
+            1 => {
+                let candidate = most_specific.pop().unwrap();
+                // The source parent walk tracks nominal identities. Generic
+                // ancestors cannot be inferred without their argument mapping.
+                if self
+                    .raw(&candidate)?
+                    .is_some_and(|owner| !owner.declaration.type_parameters.is_empty())
+                {
+                    None
+                } else {
+                    Some(candidate)
+                }
+            }
+            _ => None,
+        })
+    }
+
     fn protected_access(&self, owner: &str) -> Result<bool> {
         for context in self.contexts {
             if self.subclass(context, owner, &mut HashSet::new())? {
@@ -3495,7 +3557,10 @@ impl JavaDependencyLookup<'_> {
                         return Ok((true, false));
                     }
                     if !self.invocation_conversion(prior, &ty, false)? {
-                        ty = "java.lang.Object".to_owned();
+                        let Some(common) = self.common_source_bound(prior, &ty)? else {
+                            return Ok((false, true));
+                        };
+                        ty = common;
                     }
                 }
                 bindings.insert(name.clone(), ty);

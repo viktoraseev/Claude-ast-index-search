@@ -57,6 +57,8 @@ def verify(evidence: Path, root: Path, binary: Path) -> dict:
         graph_readiness(state, {**metadata, **fingerprints})
         from explore_acceptance import readiness as explore_readiness
         explore_readiness(state, {**metadata, **fingerprints})
+        from unused_acceptance import readiness as unused_readiness
+        unused_readiness(state, {**metadata, **fingerprints})
         if any(status == 'out-of-scope' and feature not in JAVA_EXCLUDED_FEATURES
                for feature, status in coverage.items()):
             raise ToolError('Java-applicable contract was classified outside the task')
