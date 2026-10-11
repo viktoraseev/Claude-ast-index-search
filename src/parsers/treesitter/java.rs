@@ -622,6 +622,9 @@ pub(crate) enum DependencyResultType {
     Array(Box<DependencyResultType>, usize),
     /// A read bound is not an invariant or writable type argument.
     UpperBound(Box<DependencyResultType>),
+    /// Formal containment retains lower/unbounded slots separately from reads.
+    LowerBound(Box<DependencyResultType>),
+    AnyArgument,
 }
 
 fn dependency_wildcard_bound(ty: Node<'_>) -> Option<Node<'_>> {
@@ -800,6 +803,67 @@ fn dependency_method_result_type(
     dependency_result_type(ty, content, package, depth)
 }
 
+/// Preserve formal wildcard variance without changing read-result capture rules.
+fn dependency_formal_type(
+    ty: Node<'_>,
+    content: &str,
+    package: &str,
+    names: &[String],
+    depth: usize,
+) -> Option<DependencyResultType> {
+    if depth >= 16 || ty.has_error() {
+        return None;
+    }
+    match ty.kind() {
+        "wildcard" => {
+            let direction = ty
+                .children(&mut ty.walk())
+                .find(|child| matches!(child.kind(), "extends" | "super"));
+            let Some(direction) = direction else {
+                return Some(DependencyResultType::AnyArgument);
+            };
+            let bound = ty.named_children(&mut ty.walk()).last()?;
+            let bound = Box::new(dependency_formal_type(
+                bound,
+                content,
+                package,
+                names,
+                depth + 1,
+            )?);
+            Some(if direction.kind() == "extends" {
+                DependencyResultType::UpperBound(bound)
+            } else {
+                DependencyResultType::LowerBound(bound)
+            })
+        }
+        "generic_type" => {
+            let arguments = ty.named_child(1)?;
+            Some(DependencyResultType::Named(
+                node_text(content, &ty.named_child(0)?).to_owned(),
+                arguments
+                    .named_children(&mut arguments.walk())
+                    .map(|argument| {
+                        dependency_formal_type(argument, content, package, names, depth + 1)
+                    })
+                    .collect(),
+            ))
+        }
+        "array_type" => Some(DependencyResultType::Array(
+            Box::new(dependency_formal_type(
+                ty.child_by_field_name("element")?,
+                content,
+                package,
+                names,
+                depth + 1,
+            )?),
+            node_text(content, &ty.child_by_field_name("dimensions")?)
+                .matches('[')
+                .count(),
+        )),
+        _ => dependency_method_result_type(ty, content, package, names, depth),
+    }
+}
+
 fn dependency_method_signature(
     member: Node<'_>,
     content: &str,
@@ -852,7 +916,7 @@ fn dependency_method_signature(
                     .map_or(0, |node| node_text(content, &node).matches('[').count());
                 ty = ty.child_by_field_name("element")?;
             }
-            let signature = dependency_method_result_type(ty, content, package, &names, 0)?;
+            let signature = dependency_formal_type(ty, content, package, &names, 0)?;
             (ty.kind() == "generic_type"
                 || matches!(&signature, DependencyResultType::Parameter { owner, .. } if owner == "@method"))
                 .then_some((signature, dimensions))
@@ -984,7 +1048,7 @@ fn dependency_member_type(member: Node<'_>, content: &str, package: &str) -> Dep
                         .map_or(0, |node| node_text(content, &node).matches('[').count());
                     ty = ty.child_by_field_name("element")?;
                 }
-                let variable = dependency_result_type(ty, content, package, 0)?;
+                let variable = dependency_formal_type(ty, content, package, &[], 0)?;
                 (matches!(&variable, DependencyResultType::Parameter { .. })
                     || matches!(&variable, DependencyResultType::Named(_, arguments) if !arguments.is_empty()))
                     .then_some((variable, dimensions))

@@ -1391,7 +1391,18 @@ fn invocation_type(node: Node<'_>, source: &str) -> Option<String> {
         ));
     }
     if node.kind() == "wildcard" {
-        return (text(node, source).trim() == "?").then(|| "?".to_owned());
+        if text(node, source).trim() == "?" {
+            return Some("?".to_owned());
+        }
+        let direction = node
+            .children(&mut node.walk())
+            .find(|child| matches!(child.kind(), "extends" | "super"))?;
+        let bound = node.named_children(&mut node.walk()).last()?;
+        return Some(format!(
+            "? {} {}",
+            direction.kind(),
+            invocation_type(bound, source)?
+        ));
     }
     type_name(node, source)
 }
